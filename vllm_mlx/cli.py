@@ -7972,7 +7972,20 @@ Examples:
     ):
         from vllm_mlx.alias_resolver import resolve_model_id as resolve_model
 
-        resolved = resolve_model(args.model)
+        resolver = get_resolver()
+        resolved_model_id = resolve_model_id(args.model)
+
+        # Check for path override in alias config
+        resolved_alias = resolver.resolve(args.model)
+        if resolved_alias and resolved_alias.path:
+            # Use custom path if specified
+            args.model = resolved_alias.path
+            print(f"  Alias: {args.model} → {resolved_alias.path} (local path)")
+        elif resolved_model_id != args.model:
+            # Regular alias resolution
+            print(f"  Alias: {args.model} → {resolved_model_id}")
+            args._original_alias = args.model
+            args.model = resolved_model_id
         if resolved != args.model:
             print(f"  Alias: {args.model} → {resolved}")
             args._original_alias = args.model
