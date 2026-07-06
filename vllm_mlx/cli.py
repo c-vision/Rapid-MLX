@@ -8479,7 +8479,7 @@ def chat_command(args):
                 f"own server (not with --base-url / --port).{RESET}\n"
             )
             return
-        from vllm_mlx.model_aliases import resolve_model
+        from vllm_mlx.alias_resolver import resolve_model_id as resolve_model
 
         resolved = resolve_model(new_alias) or new_alias
         print(f"  {DIM}Preparing {new_alias} → {resolved} ...{RESET}")
@@ -8861,7 +8861,8 @@ def info_command(args):
     Stage 1 (regex match) only — does NOT load the model, so this is fast
     and works without weights. Stage 2 (ArraysCache probe) is skipped.
     """
-    from vllm_mlx.model_aliases import resolve_model, resolve_profile
+    from vllm_mlx.alias_resolver import resolve_model_id as resolve_model
+    from vllm_mlx.model_aliases import resolve_profile
     from vllm_mlx.model_auto_config import (
         detect_model_config,
         format_profile_table,
@@ -11972,14 +11973,9 @@ def main():
         and args.model
         and getattr(args, "command", None) != "doctor"
     ):
-        from vllm_mlx.model_aliases import RetiredModelAliasError, resolve_model
-        from vllm_mlx.user_aliases import UserAliasError
+        from vllm_mlx.alias_resolver import resolve_model_id as resolve_model
 
-        try:
-            resolved = resolve_model(args.model)
-        except (RetiredModelAliasError, UserAliasError) as exc:
-            print(f"\n  Error: {exc}", file=sys.stderr)
-            raise SystemExit(1) from None
+        resolved = resolve_model(args.model)
         if resolved != args.model:
             print(f"  Alias: {args.model} → {resolved}")
             args._original_alias = args.model
