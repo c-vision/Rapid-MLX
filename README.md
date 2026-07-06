@@ -501,6 +501,74 @@ The **quantization suffix is mandatory on every alias** — `qwen3.5-4b-4bit` no
 
 **128+ explicit aliases across 30+ families** ship today (`rapid-mlx models`), including audio (13 TTS + 13 STT) and embedding aliases. `rapid-mlx info <alias>` shows the per-alias profile — parser, hybrid / MoE flags, K8V4 eligibility, DFlash / MTP eligibility.
 
+### User-configurable aliases
+
+In addition to the built-in aliases, you can define your own custom aliases in `~/.rapid-mlx/models.yaml`. This allows you to:
+
+- Use local models without downloading from HuggingFace
+- Override quantization, hardware requirements, and other settings per alias
+- Create shortcuts for frequently used models with custom parameters
+
+The configuration file uses YAML format:
+
+```yaml
+aliases:
+  # Fast inference - small model, low VRAM
+  fast:
+    model: mlx-community/Qwen3.5-4B-4bit
+    quant: 4bit
+    modality: text
+    hardware: [m1, m2, m3, m4]
+    min_vram_gb: 4
+    args:
+      max-tokens: 2048
+      temp: 0.7
+
+  # Coding specialized - larger model with custom path
+  coder:
+    model: mlx-community/Qwen3.5-Coder-27B-8bit
+    quant: 8bit
+    modality: text
+    hardware: [m2, m3, m4]
+    min_vram_gb: 16
+    path: /Users/gaetano/models/qwen-coder-local  # Optional local path override
+    args:
+      max-tokens: 4096
+      temp: 0.2
+
+  # Vision model example
+  vision:
+    model: mlx-community/Qwen2.5-VL-7B-Instruct-4bit
+    quant: 4bit
+    modality: vision
+    hardware: [m2, m3, m4]
+    min_vram_gb: 8
+    args:
+      max-tokens: 2048
+      temp: 0.7
+```
+
+**Available fields:**
+- `model` (required): HuggingFace repo ID
+- `quant`: Quantization (`4bit`, `8bit`, `3bit`, `bpw`)
+- `modality`: `text`, `vision`, `audio` 
+- `hardware`: Target hardware hints (`m1` through `m10`)
+- `min_vram_gb`: Minimum VRAM required (positive integer)
+- `args`: Additional CLI arguments as key-value pairs
+- `path`: Optional custom model directory override (bypasses HF download)
+
+User aliases take precedence over built-in aliases. The system validates the configuration and reports errors to stderr without blocking execution.
+
+To list all available aliases (built-in + user-defined):
+```bash
+rapid-mlx models
+```
+
+To get detailed information about a specific alias:
+```bash
+rapid-mlx info <alias>
+```
+
 <details>
 <summary><strong>Text families at a glance</strong></summary>
 
