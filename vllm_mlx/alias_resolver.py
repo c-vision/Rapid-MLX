@@ -144,6 +144,10 @@ def validate_alias_config(config_data: dict) -> List[str]:
                             f"Alias '{alias_name}' 'args' key '{arg_key}' must be a string."
                         )
 
+        # Validate path (optional)
+        if "path" in alias_config and not isinstance(alias_config["path"], str):
+            errors.append(f"Alias '{alias_name}' 'path' must be a string if provided.")
+
     return errors
 
 
@@ -156,11 +160,13 @@ class AliasConfig:
         quant: str | None = None,
         tokenizer_override: str | None = None,
         args: dict[str, Any] | None = None,
+        path: str | None = None,
     ):
         self.model = model
         self.quant = quant
         self.tokenizer_override = tokenizer_override
         self.args = args or {}
+        self.path = path
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dictionary for YAML output."""
@@ -171,6 +177,8 @@ class AliasConfig:
             result["tokenizer_override"] = self.tokenizer_override
         if self.args:
             result["args"] = self.args
+        if self.path:
+            result["path"] = self.path
         return result
 
     @classmethod
@@ -181,6 +189,7 @@ class AliasConfig:
             quant=data.get("quant"),
             tokenizer_override=data.get("tokenizer_override"),
             args=data.get("args"),
+            path=data.get("path"),
         )
 
 
@@ -335,6 +344,20 @@ class AliasResolver:
             pass
 
         return result
+
+    def get_model_dir(self, alias: str) -> Path | None:
+        """Get the model directory for an alias.
+        If a path is configured in the alias, return that.
+        Otherwise, resolve the model ID and look it up in the cache.
+        """
+        config = self.resolve(alias)
+        if config is None:
+            return None
+        if config.path:
+            return Path(config.path).expanduser()
+        # Fallback: resolve model ID and search cache
+        from .model_path import resolve_model_dir
+        return resolve_model_dir(config.model)
 
 
 # Global singleton instance
