@@ -144,8 +144,12 @@ def validate_alias_config(config_data: dict) -> List[str]:
                             f"Alias '{alias_name}' 'args' key '{arg_key}' must be a string."
                         )
 
-        # Validate path (optional)
-        if "path" in alias_config and not isinstance(alias_config["path"], str):
+        # Validate path (optional; None means "not set" and is always allowed)
+        if (
+            "path" in alias_config
+            and alias_config["path"] is not None
+            and not isinstance(alias_config["path"], str)
+        ):
             errors.append(f"Alias '{alias_name}' 'path' must be a string if provided.")
 
     return errors
