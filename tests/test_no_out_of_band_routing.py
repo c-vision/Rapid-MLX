@@ -476,49 +476,13 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # a model, parser, or routing tier; identical semantic shape
         # to ``RAPID_MLX_PREFIX_CACHE_SHUTDOWN_BUDGET`` above.
         "RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC",
+        # Override the model storage/cache directory (``vllm_mlx/model_path.py:
+        # get_model_path``), falling back to ``~/.cache/rapid-mlx/models`` then
+        # the HuggingFace cache. Pure storage-location knob — it changes where
+        # model bytes are read from/written to, never which model, parser, or
+        # routing tier is selected.
+        "RAPID_MLX_MODEL_PATH",
         # #558 grammar-constrained tool-calling toggle. A per-feature ON/OFF
-        # switch, NOT a routing decision. DEFAULT-ON as of PR-5 (opt-OUT with
-        # ``0``/``off``/``false``); when active the chat route builds the
-        # per-request ``GrammarLogitsProcessor`` for a constrainable
-        # ``tool_choice`` (required / named / auto), else it falls back to
-        # today's free-form-then-parse behavior. It never selects a model,
-        # parser, or tier — which model loads, which tool parser fires, which
-        # tier engages is all unchanged; it only decides whether a tool call is
-        # structurally masked. Read only by
-        # ``routes/chat.py::_tool_grammar_eligible``.
-        "RAPID_MLX_CONSTRAIN_TOOLS",
-        # #1312/#1314 Kokoro espeak self-test path overrides. When set, they
-        # redirect the phonemizer's espeak-ng shared library / data directory
-        # at a system install (used to repair a broken bundled dylib); absent,
-        # the self-test exercises whatever ``misaki`` wired up at import. Read
-        # ONLY by ``audio/probe.py``'s child-process espeak self-test — pure
-        # filesystem path knobs for a TTS dependency; never select a model,
-        # parser, or routing tier.
-        "RAPID_MLX_ESPEAK_LIB",
-        "RAPID_MLX_ESPEAK_DATA",
-        # Wan generation tuning. These are read only after aliases.json has
-        # selected the audited video-gen lane; none can alter LLM routing.
-        "RAPID_MLX_WAN_MODEL_DIR",
-        "RAPID_MLX_WAN_STEPS",
-        "RAPID_MLX_WAN_SCHEDULER",
-        "RAPID_MLX_WAN_TILING",
-        "RAPID_MLX_WAN_LORA",
-        "RAPID_MLX_WAN_LORA_HIGH",
-        "RAPID_MLX_WAN_LORA_LOW",
-        # LTX-2.5 runtime executable selected only after aliases.json has
-        # routed the request to the audited LTX-2.5 video lane. It changes
-        # dependency location, not model/parser/tier routing.
-        "RAPID_MLX_LTX25_RUNTIME",
-        # Hard deadline for an already-selected LTX-2.5 generation process;
-        # affects lifecycle only, never model/parser/tier routing.
-        "RAPID_MLX_LTX25_TIMEOUT_SEC",
-        # Opt-out of the decorative cheetah launch banner (display preference
-        # only). Same shape as DISABLE_VERSION_CHECK: it never selects a
-        # model, parser, tier, or engine route — it only suppresses a
-        # print() in cli.main() when stdout is a TTY. Read by
-        # vllm_mlx/cli.py's banner gate (--no-banner flag is the primary
-        # mechanism; the env var exists for non-interactive launchers).
-        "RAPID_MLX_NO_BANNER",
     }
 )
 
