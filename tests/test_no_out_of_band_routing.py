@@ -364,6 +364,12 @@ ALLOWED_RAPID_MLX_ENV_VARS: frozenset[str] = frozenset(
         # a model, parser, or routing tier; identical semantic shape
         # to ``RAPID_MLX_PREFIX_CACHE_SHUTDOWN_BUDGET`` above.
         "RAPID_MLX_MTP_DISPATCH_TIMEOUT_SEC",
+        # Override the model storage/cache directory (``vllm_mlx/model_path.py:
+        # get_model_path``), falling back to ``~/.cache/rapid-mlx/models`` then
+        # the HuggingFace cache. Pure storage-location knob — it changes where
+        # model bytes are read from/written to, never which model, parser, or
+        # routing tier is selected.
+        "RAPID_MLX_MODEL_PATH",
     }
 )
 
