@@ -1109,7 +1109,7 @@ def _apply_mtp_cli_model_type_reconciliation(
     transient first-read failure (warm HF cache invalidated,
     filesystem hiccup, etc.), the first read returned ``None`` and
     the second read succeeded. The engine then treated the
-    operator's explicit ``--spec-decode mtp`` request as
+    operator's explicit MTP speculative-config request as
     "non-CLI-vetted" and soft-skipped dispatch failures — silently
     degrading MTP to a no-op.
 
@@ -1149,7 +1149,7 @@ def _apply_mtp_cli_model_type_reconciliation(
         # detector refactor ever relaxes that invariant, we MUST
         # hard-fail rather than boot in the silent-skip state.
         print(
-            "error: --spec-decode mtp eligibility passed but the CLI "
+            "error: MTP speculative-config eligibility passed but the CLI "
             "could not extract config.json::model_type — this is a "
             "plumbing skew between detect_mtp_eligibility (accepted "
             "the config) and this CLI reconciliation block. Refusing "
@@ -1560,12 +1560,41 @@ def _normalize_speculative_config_or_exit(args):
         legacy_ddtree_config,
         legacy_dflash_config,
         legacy_mtp_config,
+        legacy_suffix_config,
         parse_speculative_config,
         require_migrated_speculative_config,
     )
 
     raw_config = getattr(args, "speculative_config", None)
+    config = None
+
+    def _fill_suffix_defaults() -> None:
+        if getattr(args, "suffix_max_draft", None) is None:
+            args.suffix_max_draft = 8
+        if getattr(args, "suffix_max_suffix_len", None) is None:
+            args.suffix_max_suffix_len = 4
+        if getattr(args, "suffix_min_confidence", None) is None:
+            args.suffix_min_confidence = 0.3
+        if getattr(args, "suffix_min_draft_len", None) is None:
+            args.suffix_min_draft_len = 2
+
+    def _fill_mtp_defaults() -> None:
+        if not hasattr(args, "mtp_sidecar"):
+            args.mtp_sidecar = None
+        if getattr(args, "mtp_max_k", None) is None:
+            args.mtp_max_k = 3
+        if not hasattr(args, "mtp_disable_auto_k"):
+            args.mtp_disable_auto_k = False
+
     if raw_config is not None:
+        try:
+            config = parse_speculative_config(raw_config)
+            if config is not None:
+                require_migrated_speculative_config(config)
+        except SpeculativeConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(2)
+        config_method = config.method if config is not None else "none"
         conflicts = []
         if getattr(args, "enable_ddtree", False):
             conflicts.append("--enable-ddtree")
@@ -1578,6 +1607,28 @@ def _normalize_speculative_config_or_exit(args):
             conflicts.append("--dflash-drafter-path")
         if (getattr(args, "mtp_sidecar", None) or "").strip():
             conflicts.append("--mtp-sidecar")
+        if getattr(args, "mtp_max_k", None) is not None:
+            conflicts.append("--mtp-max-k")
+        if getattr(args, "mtp_disable_auto_k", False):
+            conflicts.append("--mtp-disable-auto-k")
+        # DFlash has a dedicated preflight that historically reports
+        # these runtime conflicts as "cannot combine" (exit 1) before
+        # probing mlx-vlm. Preserve that user-facing contract; other
+        # methods stay on the generic config/legacy mutual-exclusion path.
+        if getattr(args, "enable_mtp", False) and config_method != "dflash":
+            conflicts.append("--enable-mtp")
+        if getattr(args, "suffix_decoding", False) and config_method != "dflash":
+            conflicts.append("--suffix-decoding")
+        if getattr(args, "no_spec_decode", False):
+            conflicts.append("--no-spec-decode")
+        if getattr(args, "suffix_max_draft", None) is not None:
+            conflicts.append("--suffix-max-draft")
+        if getattr(args, "suffix_max_suffix_len", None) is not None:
+            conflicts.append("--suffix-max-suffix-len")
+        if getattr(args, "suffix_min_confidence", None) is not None:
+            conflicts.append("--suffix-min-confidence")
+        if getattr(args, "suffix_min_draft_len", None) is not None:
+            conflicts.append("--suffix-min-draft-len")
         if conflicts:
             joined = ", ".join(conflicts)
             print(
@@ -1587,29 +1638,84 @@ def _normalize_speculative_config_or_exit(args):
                 file=sys.stderr,
             )
             sys.exit(2)
-    try:
-        config = parse_speculative_config(raw_config)
-        if config is not None:
-            require_migrated_speculative_config(config)
-    except SpeculativeConfigError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        sys.exit(2)
-    if config is None:
+    if raw_config is None and getattr(args, "no_spec_decode", False):
+        conflicts = []
         if getattr(args, "enable_ddtree", False):
-            config = legacy_ddtree_config()
-        elif getattr(args, "enable_dflash", False) or (
-            getattr(args, "spec_decode", "none") == "dflash"
-        ):
-            config = legacy_dflash_config(
-                (getattr(args, "dflash_drafter_path", "") or "").strip() or None
+            conflicts.append("--enable-ddtree")
+        if getattr(args, "enable_dflash", False):
+            conflicts.append("--enable-dflash")
+        spec_decode = getattr(args, "spec_decode", "none")
+        if spec_decode != "none":
+            conflicts.append(f"--spec-decode {spec_decode}")
+        if getattr(args, "enable_mtp", False):
+            conflicts.append("--enable-mtp")
+        if getattr(args, "suffix_decoding", False):
+            conflicts.append("--suffix-decoding")
+        if conflicts:
+            joined = ", ".join(conflicts)
+            print(
+                f"error: --no-spec-decode is mutually exclusive with {joined}.",
+                file=sys.stderr,
             )
-        elif getattr(args, "spec_decode", "none") == "mtp":
+            sys.exit(2)
+
+    if raw_config is None and getattr(args, "spec_decode", "none") == "mtp":
+        conflicts = []
+        if getattr(args, "enable_ddtree", False):
+            conflicts.append("--enable-ddtree")
+        if getattr(args, "enable_dflash", False):
+            conflicts.append("--enable-dflash")
+        if getattr(args, "enable_mtp", False):
+            conflicts.append("--enable-mtp")
+        if getattr(args, "suffix_decoding", False):
+            conflicts.append("--suffix-decoding")
+        if conflicts:
+            joined = ", ".join(conflicts)
+            print(
+                "error: --spec-decode mtp is mutually exclusive with "
+                f"{joined}; express speculative decoding settings inside "
+                "--speculative-config.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    if config is None:
+        if getattr(args, "spec_decode", "none") == "mtp":
+            print(
+                "warning: --spec-decode mtp is deprecated; use "
+                '--speculative-config \'{"method":"mtp"}\' instead.',
+                file=sys.stderr,
+            )
             config = legacy_mtp_config(
-                model=(getattr(args, "mtp_sidecar", None) or "").strip() or None,
+                model=(getattr(args, "mtp_sidecar", "") or "").strip() or None,
                 num_speculative_tokens=getattr(args, "mtp_max_k", None),
+                disable_auto_k=getattr(args, "mtp_disable_auto_k", None),
             )
+        try:
+            if config is not None:
+                pass
+            elif getattr(args, "enable_ddtree", False):
+                config = legacy_ddtree_config()
+            elif getattr(args, "enable_dflash", False) or (
+                getattr(args, "spec_decode", "none") == "dflash"
+            ):
+                config = legacy_dflash_config(
+                    (getattr(args, "dflash_drafter_path", "") or "").strip() or None
+                )
+            elif getattr(args, "suffix_decoding", False):
+                config = legacy_suffix_config(
+                    num_speculative_tokens=getattr(args, "suffix_max_draft", None),
+                    max_suffix_len=getattr(args, "suffix_max_suffix_len", None),
+                    min_confidence=getattr(args, "suffix_min_confidence", None),
+                    min_draft_len=getattr(args, "suffix_min_draft_len", None),
+                )
+        except SpeculativeConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(2)
     args._speculative_config = config
     if config is None:
+        _fill_mtp_defaults()
+        _fill_suffix_defaults()
         return
     if config.method == "ddtree":
         args.enable_ddtree = True
@@ -1621,10 +1727,24 @@ def _normalize_speculative_config_or_exit(args):
             args.spec_decode = "none"
     elif config.method == "mtp":
         args.spec_decode = "mtp"
-        if config.model:
-            args.mtp_sidecar = config.model
+        args.mtp_sidecar = config.model
         if config.num_speculative_tokens is not None:
             args.mtp_max_k = config.num_speculative_tokens
+        if config.disable_auto_k is not None:
+            args.mtp_disable_auto_k = config.disable_auto_k
+    elif config.method == "suffix":
+        args.suffix_decoding = True
+        if config.num_speculative_tokens is not None:
+            args.suffix_max_draft = config.num_speculative_tokens
+        if config.max_suffix_len is not None:
+            args.suffix_max_suffix_len = config.max_suffix_len
+        if config.min_confidence is not None:
+            args.suffix_min_confidence = config.min_confidence
+        if config.min_draft_len is not None:
+            args.suffix_min_draft_len = config.min_draft_len
+
+    _fill_mtp_defaults()
+    _fill_suffix_defaults()
 
 
 def _resolve_dflash_drafter_repo(args, profile) -> str:
@@ -2738,17 +2858,13 @@ def serve_command(args):
         enable_mtp=args.enable_mtp,
         mtp_num_draft_tokens=args.mtp_num_draft_tokens,
         mtp_optimistic=args.mtp_optimistic,
-        # R15-P1 #302/#313: --spec-decode {none,mtp,dflash}. Plumb the
-        # raw choice through; the boot-time eligibility check below
-        # validates that ``mtp`` was only passed for a config.json with
-        # ``mtp_num_hidden_layers >= 1`` and ``dflash`` requires a
-        # Qwen3.5/3.6 model + a bound DFlash drafter.
+        # Speculative decoding selection. ``mtp`` is set internally by
+        # --speculative-config only; legacy --spec-decode remains limited
+        # to none/dflash.
         spec_decode=getattr(args, "spec_decode", "none"),
         dflash_drafter_path=getattr(args, "dflash_drafter_path", "") or "",
-        # 0.9.13 PR-A: Gemma 4 external MTP sidecar path (see
-        # ``SchedulerConfig.mtp_sidecar`` for the routing contract).
-        # ``None`` is the "no sidecar; native-MTP path only" sentinel
-        # matching the argparse default.
+        # Optional external MTP sidecar path. ``None`` is the "no
+        # sidecar; native-MTP path only" sentinel.
         mtp_sidecar=getattr(args, "mtp_sidecar", None),
         # 0.9.13 PR-A codex round-E blocker #2: CLI-resolved
         # ``config.json::model_type`` for the dispatch step. See the
@@ -2807,18 +2923,10 @@ def serve_command(args):
         print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
     if args.enable_mtp:
         print(f"MTP: enabled, draft_tokens={args.mtp_num_draft_tokens}")
-    # R15-P1 #302: native Qwen3.5/3.6 MTP via vendored mlx-lm PR #990.
-    # Banner line + boot-time eligibility check fires here so misuse
-    # (--spec-decode mtp on a non-Qwen3.5/3.6 model) bounces with a
-    # clear error rather than discovering the mismatch when the first
-    # backbone forward pass raises ``AttributeError`` mid-generation.
-    #
-    # 0.9.13 PR-A: when ``--mtp-sidecar <path>`` is set, the operator
-    # is opting into the Gemma 4 external assistant-drafter route.
-    # ``detect_mtp_eligibility`` then permits a base Gemma 4 unified
-    # checkpoint (which has no baked-in MTP head — the sidecar carries
-    # the assistant weights) through as CHAIN. Qwen3.5/3.6 still needs
-    # ``mtp_num_hidden_layers >= 1`` on the base config either way.
+    # Native Qwen3.5/3.6 MTP via vendored mlx-lm PR #990. The
+    # config-only entrypoint is ``--speculative-config '{"method":"mtp"}'``.
+    # Boot-time eligibility check fires here so misuse bounces with a clear
+    # error instead of discovering the mismatch mid-generation.
     if getattr(args, "spec_decode", "none") == "mtp":
         from vllm_mlx.spec_decode.mtp import (
             MTPEligibility,
@@ -2839,21 +2947,18 @@ def serve_command(args):
         if eligibility is MTPEligibility.NONE:
             if has_sidecar:
                 print(
-                    "error: --spec-decode mtp --mtp-sidecar <path> requires a "
-                    "Gemma 4 unified checkpoint (model_type='gemma4_unified') "
-                    "or a Qwen3.5 / Qwen3.6 checkpoint with "
-                    "mtp_num_hidden_layers >= 1. The loaded model does not "
-                    "qualify.",
+                    "error: MTP speculative-config requires either a Qwen3.5 / "
+                    "Qwen3.6 checkpoint with mtp_num_hidden_layers >= 1 in "
+                    "config.json. Assistant sidecars are reserved for future "
+                    "validated support and do not make this model eligible.",
                     file=sys.stderr,
                 )
             else:
                 print(
-                    "error: --spec-decode mtp requires a Qwen3.5 / Qwen3.6 "
-                    "checkpoint with mtp_num_hidden_layers >= 1 in "
-                    "config.json, or a Gemma 4 unified checkpoint paired "
-                    "with --mtp-sidecar <path> (see "
-                    "google/gemma-4-*-it-assistant on HF). The loaded "
-                    "model does not qualify.",
+                    "error: MTP speculative-config requires a Qwen3.5 / "
+                    "Qwen3.6 checkpoint with mtp_num_hidden_layers >= 1 in "
+                    "config.json. Assistant sidecars are not currently "
+                    "supported. The loaded model does not qualify.",
                     file=sys.stderr,
                 )
             sys.exit(2)
@@ -2876,7 +2981,9 @@ def serve_command(args):
             logger=logger,
         )
 
-        sidecar_note = f" +sidecar={args.mtp_sidecar}" if has_sidecar else ""
+        sidecar_note = (
+            f" +sidecar={getattr(args, 'mtp_sidecar', None)}" if has_sidecar else ""
+        )
         print(f"Spec-decode: mtp ({eligibility.value}){sidecar_note}")
 
     # ``--spec-decode dflash`` is normalized to ``--enable-dflash`` near
@@ -3455,6 +3562,21 @@ def _run_submit_flow(
     _check_disk_space(hf_path, force=getattr(args, "force_disk_check", False))
     _check_memory_capacity(hf_path)
 
+    # Pre-fetch the model via the R2 mirror (with HF fallback) BEFORE the
+    # thread executor spins up. Without this, ``mlx_lm.load`` runs inside
+    # the executor and delegates to ``huggingface_hub.snapshot_download``
+    # directly, skipping the mirror entirely (bug: --submit diverged from
+    # ``serve``/``chat``/``pull``/``jlens`` which all prefetch via the
+    # mirror first). Running this in the main thread — before the executor
+    # is created — surfaces the mirror's per-file progress lines to the
+    # contributor's terminal; if we deferred to the executor, the tqdm
+    # bars from a warm cache-miss would race the ``Loading model …`` print
+    # below. ``_ensure_model_downloaded`` is a no-op on local paths and on
+    # fully-cached repos, and swallows mirror errors gracefully so
+    # ``mlx_lm.load`` still falls through to HF when the mirror is
+    # unreachable.
+    _ensure_model_downloaded(hf_path)
+
     # ``--sampled`` runs a SECOND submission (with sampling="sampled")
     # in addition to the always-on greedy run. The README contract is
     # "two rows when --sampled is set, one row otherwise" — a previous
@@ -3695,6 +3817,18 @@ def bench_command(args):
 
     _check_disk_space(args.model, force=getattr(args, "force_disk_check", False))
     _check_memory_capacity(args.model)
+
+    # Pre-fetch the model via the R2 mirror (with HF fallback) BEFORE the
+    # heavy bench boot. Without this, ``bench`` falls into ``mlx_lm.load``
+    # → ``huggingface_hub.snapshot_download`` directly and skips the
+    # mirror entirely, wasting the user's bandwidth and hitting HF rate
+    # limits (bug: bench diverged from ``serve``/``chat``/``pull``/``jlens``
+    # which all prefetch via the mirror first).
+    # ``_ensure_model_downloaded`` is a no-op on local paths and on
+    # fully-cached repos and swallows mirror errors gracefully (mlx_lm.load
+    # falls through to HF), so this is safe on the warm path and when
+    # the mirror is unreachable.
+    _ensure_model_downloaded(args.model)
 
     # Handle prefix cache flags
     enable_prefix_cache = args.enable_prefix_cache and not args.disable_prefix_cache
@@ -6639,8 +6773,11 @@ Examples:
             "parses method/model/num_speculative_tokens now. DFlash is "
             'available with \'{"method":"dflash"}\', DDTree with '
             '\'{"method":"ddtree"}\', and MTP with '
-            '\'{"method":"mtp"}\'. SuffixDecoding keeps its legacy flag '
-            "until it migrates to this surface."
+            '\'{"method":"mtp","num_speculative_tokens":3,'
+            '"disable_auto_k":false}\'. SuffixDecoding is an explicit, '
+            "workload-specific flag for high prompt/output-overlap traffic "
+            "and is available with "
+            '\'{"method":"suffix","num_speculative_tokens":8}\'.'
         ),
     )
     serve_parser.add_argument(
@@ -6747,92 +6884,44 @@ Examples:
         help="Skip MTP acceptance check for maximum speed. "
         "~5-10%% wrong tokens. Best for chat, not for code.",
     )
-    # R15-P1 #302: native Qwen3.5/3.6 MTP via vendored mlx-lm PR #990.
-    # Lives next to the existing ``--enable-mtp`` (Qwen3-Next runtime
-    # injection) rather than replacing it because the two paths target
-    # DIFFERENT architectures — Qwen3-Next uses a hybrid Gated-DeltaNet
-    # + attention layout that the existing ``_install_mtp`` patches
-    # at the BatchGenerator level, while Qwen3.5/3.6 uses a
-    # GatedDeltaNet + MTP-head split that needs the PR #990
-    # ``mtp_generate_step`` loop (cache rollback, n_confirmed split,
-    # probabilistic acceptance). Coexistence keeps existing dogfood
-    # users on ``--enable-mtp`` working while the new path is opt-in.
-    #
-    # Default ``none`` because the lossless contract has not yet been
-    # verified end-to-end against a converted Qwen3.5/3.6 checkpoint
-    # (R15-P1 follow-up bench is GPU-contended with Stage B Viterbi
-    # conversion). The CLI rejects ``--spec-decode mtp`` at boot if
-    # the loaded model's ``config.json`` lacks
-    # ``mtp_num_hidden_layers >= 1`` so an operator who passes the
-    # flag against a non-eligible model sees a clear error rather
-    # than silent fallback.
-    serve_parser.add_argument(
-        "--spec-decode",
-        dest="spec_decode",
-        choices=["none", "mtp", "dflash"],
-        default="none",
-        help=(
-            "R15-P1 model-side speculative decode. "
-            "``none`` (default) disables; ``mtp`` enables Qwen3.5/3.6 "
-            "native MTP via vendored mlx-lm PR #990 — requires a "
-            "checkpoint converted with the PR #990 sanitize() path "
-            "that preserves ``mtp.*`` weights; ``dflash`` enables the "
-            "block-diffusion drafter from arxiv 2410.04097 (R15-P1 "
-            "#313) for Qwen3.5/3.6 with a bound drafter (default "
-            "block size 16). Rejects at boot if the model doesn't "
-            "qualify so misuse fails loud."
-        ),
-    )
-    # 0.9.13 PR-A: external MTP sidecar for the Gemma 4 assistant-drafter
-    # route. Combined with ``--spec-decode mtp``, allows a base Gemma 4
-    # unified checkpoint (which never ships an MTP head of its own) to
-    # graft on the ~4-layer assistant drafter from
-    # ``google/gemma-4-*-it-assistant`` (Apache 2.0). Not used by the
-    # Qwen3.5/3.6 native-MTP path — that lineage's MTP head is baked
-    # into the target checkpoint via mlx-lm PR #990's sanitize() pass,
-    # so ``--mtp-sidecar`` has no effect there.
     serve_parser.add_argument(
         "--mtp-sidecar",
         dest="mtp_sidecar",
         default=None,
-        help=(
-            "Path to a Gemma 4 MTP assistant-drafter checkpoint — either a "
-            "local safetensors directory (e.g. ~/.cache/huggingface/hub/"
-            "gemma-4-12B-it-assistant) or an HF repo id "
-            "(e.g. google/gemma-4-12B-it-assistant). Only consulted when "
-            "--spec-decode mtp is set; ignored for the Qwen3.5/3.6 "
-            "native-MTP path (their head is baked into the target). "
-            "Requires the [mtp] install extra."
-        ),
+        help=argparse.SUPPRESS,
     )
-    # 0.9.13 PR-B: Ollama-style EV depth controller knobs. The controller
-    # picks K ∈ {0..max_k} per round via ``argmax_K committed(K)/cost(K)``,
-    # persisting cost + acceptance state across requests (per-model).
-    # K=0 "parks" — plain decode, no drafter — which fixes the prose
-    # slowdown from PR-A K=1 (drafter cost dominates on low-accept content).
     serve_parser.add_argument(
         "--mtp-max-k",
         dest="mtp_max_k",
         type=int,
-        default=3,
-        help=(
-            "Hard ceiling on the per-round draft depth the EV controller "
-            "may select (default: 3). The current generator implements "
-            "K∈{0,1} (park + chain-of-1); values >1 are effectively "
-            "clamped until chain-of-K verify lands. Only consulted when "
-            "--spec-decode mtp is set."
-        ),
+        default=None,
+        help=argparse.SUPPRESS,
     )
     serve_parser.add_argument(
         "--mtp-disable-auto-k",
         dest="mtp_disable_auto_k",
         action="store_true",
         default=False,
+        help=argparse.SUPPRESS,
+    )
+    # Compatibility selector kept for older public shorthands.
+    # ``mtp`` is accepted as a deprecated hidden choice and normalized to
+    # ``--speculative-config '{"method":"mtp"}'``. Keep help focused on
+    # the non-deprecated values via ``metavar``.
+    serve_parser.add_argument(
+        "--spec-decode",
+        dest="spec_decode",
+        choices=["none", "dflash", "mtp"],
+        metavar="{none,dflash}",
+        default="none",
         help=(
-            "Disable the EV depth controller and keep the pre-PR-B "
-            "fixed-K=1 chain-of-1 MTP behavior. Used to A/B bench the "
-            "controller against the fixed-K=1 baseline. Only consulted "
-            "when --spec-decode mtp is set."
+            "Compatibility selector for model-side speculative decode; "
+            "prefer --speculative-config for new usage. "
+            "``none`` (default) disables; ``dflash`` enables the "
+            "block-diffusion drafter from arxiv 2410.04097 (R15-P1 "
+            "#313) for Qwen3.5/3.6 with a bound drafter (default "
+            "block size 16). DFlash validates its model/drafter pair "
+            "at boot so misuse fails loud."
         ),
     )
     # R15-P1 #313: DFlash drafter HF path override. Empty by default
@@ -6852,41 +6941,45 @@ Examples:
         ),
     )
     # SuffixDecoding — drafter-free spec-decode using a suffix tree over
-    # generated tokens. Big wins on agent/tool/JSON workloads (3-5x);
-    # ~zero overhead on free-form chat. Pure-attention only.
+    # prompt/generated tokens. This is an explicit workload flag, not a
+    # general accelerator: it can help long high-overlap copy/code-edit/
+    # repeated tool-XML traffic, and can regress ordinary chat / JSONL /
+    # unsupported model families. Pure-attention only.
     serve_parser.add_argument(
         "--suffix-decoding",
         action="store_true",
         default=False,
         help="Enable SuffixDecoding spec-decode (drafter-free, statistical). "
-        "Speedup is workload-dependent: 3-5x on tool-call/JSON/code-edit, "
-        "~1x on free-form chat. Auto-disabled on hybrid models "
-        "(Qwen3.5/3.6, Granite4, Mamba/Jamba/RWKV).",
+        "Explicit opt-in only: useful for long high-overlap workloads such "
+        "as prompt-copy, code editing, and repeated tool XML on validated "
+        "models. Do not use as a general chat accelerator; GPT-OSS/Qwen "
+        "families have shown regressions in local benches. Auto-disabled "
+        "on hybrid models (Qwen3.5/3.6 A3B/A10B, Granite4, Mamba/Jamba/RWKV).",
     )
     serve_parser.add_argument(
         "--suffix-max-draft",
         type=int,
-        default=8,
+        default=None,
         help="Max draft tokens per verify step (default: 8). "
         "Verify forward cost grows linearly with this.",
     )
     serve_parser.add_argument(
         "--suffix-max-suffix-len",
         type=int,
-        default=4,
+        default=None,
         help="Max k-gram length indexed for suffix matching (default: 4).",
     )
     serve_parser.add_argument(
         "--suffix-min-confidence",
         type=float,
-        default=0.3,
+        default=None,
         help="Vote confidence floor for draft truncation (default: 0.3). "
         "Lower → more optimistic drafts; higher → fewer but more reliable.",
     )
     serve_parser.add_argument(
         "--suffix-min-draft-len",
         type=int,
-        default=2,
+        default=None,
         help="Skip the verify forward when drafter returns fewer than "
         "this many tokens (default: 2). Protects free-form chat from "
         "verify overhead on weak 1-token drafts. Set to 1 to verify "
@@ -7440,7 +7533,7 @@ Examples:
             "'smoke' (boot + 1 prompt), "
             "'speed' (B=1 perf probe), "
             "'harness' (5 first-class agent harnesses: "
-            "codex/opencode/hermes/aider/langchain), "
+            "codex/opencode/qwen-code/hermes/aider), "
             "'all' (smoke → speed → harness sequentially, abort on smoke "
             "fail). Boots the model server exactly once per invocation."
         ),
@@ -7632,6 +7725,39 @@ Examples:
         help="Model alias (e.g. qwen3.5-4b-4bit) or HF repo (e.g. mlx-community/SmolLM3-3B-4bit)",
     ).completer = alias_completer
 
+    # Jlens command — read a model's internal "draft" with the Jacobian lens
+    jlens_parser = subparsers.add_parser(
+        "jlens",
+        help="Read a model's internal thoughts across layers (Jacobian lens)",
+    )
+    jlens_parser.add_argument(
+        "prompt",
+        help='Prompt to trace, e.g. "why is the sky blue"',
+    )
+    jlens_parser.add_argument(
+        "--model",
+        "-m",
+        default="qwen3-1.7b",
+        help="Model alias or HF repo to inspect (default: qwen3-1.7b)",
+    ).completer = alias_completer
+    jlens_parser.add_argument(
+        "--step",
+        type=int,
+        default=2,
+        help="Probe every Nth layer (default: 2; use 1 for full-resolution)",
+    )
+    jlens_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of the rendered view",
+    )
+    jlens_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Show full per-layer readouts and the answer's rank trajectory",
+    )
+
     # Agents command
     agents_parser = subparsers.add_parser(
         "agents", help="List, configure, and test agent integrations"
@@ -7640,7 +7766,7 @@ Examples:
         "agent_name",
         nargs="?",
         default=None,
-        help="Agent name (e.g. hermes, goose, aider). Omit to list all.",
+        help="Agent name (e.g. codex, opencode, qwen-code, aider). Omit to list all.",
     )
     agents_parser.add_argument(
         "--setup",
@@ -7987,7 +8113,15 @@ Examples:
             args._original_alias = args.model
             args.model = resolved_model_id
         if resolved != args.model:
-            print(f"  Alias: {args.model} → {resolved}")
+            # Keep stdout pure JSON for machine-readable modes (jlens --json);
+            # the human-facing alias banner goes to stderr there.
+            _alias_stream = (
+                sys.stderr
+                if getattr(args, "command", None) == "jlens"
+                and getattr(args, "json", False)
+                else sys.stdout
+            )
+            print(f"  Alias: {args.model} → {resolved}", file=_alias_stream)
             args._original_alias = args.model
             args.model = resolved
         elif "/" not in args.model and not os.path.exists(args.model):
@@ -8073,7 +8207,7 @@ Examples:
     # NOT inherit the bypass. Codex round-2 BLOCKING #2.
     _chat_spawn_child = os.environ.pop("RAPID_MLX_CHAT_SPAWN", "") == "1"
 
-    _GATED_COMMANDS = {"chat", "run", "serve", "pull", "bench"}
+    _GATED_COMMANDS = {"chat", "run", "serve", "pull", "bench", "jlens"}
     if (
         getattr(args, "command", None) in _GATED_COMMANDS
         and hasattr(args, "model")
@@ -8149,6 +8283,10 @@ Examples:
         chat_command(args)
     elif args.command == "info":
         info_command(args)
+    elif args.command == "jlens":
+        from vllm_mlx.jlens import jlens_command
+
+        jlens_command(args)
     elif args.command == "agents":
         agents_command(args)
     elif args.command == "doctor":

@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  Rapid-MLX is a local LLM inference engine for Macs. It speaks the OpenAI Chat / Responses / Embeddings APIs, so anything that talks to ChatGPT — Cursor, Claude Code, Aider, Codex CLI, LangChain, PydanticAI, your own scripts — just works against <code>http://localhost:8000</code>. No cloud, no API key, no per-token cost.
+  Rapid-MLX is a local LLM inference engine for Macs. It speaks the OpenAI Chat / Responses / Embeddings APIs, so anything that talks to ChatGPT — Cursor, Claude Code, Codex CLI, Aider, OpenCode, Qwen Code, Kilo Code, LangChain, PydanticAI, your own scripts — just works against <code>http://localhost:8000</code>. No cloud, no API key, no per-token cost.
 </p>
 
 <p align="center">
@@ -31,7 +31,7 @@
 <p align="center">
   <img src="https://raw.githubusercontent.com/raullenchai/Rapid-MLX/main/docs/assets/demo.gif" alt="Rapid-MLX demo — install, serve Gemma 4, chat, tool calling" width="700">
   <br>
-  <em>pip install → serve Gemma 4 → chat + tool calling → works with PydanticAI, LangChain, Aider, and more.</em>
+  <em>pip install → serve Gemma 4 → chat + tool calling → works with Codex CLI, Claude Code, Qwen Code, Kilo Code, PydanticAI, LangChain, and more.</em>
 </p>
 
 ---
@@ -102,7 +102,7 @@ Defaults to `qwen3.5-4b-4bit`. First run downloads the model (~2.5 GB) — you'l
 rapid-mlx serve qwen3.5-4b-4bit
 ```
 
-Starts an OpenAI-compatible HTTP server. Wait for `Ready: http://localhost:8000/v1`, then point Cursor, Claude Code, Aider, LangChain, the OpenAI SDK — anything — at `http://localhost:8000/v1`.
+Starts an OpenAI-compatible HTTP server. Wait for `Ready: http://localhost:8000/v1`, then point Cursor, Claude Code, Codex CLI, Qwen Code, Kilo Code, Aider, LangChain, the OpenAI SDK — anything — at `http://localhost:8000/v1`.
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -143,7 +143,7 @@ If you're comparing against Ollama, LM Studio, `mlx-lm serve`, or `llama.cpp`:
 
 - **Fastest on Apple Silicon, measured.** Under concurrent load (B=4), Rapid-MLX is **2.3× faster than Ollama** on the apples-to-apples GPT-OSS 20B row (identical weights both sides), leads by **1.7–2.4×** across the Qwen3.5 / Qwen3.6 closest-tag Ollama rows, and runs **1.2–1.5× faster than `mlx-lm serve`** on shared MLX weights. Full table in [Benchmarks](#benchmarks).
 - **Drop-in OpenAI / Anthropic API.** Same `/v1/chat/completions` and `/v1/responses` as OpenAI, plus `/v1/messages` for the Anthropic SDK and Claude Code. No client-side adapter required.
-- **Tool calling that actually works under 4-bit quantization.** 17 parser formats with automatic recovery — when a quantized model emits a malformed tool call as text, Rapid-MLX detects it and rebuilds the structured `tool_calls` object instead of failing silently. Verified end-to-end against Cursor, Codex CLI, Claude Code, Aider, LangChain, PydanticAI, smolagents.
+- **Tool calling that actually works under 4-bit quantization.** 17 parser formats with automatic recovery — when a quantized model emits a malformed tool call as text, Rapid-MLX detects it and rebuilds the structured `tool_calls` object instead of failing silently. Verified end-to-end against 8 Tier-1 agent backends (Codex CLI, Claude Code, OpenCode, Qwen Code, OpenHands, Hermes Agent, Aider, Kilo Code) and 3 Tier-1 frameworks (LangChain / LangGraph, PydanticAI, smolagents) — see the [Model × Agent test matrix](#model--agent-test-matrix).
 - **Prompt cache, even on hybrid RNN models, sharable across tenants.** Standard transformers get radix-tree prefix cache — N clients hitting the same 2k-token system prompt converge on the same trie node (O(prefix_len) lookup vs. O(log N + LCP_scan) on hash caches). Hybrid models (Qwen3.5 DeltaNet) get RNN state snapshots restored in ~0.1 ms instead of re-running hundreds of tokens through the recurrent layers. 2–5× faster TTFT on every architecture, always on.
 - **Long-prompt prefill acceleration.** PFlash scores 32K+ prompts and only prefills the sink + recent tail + query-relevant middle — **3.87–8.5× faster cold-start TTFT** with full needle-in-a-haystack recall. Default-on for verified aliases; `--pflash always` forces it for any model.
 - **TurboQuant K8V4 KV codec, default-on for verified MoE.** 9 Qwen3.5/3.6 hero aliases ship with K8V4 (K 8-bit + V 4-bit after Walsh-Hadamard + Lloyd-Max) turned on — codec compresses KV to ~1/2.4 (~58% savings), lossless across the verified matrix. Set `--kv-cache-turboquant none` to force off.
@@ -169,21 +169,24 @@ A streaming REPL with slash commands (`/help`, `/system`, `/save`, `/clear`). No
 rapid-mlx serve qwen3.5-9b-4bit
 ```
 
-Point Cursor, Continue.dev, Open WebUI, LibreChat, the OpenAI Python SDK, LangChain, PydanticAI, smolagents at `http://localhost:8000/v1`. Tool calling, streaming, reasoning separation, structured JSON output, and embeddings are all on the standard endpoints. See [Connect Your Client](#connect-your-client) for one-shot configs.
+Point Cursor, LibreChat, Open WebUI, the OpenAI Python SDK, LangChain / LangGraph, PydanticAI, smolagents at `http://localhost:8000/v1`. Tool calling, streaming, reasoning separation, structured JSON output, and embeddings are all on the standard endpoints. See [Connect Your Client](#connect-your-client) for one-shot configs.
 
-### 3. Agent backends: Codex CLI, Claude Code, Aider, OpenCode
+### 3. Agent backends: Codex CLI, Claude Code, OpenCode, Qwen Code, Kilo Code — 8 Tier-1 total
 
-Rapid-MLX is the *backend* — pair it with an open-source agent CLI for the full Claude Code-like experience.
+Rapid-MLX is the *backend* — pair it with an open-source agent CLI for the full Claude Code-like experience. The full Tier-1 list is in [Connect Your Client](#tier-1-agent-backends); the flagship trio below covers > 90 % of what people install.
 
 ```bash
 rapid-mlx serve qwen3.6-27b-8bit          # or any tool-capable alias
 rapid-mlx agents codex --setup            # writes ~/.codex/config.toml
 codex                                      # now talks to your local model
+
+rapid-mlx agents qwen-code --setup        # writes ~/.qwen/settings.json
+rapid-mlx agents kilo-code --setup        # writes ~/.config/kilo-code/settings.json
 ```
 
 - **Codex CLI** (OpenAI's official Rust agent, 0.136.0+) hits `/v1/responses`. Verified end-to-end on Qwen3.5-9B / Qwen3.6-27B for chat, file read/write, shell, multi-step, and source analysis. Release gate G7b probes the codex-shape SSE on every tag. ([guide](docs/guides/codex-cli.md))
 - **Claude Code** hits `/v1/messages` (Anthropic SDK). `ANTHROPIC_BASE_URL=http://localhost:8000 claude`.
-- **Aider / OpenCode / OpenClaude / Goose / Hermes / Claw Code** — `rapid-mlx agents <name> --setup` writes the right config file.
+- **Qwen Code / Kilo Code / OpenCode / OpenHands / Hermes Agent / Aider** — `rapid-mlx agents <name> --setup` writes the right config file. See the [full Tier-1 table](#tier-1-agent-backends) for setup and integration-test links.
 
 ### 4. Benchmark your hardware and contribute to the community
 
@@ -205,33 +208,73 @@ Tunnels your local server through `rapidserver.quicksilverpro.io` over a WebSock
 
 ## Connect Your Client
 
-### Tested integrations
+Three tiers of integration are shipped:
 
-**Agent harnesses** (auto-setup with `rapid-mlx agents <name> --setup`):
+1. **Tier-1 Agent Backends** (8) — every one has a `rapid-mlx agents <name> --setup` config template *and* an integration test that boots the server + real model and drives the same wire the agent drives. For clarity: **Claude Code** and **Hermes Agent** get real-client SDK smoke (Anthropic SDK, dedicated `test_hermes.py`); **Aider** gets a shell-harness smoke (`test_aider.sh`); **Codex CLI** gets a raw `/v1/responses` route smoke; **OpenCode / Qwen Code / OpenHands / Kilo Code** get **wire-level smoke** via the Python OpenAI SDK against the identical `/v1/chat/completions` route their real binary hits — proving the route + tool schema + envelope, not the vendor binary itself. This is "wire-verified for every agent, client-verified where the client is drivable in-process".
+2. **Tier-1 Frameworks** (3) — Python libraries that speak `/v1/chat/completions`. Same wire-verified bar as agents, driven through the real framework packages.
+3. **Compatible** (community-verified) — UIs / IDE extensions / older tools that plug in via the OpenAI-compatible URL. No per-model matrix here; if you use one that isn't listed, it almost certainly still works.
 
-| Harness | Type | Notes |
-|---------|------|-------|
-| [Codex CLI](https://github.com/openai/codex) | Agent | OpenAI's official Rust agent — `/v1/responses` shim, verified end-to-end against codex 0.136.0 ([guide](docs/guides/codex-cli.md)) |
-| [Claude Code](https://www.anthropic.com/claude-code) | Agent | Anthropic SDK via `/v1/messages` — `ANTHROPIC_BASE_URL=http://localhost:8000 claude` |
-| [Aider](https://aider.chat) | Agent | CLI edit-and-commit, architect mode ([test](tests/integrations/test_aider.sh)) |
-| [OpenCode](https://github.com/sst/opencode) | TUI Agent | Claude Code-like terminal UX, OpenAI-compat provider |
-| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | Agent | 62 tools, multi-turn ([test](tests/integrations/test_hermes.py)) |
-| [Goose](https://github.com/block/goose) | Agent | Ollama provider via `OLLAMA_HOST` |
-| [OpenClaude](https://github.com/Gitlawb/openclaude) | Agent | Anthropic SDK, `CLAUDE_CODE_USE_OPENAI=1` ([test](tests/integrations/test_anthropic_sdk.py)) |
-| [Claw Code](https://github.com/ultraworkers/claw-code) | Agent | OpenAI & Anthropic endpoints |
-| [PydanticAI](https://ai.pydantic.dev) | Framework | Typed agents, structured output ([test](tests/integrations/test_pydantic_ai_full.py)) |
-| [LangChain](https://langchain.com) | Framework | `ChatOpenAI`, tools, streaming ([test](tests/integrations/test_langchain.py)) |
-| [smolagents](https://github.com/huggingface/smolagents) | Framework | CodeAgent + ToolCallingAgent ([test](tests/integrations/test_smolagents_full.py)) |
+### Tier-1 Agent Backends
 
-**UI / IDE clients:**
+Most rows auto-setup with `rapid-mlx agents <name> --setup`. Claude Code is a one-liner env-var config against the vendor CLI (no `claude-code` profile in this repo — the setup column shows the exact env-var). Each row's **Integration test** column links a cell in the 24-cell agent matrix (`tests/integrations/test_agents_matrix.py`) or the dedicated deep-flow file.
 
-| Client | Status | Setup |
-|--------|--------|-------|
-| [Cursor](https://cursor.com) | Compatible | Settings → OpenAI Base URL |
-| [Continue.dev](https://continue.dev) | Compatible | VS Code / JetBrains extension |
-| [LibreChat](https://librechat.ai) | Tested | Docker ([test](tests/integrations/test_librechat_docker.py)) |
-| [Open WebUI](https://github.com/open-webui/open-webui) | Tested | Docker ([test](tests/integrations/test_openwebui.py)) |
-| Any OpenAI-compatible app | Compatible | Point at `http://localhost:8000/v1` |
+| Agent | Category | Wire | Setup | Integration test |
+|---|---|---|---|---|
+| [Codex CLI](https://github.com/openai/codex) | CLI | `/v1/responses` | `rapid-mlx agents codex --setup` | [test_agents_matrix.py::TestCodexCLI](tests/integrations/test_agents_matrix.py) · [guide](docs/guides/codex-cli.md) |
+| [Claude Code](https://www.anthropic.com/claude-code) | CLI | `/v1/messages` | `ANTHROPIC_BASE_URL=http://localhost:8000 claude` | [test_anthropic_sdk.py](tests/integrations/test_anthropic_sdk.py) · [matrix cell](tests/integrations/test_agents_matrix.py) |
+| [OpenCode](https://github.com/sst/opencode) | TUI | `/v1/chat/completions` | `rapid-mlx agents opencode --setup` | [test_agents_matrix.py::TestOpenCode](tests/integrations/test_agents_matrix.py) |
+| [Qwen Code](https://github.com/QwenLM/qwen-code) | CLI | `/v1/chat/completions` | `rapid-mlx agents qwen-code --setup` | [test_agents_matrix.py::TestQwenCode](tests/integrations/test_agents_matrix.py) |
+| [OpenHands](https://github.com/All-Hands-AI/OpenHands) | Sandbox | `/v1/chat/completions` | `rapid-mlx agents openhands --setup` | [test_agents_matrix.py::TestOpenHands](tests/integrations/test_agents_matrix.py) (wire smoke — Docker E2E deferred to 0.10.6 Phase 4) |
+| [Hermes Agent](https://github.com/NousResearch/hermes-agent) | Agent | `/v1/chat/completions` | `rapid-mlx agents hermes --setup` | [test_hermes.py](tests/integrations/test_hermes.py) · [matrix cell](tests/integrations/test_agents_matrix.py) |
+| [Aider](https://aider.chat) | CLI | `/v1/chat/completions` | `rapid-mlx agents aider --setup` | [test_aider.sh](tests/integrations/test_aider.sh) (real CLI edit-and-write) · [matrix cell](tests/integrations/test_agents_matrix.py) (wire smoke only) |
+| [Kilo Code](https://github.com/Kilo-Org/kilocode) | IDE + CLI | `/v1/chat/completions` | `rapid-mlx agents kilo-code --setup` | [test_agents_matrix.py::TestKiloCode](tests/integrations/test_agents_matrix.py) |
+
+### Tier-1 Frameworks
+
+| Framework | Wire | Setup | Integration test |
+|---|---|---|---|
+| [LangChain](https://langchain.com) (+ [LangGraph](https://langchain-ai.github.io/langgraph/)) | `/v1/chat/completions` | `ChatOpenAI(base_url=…)`; LangGraph builds on the same client | [test_langchain.py](tests/integrations/test_langchain.py) · [matrix cell](tests/integrations/test_frameworks_matrix.py) |
+| [PydanticAI](https://ai.pydantic.dev) | `/v1/chat/completions` | `OpenAIChatModel(provider=OpenAIProvider(base_url=…))` | [test_pydantic_ai_full.py](tests/integrations/test_pydantic_ai_full.py) · [matrix cell](tests/integrations/test_frameworks_matrix.py) |
+| [smolagents](https://github.com/huggingface/smolagents) | `/v1/chat/completions` | `OpenAIServerModel(api_base=…)` | [test_smolagents_full.py](tests/integrations/test_smolagents_full.py) · [matrix cell](tests/integrations/test_frameworks_matrix.py) |
+
+### Compatible (community-verified)
+
+Plugs into the OpenAI-compatible URL. No per-model matrix — if these break, they're one config-line away from working again.
+
+| Client | Setup | Notes |
+|---|---|---|
+| [Cursor](https://cursor.com) | Settings → Models → OpenAI Base URL = `http://localhost:8000/v1` | Agent / composer mode uses tool calls automatically |
+| [LibreChat](https://librechat.ai) | Docker; `librechat.yaml` under `endpoints.custom` | [test_librechat_docker.py](tests/integrations/test_librechat_docker.py) |
+| [Open WebUI](https://github.com/open-webui/open-webui) | Docker; `OPENAI_API_BASE_URL=http://host.docker.internal:8000/v1` | [test_openwebui.py](tests/integrations/test_openwebui.py) |
+| [Continue.dev](https://continue.dev) | VS Code / JetBrains extension | ⚠️ Upstream repo went read-only 2026-06-19; users should migrate to **Kilo Code** (Tier 1 above) |
+| Any OpenAI-compatible app | Point at `http://localhost:8000/v1` | — |
+
+### Model × Agent test matrix
+
+Two matrices track integration coverage (see [tests/integrations/README.md](tests/integrations/README.md)):
+
+**Agent × Family (8 × 3 = 24 cells)**
+
+| Agent | Qwen 3.6 | Gemma 4 | gpt-oss |
+|---|---|---|---|
+| codex-cli | 🔲 | 🔲 | 🔲 |
+| claude-code | 🔲 | 🔲 | 🔲 |
+| opencode | 🔲 | 🔲 | 🔲 |
+| qwen-code | 🔲 | 🔲 | 🔲 |
+| openhands | 🔲 | 🔲 | 🔲 |
+| hermes-agent | 🔲 | 🔲 | 🔲 |
+| aider | 🔲 | 🔲 | 🔲 |
+| kilo-code | 🔲 | 🔲 | 🔲 |
+
+**Framework × Family (3 × 3 = 9 cells)**
+
+| Framework | Qwen 3.6 | Gemma 4 | gpt-oss |
+|---|---|---|---|
+| LangChain (+ LangGraph) | 🔲 | 🔲 | 🔲 |
+| PydanticAI | 🔲 | 🔲 | 🔲 |
+| smolagents | 🔲 | 🔲 | 🔲 |
+
+Legend: ✅ passing · ⚠️ skipped (known cause) · 🔲 pending (fills in during 0.10.6 Phase 4 plumbing).
 
 ### Quick setup snippets
 
@@ -267,24 +310,21 @@ ANTHROPIC_BASE_URL=http://localhost:8000 ANTHROPIC_API_KEY=not-needed claude
 aider --openai-api-base http://localhost:8000/v1 --openai-api-key not-needed
 ```
 
-**Goose:**
-```bash
-GOOSE_PROVIDER=ollama OLLAMA_HOST=http://localhost:8000 \
-GOOSE_MODEL=default goose run --text "hello"
+**Qwen Code** — `rapid-mlx agents qwen-code --setup` writes `~/.qwen/settings.json`. Or by hand:
+```json
+{
+  "openaiCompatible": {
+    "baseUrl": "http://localhost:8000/v1",
+    "apiKey": "not-needed",
+    "model": "default"
+  }
+}
 ```
+
+**Kilo Code** — `rapid-mlx agents kilo-code --setup` writes `~/.config/kilo-code/settings.json`. In the VS Code extension: Settings → Kilo Code → API Provider = `openai`; Base URL = `http://localhost:8000/v1`.
 
 <details>
-<summary><strong>More client setup snippets (Continue.dev, OpenCode, LibreChat, Open WebUI, Hermes, PydanticAI, smolagents, Anthropic SDK)</strong></summary>
-
-**Continue.dev** (`~/.continue/config.yaml`):
-```yaml
-models:
-  - name: rapid-mlx
-    provider: openai
-    model: default
-    apiBase: http://localhost:8000/v1
-    apiKey: not-needed
-```
+<summary><strong>More client setup snippets (OpenCode, OpenHands, LibreChat, Open WebUI, Hermes, PydanticAI, smolagents, Anthropic SDK)</strong></summary>
 
 **OpenCode** (`opencode.json` in your project root):
 ```json
@@ -338,17 +378,10 @@ model:
   context_length: 32768
 ```
 
-**OpenClaude:**
+**OpenHands** (env vars — uses LiteLLM under the hood):
 ```bash
-CLAUDE_CODE_USE_OPENAI=1 OPENAI_BASE_URL=http://localhost:8000/v1 \
-OPENAI_API_KEY=not-needed OPENAI_MODEL=default openclaude -p "hello"
-```
-
-**Claw Code:**
-```bash
-export OPENAI_BASE_URL=http://localhost:8000/v1
-export OPENAI_API_KEY=not-needed
-claw --model "openai/default" prompt "summarize this repo"
+LLM_BASE_URL=http://localhost:8000/v1 LLM_API_KEY=not-needed \
+LLM_MODEL=default openhands
 ```
 
 **PydanticAI** (`pip install pydantic-ai`):
@@ -845,7 +878,7 @@ Qwen3.5 uses Gated DeltaNet (75% RNN) + full attention (25% KV). Other engines r
 | **KV cache quantization** | Quantize prefix cache entries to reduce memory | All models with `--kv-cache-quantization` |
 | **DFlash speculative decoding** | Block-diffusion drafter, parallel draft + verify (single-user) | `qwen3.5-27b-8bit`, `qwen3.6-27b-8bit` with `--speculative-config '{"method":"dflash"}'` |
 | **DDTree speculative decoding** | DFlash draft-tree verification over multiple branches | `qwen3.5-9b-8bit` (experimental, single-user) |
-| **MTP speculative decoding** | Multi-token prediction head shipped with the model | MTP-trained checkpoints with `--speculative-config '{"method":"mtp"}'` |
+| **MTP speculative decoding** | Multi-token prediction head shipped with the model | Existing MTP-eligible checkpoints with `--speculative-config '{"method":"mtp"}'` |
 | **SuffixDecoding** | Drafter-free, statistical n-gram lookup speculative decoding | All BatchedEngine models with `--suffix-decoding` |
 | **Prefill chunking** | Configurable step size for large-prompt throughput | All models |
 | **Cloud routing** | Offload high-token requests to cloud LLM when local is slow | All models with `--cloud-model` |
@@ -911,11 +944,13 @@ rapid-mlx serve qwen3.5-27b-8bit --speculative-config '{"method":"dflash"}'
 
 Workload sensitivity: coding / math / summarization typically see **1.5–2.7×**; high-entropy creative writing and long-form chat can dip to **0.6–0.9×** because the drafter's training distribution diverges from open-ended generation — a known spec-decode literature pattern ([AdaEDL](https://arxiv.org/abs/2410.18351)), not a bug. DFlash mode runs a dedicated single-user server (no batched kernel yet); tool calling, MCP, and embeddings aren't available in that mode — restart without DFlash for those.
 
-**MTP** (Multi-Token Prediction) — draft head baked into the model. Opt in with `--speculative-config '{"method":"mtp"}'` on MTP-trained checkpoints. When using an already-supported MTP sidecar flow, pass the sidecar path in the config `model` field; it maps to the existing `--mtp-sidecar` plumbing.
+**MTP** (Multi-Token Prediction) — draft head baked into the model. Opt in with `--speculative-config '{"method":"mtp"}'` on checkpoints accepted by the existing MTP eligibility gate. `num_speculative_tokens` maps to the existing MTP max-K controller ceiling; `disable_auto_k` pins the fixed-K=1 bench path. Gemma 4 assistant-sidecar MTP is not advertised because July 2026 A/B validation found greedy output divergence; it remains disabled until a lossless implementation lands.
+
+For fixed-K parity benches:
 
 ```bash
-rapid-mlx serve mlx-community/gemma-4-12b-it-4bit \
-  --speculative-config '{"method":"mtp","model":"google/gemma-4-12B-it-assistant"}'
+rapid-mlx serve <mtp-eligible-qwen-checkpoint> \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":1,"disable_auto_k":true}'
 ```
 
 **SuffixDecoding** — drafter-free, statistical n-gram lookup over the running suffix. Opt in with `--suffix-decoding`; works on any BatchedEngine alias.
@@ -935,7 +970,7 @@ rapid-mlx serve qwen3.5-9b-8bit \
   --speculative-config '{"method":"ddtree","model":"z-lab/Qwen3.5-9B-DFlash","num_speculative_tokens":16,"tree_budget":24}'
 ```
 
-`--enable-dflash` remains as a compatibility shorthand for `--speculative-config '{"method":"dflash"}'`, and `--dflash-drafter-path` maps to the config `model` field. `--enable-ddtree` similarly remains as a compatibility shorthand for `--speculative-config '{"method":"ddtree"}'`. `--spec-decode mtp` remains as a compatibility shorthand for `--speculative-config '{"method":"mtp"}'`, and `--mtp-sidecar` maps to the config `model` field. None of these backends is enabled by default. SuffixDecoding keeps its existing flag until it migrates behind the same config interface.
+`--enable-dflash` remains as a compatibility shorthand for `--speculative-config '{"method":"dflash"}'`, and `--dflash-drafter-path` maps to the config `model` field. `--enable-ddtree` similarly remains as a compatibility shorthand for `--speculative-config '{"method":"ddtree"}'`. For MTP, `--speculative-config '{"method":"mtp"}'` is the preferred public path; the old `--spec-decode mtp` shorthand remains accepted as a hidden deprecated compatibility path. `--suffix-decoding` remains as a compatibility shorthand for `--speculative-config '{"method":"suffix"}'`. None of these backends is enabled by default.
 
 Mutex: DFlash cannot combine with MTP or SuffixDecoding (single-user path). MTP and SuffixDecoding cannot combine with each other (both consume the drafter slot).
 
@@ -975,10 +1010,9 @@ Mutex: DFlash cannot combine with MTP or SuffixDecoding (single-user path). MTP 
 | `--prefix-cache-index` | Prefix-cache lookup index: `radix` (default) or `hash` | `radix` |
 | `--pflash` | PFlash sparse prefill: `auto` / `always` / `off` | `auto` (on for verified aliases) |
 | `--enable-dflash` | Compatibility shorthand for DFlash speculative decoding (single-user; prefer `--speculative-config '{"method":"dflash"}'`) | off |
-| `--speculative-config` | vLLM-style speculative decoding JSON config; supports DFlash `{"method":"dflash"}`, DDTree `{"method":"ddtree"}`, and MTP `{"method":"mtp"}` | off |
+| `--speculative-config` | vLLM-style speculative decoding JSON config; supports DFlash, DDTree, MTP, and SuffixDecoding | off |
 | `--enable-ddtree` | Compatibility shorthand for DDTree speculative decoding (single-user; `qwen3.5-9b-8bit`) | off |
 | `--suffix-decoding` | Drafter-free n-gram speculative decoding (BatchedEngine path) | off |
-| `--spec-decode mtp` | Compatibility shorthand for MTP head speculative decoding; prefer `--speculative-config '{"method":"mtp"}'` | off |
 | `--gpu-memory-utilization` | Fraction of device memory to use (0.0-1.0) | `0.90` |
 
 **Cloud routing**
@@ -1182,7 +1216,7 @@ harness/                 # Regression baselines + thresholds
 | [DFlash](https://arxiv.org/abs/2602.06036) — block-diffusion drafter, single-user | 1.3–2× decode (workload-dependent) | Shipping, opt-in (`--speculative-config '{"method":"dflash"}'`, `[dflash]` extra; qwen3.5-27b-8bit, qwen3.6-27b-8bit) |
 | [DDTree](https://arxiv.org/abs/2604.12989) — DFlash draft-tree verification, single-user | TBD on rapid-mlx 9B gate | Experimental (`--speculative-config '{"method":"ddtree"}'`; `--enable-ddtree` compatibility shorthand) |
 | [SuffixDecoding](https://arxiv.org/abs/2411.04975) — drafter-free n-gram speculative | 1.1–1.5× decode | Shipping (`--suffix-decoding`, per-model tier sweep ongoing) |
-| MTP — Multi-Token Prediction head | 1.4–1.7× decode | Shipping, opt-in (`--speculative-config '{"method":"mtp"}'`; `--spec-decode mtp` compatibility shorthand) |
+| MTP — Multi-Token Prediction head | Workload-dependent decode gain | Shipping for existing MTP-eligible checkpoints, opt-in (`--speculative-config '{"method":"mtp"}'`) |
 | [EAGLE-3](https://arxiv.org/abs/2503.01840) — feature-level draft on Metal | 3–6.5× decode | Not started |
 | [ReDrafter](https://arxiv.org/abs/2403.09919) — Apple's RNN draft head | 1.4–1.5× decode | Not started |
 

@@ -84,13 +84,14 @@ register_spec_decoder(
         method="mtp",
         description="Model-side multi-token prediction head",
         config_enabled=True,
-        legacy_hint="use --spec-decode mtp",
+        legacy_hint='use --speculative-config \'{"method":"mtp"}\'',
     )
 )
 register_spec_decoder(
     SpecDecoderPlugin(
         method="suffix",
-        description="Drafter-free suffix / n-gram speculative decoding",
+        description=("Explicit suffix / n-gram speculation for high-overlap workloads"),
+        config_enabled=True,
         legacy_hint="use --suffix-decoding",
         aliases=("ngram",),
     )
