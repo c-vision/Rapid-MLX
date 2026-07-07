@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DS4 Downloader - handles model downloads with resume support and parallel chunks."""
+"""Model downloader - handles model downloads with resume support and parallel chunks."""
 
 from __future__ import annotations
 
@@ -12,15 +12,15 @@ import urllib.parse
 
 import requests
 
-from vllm_mlx.tools.ds4_manager import DS4StatusManager
+from vllm_mlx.tools.model_download_status import ModelDownloadStatusManager
 
 
-class DS4DownloadError(Exception):
-    """Exception raised when DS4 download fails."""
+class ModelDownloadError(Exception):
+    """Exception raised when a model download fails."""
     pass
 
 
-class DS4Downloader:
+class ModelDownloader:
     """Handles downloading models with resume support, parallel chunks, and integrity verification."""
 
     # Configuration constants
@@ -33,23 +33,23 @@ class DS4Downloader:
 
     def __init__(self, cache_dir: Optional[Path | str] = None):
         """
-        Initialize the DS4 downloader.
+        Initialize the model downloader.
 
         Args:
             cache_dir: Directory to store downloaded models (default: from env or default)
         """
-        self.cache_dir = Path(cache_dir) if cache_dir else Path.home() / ".cache" / "rapid-mlx" / "ds4"
+        self.cache_dir = Path(cache_dir) if cache_dir else Path.home() / ".cache" / "rapid-mlx" / "downloads"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # Session for connection pooling and headers
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Rapid-MLX-DS4-Downloader/1.0",
+            "User-Agent": "Rapid-MLX-Downloader/1.0",
             "Accept": "*/*",
         })
 
         # Status manager for tracking
-        self.status_manager = DS4StatusManager(self.cache_dir)
+        self.status_manager = ModelDownloadStatusManager(self.cache_dir)
 
     def _get_hf_download_url(self, model_id: str) -> Optional[str]:
         """
@@ -149,7 +149,7 @@ class DS4Downloader:
         """
         headers = {
             "Range": f"bytes={start}-{end - 1}" if end > start else "bytes=*/",
-            "User-Agent": "Rapid-MLX-DS4-Downloader/1.0",
+            "User-Agent": "Rapid-MLX-Downloader/1.0",
         }
 
         for attempt in range(retries + 1):
@@ -330,7 +330,7 @@ class DS4Downloader:
                         # Download this chunk
                         headers = {
                             "Range": f"bytes={downloaded}-{chunk_end - 1}",
-                            "User-Agent": "Rapid-MLX-DS4-Downloader/1.0",
+                            "User-Agent": "Rapid-MLX-Downloader/1.0",
                         }
 
                         for attempt in range(self.RETRY_ATTEMPTS + 1):
@@ -373,7 +373,7 @@ class DS4Downloader:
                 # No size info - download as single chunk
                 headers = {
                     "Range": f"bytes={start_byte}-",
-                    "User-Agent": "Rapid-MLX-DS4-Downloader/1.0",
+                    "User-Agent": "Rapid-MLX-Downloader/1.0",
                 }
 
                 response = self.session.get(
@@ -428,7 +428,7 @@ class DS4Downloader:
 # Convenience function for external use
 def download_model(model_id: str, show_progress: bool = True) -> tuple[bool, Optional[str]]:
     """
-    Convenience function to download a model using DS4.
+    Convenience function to download a model.
 
     Args:
         model_id: Model identifier (e.g., "mlx-community/Qwen3.5-27B-8bit")
@@ -437,5 +437,5 @@ def download_model(model_id: str, show_progress: bool = True) -> tuple[bool, Opt
     Returns:
         Tuple of (success: bool, file_path: Optional[str])
     """
-    downloader = DS4Downloader()
+    downloader = ModelDownloader()
     return downloader.download_model(model_id, show_progress)
