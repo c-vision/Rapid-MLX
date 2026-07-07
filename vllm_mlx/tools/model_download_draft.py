@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-DS4 Download Tool for Rapid-MLX
+Model download tool for Rapid-MLX (early draft, superseded by model_downloader.py)
 
-This module handles downloading models to the DS4 cache directory with:
+This is an earlier, incomplete iteration of the download tooling — it has
+several undefined-name bugs (see download_model/download_range below) and
+was never wired into the CLI. model_downloader.py is the version that
+actually runs. Kept here for reference only; not imported anywhere.
+
+This module was meant to handle downloading models to the local cache
+directory with:
 - Parallel multi-part downloads
 - Progress tracking
 - Resume support
@@ -27,21 +33,21 @@ from vllm_mlx.utils import get_cache_dir, get_env_variable
 # Constants
 CHUNK_SIZE = 1024 * 64  # 64KB
 MAX_RETRIES = 3
-DS4_DIR_NAME = "ds4"
-DS4_STATUS_FILE = "ds4_status.json"
+DOWNLOAD_DIR_NAME = "downloads"
+DOWNLOAD_STATUS_FILE = "download_status.json"
 
-class DS4Downloader:
+class ModelDownloader:
     """Handles downloading models with resume support and integrity verification."""
 
     def __init__(self, cache_dir: str | None = None):
         """
-        Initialize the DS4 downloader.
+        Initialize the model downloader.
 
         Args:
             cache_dir: Directory to store downloaded models (default: from env or default)
         """
         self.cache_dir = get_cache_dir() if cache_dir is None else cache_dir
-        self.status_file = Path(self.cache_dir) / DS_STATUS_FILE
+        self.status_file = Path(self.cache_dir) / DOWNLOAD_STATUS_FILE
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_chunk_size(self, file_size: int) -> int:

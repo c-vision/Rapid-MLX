@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DS4 Status Manager - tracks download state for resume support."""
+"""Model download status manager - tracks download state for resume support."""
 
 from __future__ import annotations
 
@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
-class DS4StatusManager:
-    """Manage DS4 downloads status tracking with atomic operations."""
+class ModelDownloadStatusManager:
+    """Manage model download status tracking with atomic operations."""
 
     def __init__(self, cache_dir: Path | str | None = None):
-        self.cache_dir = Path(cache_dir) if cache_dir else Path.home() / ".cache" / "rapid-mlx" / "ds4"
-        self.status_file = self.cache_dir / "ds4_status.json"
+        self.cache_dir = Path(cache_dir) if cache_dir else Path.home() / ".cache" / "rapid-mlx" / "downloads"
+        self.status_file = self.cache_dir / "download_status.json"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._init_status_file()
 

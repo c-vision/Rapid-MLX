@@ -44,9 +44,9 @@ Any alias (yours or built-in) can pin a `path:` field pointing at an already-dow
 
 Full reference: [`vllm_mlx/alias_resolver.py`](vllm_mlx/alias_resolver.py), tests in [`tests/test_alias_resolver.py`](tests/test_alias_resolver.py).
 
-### 3. DS4 download tooling (work in progress, **not yet tested end-to-end**)
+### 3. Model download tooling (work in progress, **not yet tested end-to-end**)
 
-An experimental parallel-download manager (`vllm_mlx/tools/ds4_download.py`, `ds4_downloader.py`, `ds4_manager.py`) intended to speed up and make resumable the process of fetching a model into the alias-path cache, with SHA256 integrity verification. **This is unfinished and unverified** — no automated test coverage yet, and it hasn't been exercised against a real download end-to-end. Treat it as a preview, not something to rely on; contributions or bug reports on it are welcome.
+An experimental parallel-download manager (`vllm_mlx/tools/model_downloader.py` + `model_download_status.py`) intended to speed up and make resumable the process of fetching a model into the alias-path cache, with SHA256 integrity verification. **This is unfinished and unverified** — no automated test coverage yet, it isn't wired into the CLI, and it hasn't been exercised against a real download end-to-end. There's also an earlier, broken draft of the same idea kept around for reference (`model_download_draft.py`) — not used by anything. Treat all of this as a preview, not something to rely on; contributions or bug reports on it are welcome.
 
 ### 4. Kept current with upstream
 
