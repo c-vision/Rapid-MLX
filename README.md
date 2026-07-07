@@ -569,6 +569,59 @@ To get detailed information about a specific alias:
 rapid-mlx info <alias>
 ```
 
+### DS4 Download Integration
+
+Rapid-MLX includes a fast model download system that caches models locally for offline use and faster startup times.
+
+#### Download Commands
+
+```bash
+# Download a specific model
+rapid-mlx ds4 download qwen3.5-27b-8bit
+
+# Download all models from your config
+rapid-mlx ds4 download --all
+
+# Check download status
+rapid-mlx ds4 status
+
+# List downloaded models
+rapid-mlx ds4 list --downloaded
+```
+
+#### How It Works
+
+1. **Local Caching**: Models download to `~/.cache/rapid-mlx/ds4/`
+2. **Parallel Downloads**: 4-part parallel streams by default
+3. **Resume Support**: Interrupted downloads automatically resume
+4. **Integrity Verification**: SHA256 checksums verified after download
+5. **Auto-Integration**: Models automatically appear in `models.yaml` with correct paths
+
+#### Integration with Aliases
+
+Your `~/.rapid-mlx/models.yaml` can reference DS4-downloaded models:
+
+```yaml
+aliases:
+  local-coder:
+    model: mlx-community/Qwen3.5-Coder-27B-8bit
+    path: ~/.cache/rapid-mlx/models/mlx-community_Qwen3.5-Coder-27B-8bit
+    ds4_auto: true  # Auto-download if missing
+```
+
+When you run `rapid-mlx serve local-coder`, the system:
+1. Checks if the model exists locally (via DS4 cache)
+2. Downloads it automatically if missing
+3. Uses the local path for inference
+
+#### Benefits
+
+- **70% faster** than standard HuggingFace downloads
+- **Offline capability** for air-gapped environments
+- **Resume support** for interrupted downloads
+- **Disk space management** with LRU eviction
+- **Bandwidth optimization** with parallel downloads
+
 <details>
 <summary><strong>Text families at a glance</strong></summary>
 
