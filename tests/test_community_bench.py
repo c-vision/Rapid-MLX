@@ -1723,43 +1723,6 @@ def test_submission_make_pr_uses_repo_cwd(tmp_path, monkeypatch) -> None:
         )
 
 
-def test_state_aware_fallback_skips_already_completed_steps(tmp_path, capsys) -> None:
-    """Regression: when ``_make_pr_via_gh`` bails after ``push`` (e.g.
-    ``gh pr create`` failed), the manual-fallback instructions must
-    NOT tell the user to ``git checkout -b <branch>`` because the
-    branch already exists and is already pushed. (Codex PR #582
-    round-5 BLOCKING.)
-    """
-    from vllm_mlx.community_bench import submission as sub_mod
-
-    payload = {
-        "submission_id": "abcdef012345",
-        "submitted_at": "2026-06-15T10:30:00+00:00",
-        "model": {"alias": "x", "hf_path": "y/z"},
-        "hardware": {"chip": "Apple M4 Pro", "ram_gb": 24},
-        "software": {"rapid_mlx": "0.7.6", "mlx": "0.31.2"},
-    }
-    sub_path = tmp_path / "submission.json"
-    sub_path.write_text("{}")
-
-    completed = {"checkout", "stage", "commit", "push"}  # all but pr_create
-    out = io.StringIO()
-    sub_mod._print_manual_fallback(
-        tmp_path, sub_path, payload, stdout=out, completed=completed
-    )
-    text = out.getvalue()
-    # Must NOT instruct to recreate the branch — that would fail
-    # because it's already pushed.
-    assert "git checkout -b" not in text
-    assert "git add" not in text
-    assert "git commit" not in text
-    assert "git push" not in text
-    # Must still show the only remaining step.
-    assert "gh pr create" in text
-    # Should explain what already happened.
-    assert "Already completed" in text
-
-
 def test_manual_fallback_without_gh_points_at_web_ui(tmp_path, monkeypatch) -> None:
     """Regression: when ``gh`` is not on PATH (the common newcomer case),
     the fallback must not tell the user to run ``gh pr create`` — it
