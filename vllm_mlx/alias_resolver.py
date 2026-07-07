@@ -61,9 +61,13 @@ def _validate_modality(value) -> bool:
 
 
 def _validate_hardware(value) -> bool:
-    """Check that hardware value is one of the allowed hardware identifiers (or None)."""
+    """Check that hardware value is one of the allowed hardware identifiers,
+    a list of them (e.g. ``[m1, m2, m3, m4]`` for "works on any of these"),
+    or None."""
     if value is None:
         return True
+    if isinstance(value, list):
+        return all(v in _ALLOWED_HARDWARE for v in value)
     return value in _ALLOWED_HARDWARE
 
 

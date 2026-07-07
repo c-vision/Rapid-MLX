@@ -11973,27 +11973,35 @@ def main():
         and args.model
         and getattr(args, "command", None) != "doctor"
     ):
-        from vllm_mlx.alias_resolver import resolve_model_id as resolve_model
+        from vllm_mlx.alias_resolver import get_resolver, resolve_model_id as resolve_model
 
         resolver = get_resolver()
-        resolved_model_id = resolve_model_id(args.model)
+        resolved_model_id = resolve_model(args.model)
 
         # Check for path override in alias config
         resolved_alias = resolver.resolve(args.model)
+        already_resolved = False
         if resolved_alias and resolved_alias.path:
             # Use custom path if specified
             args.model = resolved_alias.path
             print(f"  Alias: {args.model} → {resolved_alias.path} (local path)")
+            already_resolved = True
         elif resolved_model_id != args.model:
-            # Regular alias resolution
-            print(f"  Alias: {args.model} → {resolved_model_id}")
+            # Regular alias resolution. Keep stdout pure JSON for
+            # machine-readable modes (jlens --json); the human-facing
+            # alias banner goes to stderr there.
+            _alias_stream = (
+                sys.stderr
+                if getattr(args, "command", None) == "jlens"
+                and getattr(args, "json", False)
+                else sys.stdout
+            )
+            print(f"  Alias: {args.model} → {resolved_model_id}", file=_alias_stream)
             args._original_alias = args.model
             args.model = resolved_model_id
-        if resolved != args.model:
-            print(f"  Alias: {args.model} → {resolved}")
-            args._original_alias = args.model
-            args.model = resolved
-        elif "/" not in args.model and not os.path.exists(args.model):
+            already_resolved = True
+
+        if not already_resolved and "/" not in args.model and not os.path.exists(args.model):
             # R8-M5 (Bo 0.8.9 dogfood): short audio aliases (``kokoro``,
             # ``whisper``, ``parakeet``, ``chatterbox``, ``vibevoice``,
             # ``voxcpm``) and their full-form siblings (``kokoro-82m-
