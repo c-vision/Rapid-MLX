@@ -4360,6 +4360,7 @@ def pull_command(args):
             stall_minutes=getattr(args, "stall_timeout", None),
             retries=getattr(args, "stall_retries", None),
             max_workers=getattr(args, "workers", None),
+            disable_xet=getattr(args, "disable_xet", False),
         )
         if not success:
             print(f"\n  Error: download of '{repo_id}' failed — see above.")
@@ -7648,6 +7649,15 @@ Examples:
         default=None,
         help="With --dest: parallel per-file transfers passed straight to "
         "snapshot_download. Default: 8.",
+    )
+    pull_parser.add_argument(
+        "--disable-xet",
+        action="store_true",
+        help="With --dest: skip HuggingFace's Xet transport and start "
+        "straight on the classic HTTP/LFS path — worth setting once a "
+        "repo is known to stall on Xet, to skip the wasted wait to "
+        "rediscover that. Default: off (still auto-escalates if Xet "
+        "turns out to be broken).",
     )
     rm_parser = subparsers.add_parser(
         "rm", help="Remove a cached model from the HuggingFace cache"
