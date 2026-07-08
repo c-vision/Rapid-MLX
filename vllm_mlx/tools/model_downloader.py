@@ -415,6 +415,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         retries: Optional[int] = None,
         max_workers: Optional[int] = None,
         disable_xet: bool = False,
+        no_token: bool = False,
     ) -> tuple[bool, Optional[str]]:
         """
         Download a full model repo, with resume support and SHA256
@@ -441,6 +442,13 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
                 known to stall on Xet, to skip the wasted wait to
                 rediscover that. Default: False (still auto-escalates if
                 Xet turns out to be broken, same as always).
+            no_token: Ignore HF_TOKEN even if it's set and download
+                unauthenticated. Worth trying if authenticated transfers are
+                stalling for a repo/token combination that's seen heavy
+                traffic — HuggingFace's per-token and per-IP rate limits are
+                tracked separately, so one can be throttled while the other
+                isn't. Default: False (use HF_TOKEN when present, same as
+                always).
 
         Returns:
             Tuple of (success, final directory path or None on failure).
@@ -463,12 +471,18 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
                 print(f"✓ Model '{model_id}' already downloaded: {status['path']}")
             return True, status["path"]
 
-        token = os.environ.get("HF_TOKEN")
-        if show_progress:
-            if token:
-                print(f"  Using HF_TOKEN from environment ({_masked_token(token)})")
-            else:
-                print("  No HF_TOKEN found in environment — downloading unauthenticated (slower, stricter rate limits).")
+        env_token = os.environ.get("HF_TOKEN")
+        if no_token and env_token:
+            token = None
+            if show_progress:
+                print(f"  --no-token: ignoring HF_TOKEN from environment ({_masked_token(env_token)}), downloading unauthenticated.")
+        else:
+            token = env_token
+            if show_progress:
+                if token:
+                    print(f"  Using HF_TOKEN from environment ({_masked_token(token)})")
+                else:
+                    print("  No HF_TOKEN found in environment — downloading unauthenticated (slower, stricter rate limits).")
 
         total_bytes = estimate_repo_size_bytes(model_id)
 
@@ -518,6 +532,7 @@ def download_model(
     retries: Optional[int] = None,
     max_workers: Optional[int] = None,
     disable_xet: bool = False,
+    no_token: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """
     Convenience function to download a model.
@@ -536,6 +551,8 @@ def download_model(
         disable_xet: Skip Xet and start on the classic HTTP/LFS path —
             worth setting once a repo is known to stall on Xet. Default:
             False (still auto-escalates if Xet turns out to be broken).
+        no_token: Ignore HF_TOKEN even if set, download unauthenticated.
+            Default: False.
 
     Returns:
         Tuple of (success: bool, final directory path or None on failure)
@@ -549,4 +566,5 @@ def download_model(
         retries=retries,
         max_workers=max_workers,
         disable_xet=disable_xet,
+        no_token=no_token,
     )
