@@ -105,7 +105,6 @@ class ModelDownloader:
     STALL_MINUTES = 5
     MAX_STALL_RETRIES = 3
     STALL_POLL_SECONDS = 15
-    HEARTBEAT_SECONDS = 30
     XET_DISABLE_VAR = "HF_HUB_DISABLE_XET"
 
     def __init__(self, cache_dir: Optional[Path | str] = None):
@@ -204,12 +203,17 @@ class ModelDownloader:
         never notices, since it has no default read timeout — the process
         would otherwise block in a socket read forever).
 
-        Prints a heartbeat every HEARTBEAT_SECONDS regardless of whether
-        anything stalled — snapshot_download goes quiet for a while up
-        front verifying already-downloaded partial files before resuming,
-        and that quiet phase has no progress signal of its own. Both the
-        heartbeat and the huggingface_hub tqdm bar it would otherwise race
-        against on the same terminal line are handled by the caller.
+Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
+        of whether anything stalled — snapshot_download goes quiet for a
+        while up front verifying already-downloaded partial files before
+        resuming, and that quiet phase has no progress signal of its own.
+        Includes the transfer rate since the last poll, not just the
+        cumulative total — a single in-place-updating byte count is easy
+        to mistake for frozen output; a moving rate is the difference
+        between "is this actually doing anything?" and "it says 8.7 GiB,
+        same as it said a moment ago, is that stuck or just slow?". Both
+        the heartbeat and the huggingface_hub tqdm bar it would otherwise
+        race against on the same terminal line are handled by the caller.
 
         Returns (ok, err, all_attempts_stalled) — the third value is True
         only when every attempt stalled out (as opposed to a real error
@@ -229,7 +233,8 @@ class ModelDownloader:
             start_time = time.monotonic()
             last_size = _dir_size_bytes(final_dir)
             last_progress = start_time
-            last_heartbeat = start_time
+            poll_size = last_size
+            poll_time = start_time
             last_line_len = 0
             stalled = False
 
@@ -255,11 +260,16 @@ class ModelDownloader:
                         proc.join()
                     break
 
-                if show_progress and now - last_heartbeat >= self.HEARTBEAT_SECONDS:
+                if show_progress:
+                    interval = now - poll_time
+                    rate = (size - poll_size) / interval if interval > 0 else 0.0
                     last_line_len = _print_status_line(
-                        f"  ... {_format_size(size)} on disk, {now - start_time:.0f}s elapsed", last_line_len
+                        f"  ... {_format_size(size)} on disk ({_format_size(rate)}/s), "
+                        f"{now - start_time:.0f}s elapsed",
+                        last_line_len,
                     )
-                    last_heartbeat = now
+                poll_size = size
+                poll_time = now
 
             if not stalled:
                 if show_progress:
