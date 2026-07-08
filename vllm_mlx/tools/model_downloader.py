@@ -23,6 +23,7 @@ from typing import Optional
 import requests
 from huggingface_hub import snapshot_download
 
+from vllm_mlx._download_gate import estimate_repo_size_bytes
 from vllm_mlx.tools.model_download_status import ModelDownloadStatusManager
 
 
@@ -197,6 +198,7 @@ class ModelDownloader:
         token: Optional[str],
         max_attempts: int,
         max_workers: int,
+        total_bytes: Optional[int],
     ) -> tuple[bool, Optional[str], bool]:
         """Runs up to max_attempts download attempts, restarting the
         subprocess whenever final_dir's total size hasn't grown in
@@ -264,9 +266,13 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
                 if show_progress:
                     interval = now - poll_time
                     rate = (size - poll_size) / interval if interval > 0 else 0.0
+                    if total_bytes:
+                        pct = min(100.0, size / total_bytes * 100)
+                        size_part = f"{_format_size(size)} / {_format_size(total_bytes)} ({pct:.0f}%)"
+                    else:
+                        size_part = f"{_format_size(size)} on disk"
                     last_line_len = _print_status_line(
-                        f"  ... {_format_size(size)} on disk ({_format_size(rate)}/s), "
-                        f"{now - start_time:.0f}s elapsed",
+                        f"  ... {size_part} ({_format_size(rate)}/s), {now - start_time:.0f}s elapsed",
                         last_line_len,
                     )
                 poll_size = size
@@ -295,6 +301,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         retries: Optional[int] = None,
         max_workers: Optional[int] = None,
         disable_xet: bool = False,
+        total_bytes: Optional[int] = None,
     ) -> tuple[bool, Optional[str]]:
         """Runs the download, retrying stalls, and escalating once if every
         attempt in a row stalls out.
@@ -342,7 +349,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         max_workers = max_workers if max_workers is not None else self.MAX_CONCURRENT_DOWNLOADS
 
         ok, err, all_stalled = self._run_stall_attempts(
-            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, max_attempts, max_workers
+            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, max_attempts, max_workers, total_bytes
         )
         if ok or not all_stalled or _env_is_true(self.XET_DISABLE_VAR):
             return ok, err
@@ -356,7 +363,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         os.environ[self.XET_DISABLE_VAR] = "1"
 
         ok, err, _ = self._run_stall_attempts(
-            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, max_attempts, max_workers
+            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, max_attempts, max_workers, total_bytes
         )
         return ok, err
 
@@ -424,9 +431,12 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
             else:
                 print("  No HF_TOKEN found in environment — downloading unauthenticated (slower, stricter rate limits).")
 
+        total_bytes = estimate_repo_size_bytes(model_id)
+
         self.status_manager.set_model_status(model_id, "downloading")
         if show_progress:
-            print(f"Downloading '{model_id}' into {final_dir} ...")
+            size_suffix = f" (~{_format_size(total_bytes)})" if total_bytes else ""
+            print(f"Downloading '{model_id}'{size_suffix} into {final_dir} ...")
 
         ok, err = self._download_with_stall_watchdog(
             model_id,
@@ -437,6 +447,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
             retries=retries,
             max_workers=max_workers,
             disable_xet=disable_xet,
+            total_bytes=total_bytes,
         )
         if not ok:
             self.status_manager.set_model_status(model_id, "error", error=err or "download failed")
