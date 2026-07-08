@@ -295,8 +295,19 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
                     interval = now - poll_time
                     rate = (size - poll_size) / interval if interval > 0 else 0.0
                     if total_bytes:
+                        # size can exceed total_bytes despite the dedup in
+                        # _dir_size_bytes: a blob that finished and got
+                        # assembled into a completed shard can still have an
+                        # abandoned .incomplete leftover from an earlier
+                        # failed attempt of that *same* blob sitting in the
+                        # cache — counted once as part of the finished file,
+                        # once again as cache debris, with no cheap way to
+                        # tell the two apart from the filesystem alone. Cap
+                        # what's *displayed* so a real repo never reports
+                        # doing more than 100% of its own advertised size.
+                        shown = min(size, total_bytes)
                         pct = min(100.0, size / total_bytes * 100)
-                        size_part = f"{_format_size(size)} / {_format_size(total_bytes)} ({pct:.0f}%)"
+                        size_part = f"{_format_size(shown)} / {_format_size(total_bytes)} ({pct:.0f}%)"
                     else:
                         size_part = f"{_format_size(size)} on disk"
                     last_line_len = _print_status_line(
