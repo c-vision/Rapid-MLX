@@ -17,12 +17,9 @@ Usage:
 
 import argparse
 import os
-import shlex
 import sys
-from collections.abc import Callable
 
 from vllm_mlx._completion import alias_completer
-from vllm_mlx.model_profile import ModelProfile
 
 # Project-default mirror for ``RAPID_MLX_MODEL_MIRROR`` (consumed by
 # ``_try_mirror_prefetch``). Public Cloudflare Worker → R2 bucket, with
@@ -123,64 +120,6 @@ def _listen_fd_arg(value: str) -> int:
             f"--listen-fd must be between 3 and 1023, got {fd}"
         )
     return fd
-
-
-def non_negative_int(value: str) -> int:
-    """Argparse ``type`` callable: parse a ``>= 0`` integer.
-
-    Rejects a negative value at parse time so a bad ``--response-cache-
-    entries -5`` fails immediately with a clear argparse error, before any
-    model download or load. ``SchedulerConfig.__post_init__`` also rejects
-    negatives, but for ``serve`` that check runs only after the expensive
-    download/load, so the early argparse guard gives the user faster,
-    clearer feedback. The construction-time check stays as defense in
-    depth.
-    """
-    try:
-        n = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"expected a non-negative integer, got {value!r}"
-        ) from None
-    if n < 0:
-        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {n}")
-    return n
-
-
-def positive_int(value: str) -> int:
-    """Argparse ``type`` callable: parse a strictly positive integer."""
-    try:
-        n = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"expected a positive integer, got {value!r}"
-        ) from None
-    if n <= 0:
-        raise argparse.ArgumentTypeError(f"expected a positive integer, got {n}")
-    return n
-
-
-def _vision_pixel_bounds_error(min_pixels: int, max_pixels: int) -> str | None:
-    if min_pixels and max_pixels and min_pixels > max_pixels:
-        return "--vision-min-pixels must not exceed --vision-max-pixels"
-    return None
-
-
-def positive_finite_float(value: str) -> float:
-    """Argparse type for positive, finite resource-budget values."""
-    import math
-
-    try:
-        number = float(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"expected a positive finite number, got {value!r}"
-        ) from None
-    if not math.isfinite(number) or number <= 0:
-        raise argparse.ArgumentTypeError(
-            f"expected a positive finite number, got {value!r}"
-        )
-    return number
 
 
 def _apply_body_receive_timeout_env(server_mod, *, logger=None) -> None:
@@ -295,19 +234,6 @@ def _port_preflight_or_die(host: str, port: int, *, model: str) -> None:
     the ``AF_INET`` socket and was misreported as "port already in use").
     """
     import socket
-
-    # Validate the port range up front. ``socket.bind()`` raises
-    # ``OverflowError`` (NOT an ``OSError`` subclass) for a port outside
-    # 0-65535, so the ``except OSError`` collision handler below would let
-    # it escape as a raw traceback (dogfood #2125: ``--port 99999`` printed
-    # ``OverflowError: bind(): port must be 0-65535`` instead of a friendly
-    # message). Catch the typo here — before any probe — and emit the same
-    # actionable style as the port-in-use path. ``0`` stays valid: it asks
-    # the OS for an ephemeral port, which uvicorn binds normally.
-    if not 0 <= port <= 65535:
-        print(f"\n  Error: --port {port} is out of range. Ports must be 0-65535.")
-        print(f"  Try a valid port: rapid-mlx serve {model} --port 8000")
-        sys.exit(1)
 
     wildcards = _wildcard_host_aliases()
     if host in wildcards:
@@ -532,6 +458,65 @@ def _port_is_busy(host: str, port: int) -> bool:
     return False
 
 
+def _chat_config_dir() -> str:
+    """Directory for first-launch tip markers (and future per-user chat
+    state). Honors ``RAPID_MLX_CONFIG_HOME`` override; otherwise falls back
+    to ``~/.config/rapid-mlx``. The directory is created lazily by the
+    writer; callers don't need to ensure it exists for reads.
+    """
+    override = os.environ.get("RAPID_MLX_CONFIG_HOME")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".config", "rapid-mlx")
+
+
+def _seen_tips_path() -> str:
+    return os.path.join(_chat_config_dir(), "seen-tips.json")
+
+
+def _has_seen_tip(key: str) -> bool:
+    """Return True iff the marker file records ``key: true``.
+
+    Any IO/parse error is treated as "not seen" — better to show the tip
+    one extra time than to hide it forever on a corrupt marker.
+    """
+    import json
+
+    try:
+        with open(_seen_tips_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and bool(data.get(key))
+
+
+def _mark_tip_seen(key: str) -> None:
+    """Persist ``key: true`` to the seen-tips marker. Best-effort —
+    failures are swallowed so a read-only config dir never aborts chat.
+    """
+    import json
+
+    path = _seen_tips_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError:
+        return
+    try:
+        existing: dict = {}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, ValueError):
+            existing = {}
+        existing[key] = True
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(existing, fh)
+    except OSError:
+        return
+
+
 def _print_unknown_model_help(name: str, *, full_path_example: str) -> None:
     """Print fuzzy suggestions + a curated popular-models hint.
 
@@ -542,20 +527,14 @@ def _print_unknown_model_help(name: str, *, full_path_example: str) -> None:
     supported). Now: always show *something* — fuzzy matches when we have
     them, curated popular aliases when we don't.
     """
-    from vllm_mlx.model_aliases import POPULAR_ALIASES, suggest_similar
+    from vllm_mlx.model_aliases import POPULAR_ALIASES, list_aliases, suggest_similar
 
     suggestions = suggest_similar(name)
     if suggestions:
         print(f"  Did you mean: {', '.join(suggestions)}?")
     else:
         print(f"  Try one of: {', '.join(POPULAR_ALIASES)}")
-    # No hardcoded alias total here. ``models`` splits the registry into
-    # tagged sections (chat / audio / video / image), each with its own
-    # accurate per-section count, so a single grand total printed here can
-    # only contradict the first header a user lands on (dogfood #2126:
-    # this line said "182 aliases" while ``models`` opened with "172").
-    # Let ``models`` be the single source of truth for the counts.
-    print("  Run `rapid-mlx models` to see all available aliases,")
+    print(f"  Run `rapid-mlx models` to see all {len(list_aliases())} aliases,")
     print(f"  or pass a full path like: {full_path_example}")
 
 
@@ -768,8 +747,6 @@ def _serve_audio_mode(args, entry) -> None:
 
     # CORS — same friendly default the text path uses.
     server.configure_cors_from_env(args.cors_origins)
-    # WH-1: OPT-IN Host-header allowlist (DNS-rebinding hardening).
-    server.configure_trusted_hosts(getattr(args, "trusted_hosts", None))
     if args.rate_limit > 0:
         server._rate_limiter = configure_rate_limiter(args.rate_limit, enabled=True)
 
@@ -852,9 +829,7 @@ def _serve_audio_mode(args, entry) -> None:
     from vllm_mlx._version_check import print_staleness_warning_if_any
     from vllm_mlx.config import get_config
 
-    # Audio servers are often launched by launchd or another supervisor. Keep
-    # the passive update notice in stderr startup logs even without a TTY.
-    print_staleness_warning_if_any(allow_non_tty=True)
+    print_staleness_warning_if_any()
     print()
 
     _cfg = get_config()
@@ -931,27 +906,9 @@ def _load_embedding_model_or_exit(args, load_fn) -> None:
     # safetensors mid-load, Metal OOM, schema mismatch) surface with
     # their real trace — pr_validate codex r1 NIT closure (the prior
     # ``"not found"`` substring match was too loose).
-    # Validate the embedding input-length setting up front so a bad value
-    # is a clean usage error (exit 2), not a mid-load crash (issue #1381).
-    from .embedding import normalize_max_length_setting
-
-    try:
-        max_length = normalize_max_length_setting(
-            getattr(args, "embedding_max_length", "auto")
-        )
-    except ValueError as exc:
-        print(f"error: --embedding-max-length {exc}", file=sys.stderr)
-        sys.exit(2)
-    overflow_policy = getattr(args, "embedding_overflow_policy", "truncate")
-
     not_found_exc_classes = _embedding_not_found_exception_classes()
     try:
-        load_fn(
-            args.embedding_model,
-            lock=True,
-            max_length=max_length,
-            overflow_policy=overflow_policy,
-        )
+        load_fn(args.embedding_model, lock=True)
     except not_found_exc_classes as exc:
         print(
             f"\n  Error: --embedding-model '{original_embed}' could not "
@@ -978,8 +935,7 @@ def _check_disk_space(model_name: str, force: bool = False) -> None:
     Behaviour:
 
     - Model is already a local path → return.
-    - Files already cached for the current Hub revision are excluded from the
-      required download size.
+    - ``config.json`` is in the cache → assume already downloaded → return.
     - HF API call fails (offline, gated repo, etc.) → return silently. The
       loader's 404/auth handlers will surface the real error if there is one.
     - Determined size and disk is insufficient → print actionable error
@@ -993,68 +949,29 @@ def _check_disk_space(model_name: str, force: bool = False) -> None:
     if os.path.exists(model_name):
         return
 
-    # Which directory inside the repo this alias actually needs. Resolved
-    # OUTSIDE the cache probe below: that probe is best-effort and swallows
-    # its own failures, and folding the prefix into it meant one flaky
-    # ``try_to_load_from_cache`` call silently reverted the size estimate to
-    # the whole repo — demanding disk for eight quantizations and refusing a
-    # machine with ample room for the one being fetched.
-    from vllm_mlx.model_aliases import checkpoint_prefix
-
-    _prefix = checkpoint_prefix(model_name)
-
-    # Keep the historical fast path for ordinary text-model repositories.
-    # Their loaders may intentionally fetch only one of several weight formats,
-    # so treating every uncached sibling as an impending download would count
-    # optional artifacts that the selected loader never requests.
+    # Skip if model is already in the HF cache.
     try:
         from huggingface_hub import try_to_load_from_cache
 
-        cached_config = try_to_load_from_cache(
-            model_name,
-            f"{_prefix}config.json",
-        )
-        if isinstance(cached_config, str) and os.path.exists(cached_config):
+        cached = try_to_load_from_cache(model_name, "config.json")
+        if isinstance(cached, str) and os.path.exists(cached):
             return
     except Exception:
         pass
 
-    # Query HF for the current revision and repo size + free space on the
-    # actual HF cache filesystem. Component-layout repositories such as mflux
-    # have no root config.json, so exclude each file already cached at the
-    # current revision instead of assuming the entire snapshot is missing.
-    # Only this alias's checkpoint counts — a subfolder-per-quant repo would
-    # otherwise demand disk for seven quantizations nobody asked for.
+    # Query HF for repo size + free space on the actual HF cache filesystem.
     try:
-        from huggingface_hub import model_info, try_to_load_from_cache
+        from huggingface_hub import model_info
         from huggingface_hub.constants import HF_HUB_CACHE
 
         info = model_info(model_name, files_metadata=True)
-        revision = getattr(info, "sha", None)
-        siblings = [
-            sibling
-            for sibling in (getattr(info, "siblings", None) or [])
-            if hasattr(sibling, "size")
-            and hasattr(sibling, "rfilename")
-            and (not _prefix or sibling.rfilename.startswith(_prefix))
-        ]
-        model_size_bytes = 0
-        for sibling in siblings:
-            try:
-                cached = try_to_load_from_cache(
-                    model_name,
-                    sibling.rfilename,
-                    revision=revision,
-                )
-                is_cached = isinstance(cached, str) and os.path.exists(cached)
-            except Exception:
-                # A cache lookup is only an optimization. If it is unreadable,
-                # retain the file in the conservative download estimate.
-                is_cached = False
-            if not is_cached:
-                model_size_bytes += sibling.size or 0
+        model_size_bytes = sum(
+            (s.size or 0)
+            for s in (getattr(info, "siblings", None) or [])
+            if hasattr(s, "size")
+        )
         if model_size_bytes == 0:
-            return  # Nothing left to download (or size unavailable).
+            return  # Can't determine size — skip rather than guess.
 
         # statvfs needs an existing path; HF_HUB_CACHE may not exist yet on
         # a fresh install. Walk up to the first ancestor that does.
@@ -1083,7 +1000,7 @@ def _check_disk_space(model_name: str, force: bool = False) -> None:
 
         print()
         print("  Error: Insufficient disk space for download.")
-        print(f"    Download size: {model_size_gb:>7.1f} GB")
+        print(f"    Model size:    {model_size_gb:>7.1f} GB")
         print(f"    Free space:    {available_gb:>7.1f} GB  ({probe})")
         print(f"    Need to free:  {need_to_free_gb:>7.1f} GB")
         print()
@@ -1164,16 +1081,7 @@ def _gather_kv_cache_dtype_inputs(model_name: str) -> tuple[dict | None, dict | 
         from huggingface_hub import try_to_load_from_cache as _cache_lookup
 
         hf_path = (alias_meta or {}).get("hf_path") or model_name
-        # Local model directory (e.g. a freshly ``mlx_lm convert``-ed
-        # ``-rapid`` build served by path): read its ``config.json``
-        # directly. ``try_to_load_from_cache`` only resolves HF repo ids,
-        # so without this a local path yields ``hf_cfg=None`` and the MTP
-        # eligibility gate wrongly rejects an otherwise-eligible checkpoint.
-        _local_cfg = _os.path.join(model_name, "config.json") if model_name else None
-        if _local_cfg and _os.path.isfile(_local_cfg):
-            with open(_local_cfg) as fh:
-                hf_cfg = _json.load(fh)
-        elif hf_path:
+        if hf_path:
             cached = _cache_lookup(repo_id=hf_path, filename="config.json")
             if cached and _os.path.exists(cached):
                 with open(cached) as fh:
@@ -1272,70 +1180,6 @@ def _apply_mtp_cli_model_type_reconciliation(
     scheduler_config.mtp_model_type = _eligibility_model_type
 
 
-def _check_alias_min_memory(user_typed: str) -> None:
-    """Alias-level unified-memory guard — warn if the user's Mac is
-    smaller than the alias's declared ``min_memory_gb`` floor.
-
-    codex #1069 round 3 [NIT #3]: fires alongside (and before) the
-    generic model-size / pressure check in ``_check_memory_capacity``.
-    That check reads live weights + free RAM, so it can only warn AFTER
-    the download completes (or from the HF file-size API, which lags).
-    This one fires up front from the alias profile so a user on a 128
-    GB Max sees the actionable pointer BEFORE the 166 GB
-    ``hy3-preview-4bit`` download starts.
-
-    Best-effort: warns loudly (never aborts) so an operator with a
-    borderline machine, headless setup, or unusual memory allocator
-    can still opt in. Silent no-op when:
-      - The alias has no ``min_memory_gb`` metadata (every model we
-        ship under 100 GB weights).
-      - The user typed an HF path directly instead of an alias.
-      - psutil is unavailable / raises.
-    """
-    try:
-        from .model_aliases import resolve_profile
-
-        profile = resolve_profile(user_typed)
-    except Exception:
-        return
-    if profile is None:
-        return
-    floor_gb = getattr(profile, "min_memory_gb", None)
-    if floor_gb is None or floor_gb <= 0:
-        return
-
-    try:
-        import psutil
-
-        total_ram_gb = psutil.virtual_memory().total / (1024**3)
-    except Exception:
-        return
-    if total_ram_gb <= 0:
-        return
-    if total_ram_gb >= floor_gb:
-        return  # Machine is big enough — silent.
-
-    is_tty = sys.stdout.isatty() and "NO_COLOR" not in os.environ
-    YELLOW = "\x1b[33m" if is_tty else ""
-    BOLD = "\x1b[1m" if is_tty else ""
-    RESET = "\x1b[0m" if is_tty else ""
-    print(
-        f"\n{YELLOW}{BOLD}⚠  Ultra-only alias '{user_typed}' declares a "
-        f"{floor_gb:.0f} GB unified-memory floor, but this Mac reports "
-        f"{total_ram_gb:.1f} GB.{RESET}"
-    )
-    print(
-        f"{YELLOW}   The model weights are large enough to OOM the Metal "
-        "allocator (or kernel-panic on macOS < 15.2, issue #324) before "
-        f"the first token generates.{RESET}"
-    )
-    print(
-        f"{YELLOW}   Recommended: pick a Tier-1 alias sized for this "
-        "machine (`rapid-mlx models` for the full list). "
-        f"Proceeding anyway…{RESET}\n"
-    )
-
-
 def _check_memory_capacity(model_name: str) -> None:
     """Pre-flight memory check — warn loudly if loading this model is
     likely to push unified memory past the danger threshold.
@@ -1382,16 +1226,9 @@ def _check_memory_capacity(model_name: str) -> None:
         else:
             from huggingface_hub import model_info, try_to_load_from_cache
 
-            from vllm_mlx.model_aliases import checkpoint_prefix
-
-            # One repo, one folder per quantization: the working set is
-            # this alias's folder, not the eight-checkpoint repo. Sizing
-            # the whole repo made a 1.6 GB model project a 28 GB working
-            # set and fire the kernel-panic warning on a 32 GB Mac.
-            prefix = checkpoint_prefix(model_name)
-            cached = try_to_load_from_cache(model_name, f"{prefix}config.json")
+            cached = try_to_load_from_cache(model_name, "config.json")
             if isinstance(cached, str) and os.path.exists(cached):
-                # Already-downloaded model: walk the checkpoint directory.
+                # Already-downloaded model: walk the snapshot directory.
                 snapshot_dir = os.path.dirname(cached)
                 for root, _dirs, files in os.walk(snapshot_dir):
                     for f in files:
@@ -1405,7 +1242,6 @@ def _check_memory_capacity(model_name: str) -> None:
                     (s.size or 0)
                     for s in (getattr(info, "siblings", None) or [])
                     if hasattr(s, "size")
-                    and (not prefix or s.rfilename.startswith(prefix))
                 )
     except Exception:
         return  # Network / auth failure — fall through.
@@ -1492,115 +1328,7 @@ def _check_memory_capacity(model_name: str) -> None:
     print()
 
 
-class _StatusSpinner:
-    """Animated ``⠋ <label> Ns`` spinner on stderr for a blocking phase.
-
-    Context manager. On a TTY it spawns a daemon thread that redraws the
-    label + elapsed seconds at ~10 fps; :meth:`stop` (idempotent) clears the
-    line. Non-TTY / ``NO_COLOR`` → fully inert (no thread, no output) so CI
-    logs and pipes stay clean. :meth:`stop` is public so a caller can retire
-    the spinner mid-``with`` — e.g. from a download's ``on_pull_start`` hook,
-    right before the first real progress line — while ``__exit__`` remains a
-    belt-and-braces clear on every exit path.
-
-    Mirrors the inline spinner in :func:`_wait_for_chat_server` (same frames /
-    stream) so the cold-download "Resolving…" phase looks like the warm
-    "loading model…" phase the REPL already shows.
-    """
-
-    _FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-
-    def __init__(self, label: str, *, stream=None) -> None:
-        self._label = label
-        self._stream = stream if stream is not None else sys.stderr
-        # ``isatty`` can be absent on exotic stream stand-ins; treat missing
-        # as non-TTY so we stay inert rather than crash.
-        _isatty = getattr(self._stream, "isatty", None)
-        self._enabled = bool(_isatty and _isatty()) and "NO_COLOR" not in os.environ
-        self._done = False
-        self._start = 0.0
-        self._thread = None
-        import threading
-
-        self._stop_event = threading.Event()
-        self._lock = threading.Lock()
-        # Serializes the worker's frame writes against ``stop``'s clear so the
-        # clear is guaranteed to be the LAST thing written to the stream (no
-        # post-clear redraw). Held only around the brief write/flush — never
-        # across the inter-frame wait — so ``stop`` can grab it promptly.
-        self._draw_lock = threading.Lock()
-
-    def _run(self) -> None:
-        import time
-
-        tick = 0
-        while not self._stop_event.is_set():
-            with self._draw_lock:
-                # Re-check under the lock: if ``stop`` set the event while we
-                # waited for the lock, do not draw — otherwise this frame would
-                # land AFTER stop's clear.
-                if self._stop_event.is_set():
-                    return
-                try:
-                    elapsed = int(time.monotonic() - self._start)
-                    ch = self._FRAMES[tick % len(self._FRAMES)]
-                    self._stream.write(
-                        f"\r  \x1b[36m{ch}\x1b[0m {self._label} \x1b[2m{elapsed}s\x1b[0m"
-                    )
-                    self._stream.flush()
-                except (ValueError, OSError):
-                    return  # stream closed underneath us — stop quietly.
-            tick += 1
-            self._stop_event.wait(0.1)
-
-    def __enter__(self) -> "_StatusSpinner":
-        if self._enabled:
-            import threading
-            import time
-
-            self._start = time.monotonic()
-            self._thread = threading.Thread(target=self._run, daemon=True)
-            self._thread.start()
-        return self
-
-    def stop(self) -> None:
-        """Halt the spinner and clear its line. Idempotent + thread-safe."""
-        with self._lock:
-            if self._done:
-                return
-            self._done = True
-        self._stop_event.set()
-        if self._thread is None:
-            return  # inert (non-TTY) or never entered — nothing drawn.
-        self._thread.join(timeout=1.0)
-        # Clear under the draw lock so the clear is the worker's final write.
-        # If the worker is wedged in a blocked ``write()`` and never frees the
-        # lock within the timeout, the stream is broken — skip the clear rather
-        # than risk a garbled interleave or an unbounded hang (a stray frame on
-        # a broken stream won't render anyway). ``acquire`` doubles as the
-        # confirmation that no worker write is in flight.
-        if self._draw_lock.acquire(timeout=1.0):
-            try:
-                # Clear the whole line; the label + " Ns" fits well within a
-                # generous fixed width (ANSI codes take no display columns).
-                self._stream.write("\r" + " " * (len(self._label) + 24) + "\r")
-                self._stream.flush()
-            except (ValueError, OSError):
-                pass
-            finally:
-                self._draw_lock.release()
-
-    def __exit__(self, *exc: object) -> bool:
-        self.stop()
-        return False
-
-
-def _try_mirror_prefetch(
-    model_name: str,
-    on_pull_start: Callable[[], None] | None = None,
-    *,
-    out: dict | None = None,
-) -> bool:
+def _try_mirror_prefetch(model_name: str) -> bool:
     """Pre-fetch a HuggingFace repo via R2-first / HF-fallback (per file).
 
     Delegates to :func:`vllm_mlx._mirror.download_with_mirror_fallback`.
@@ -1608,9 +1336,6 @@ def _try_mirror_prefetch(
     and HF). Returns ``False`` if the caller should fall through to the
     plain ``snapshot_download(repo_id)`` path (catalog unavailable for
     catalog-only paths, or one or more files failed both R2 and HF).
-
-    ``on_pull_start`` is forwarded to the mirror and fired once, right before
-    the first ``Pulling`` line — used to retire a "Resolving…" spinner.
 
     Set ``RAPID_MLX_MODEL_MIRROR=""`` to disable R2 entirely and force
     HuggingFace.
@@ -1622,88 +1347,16 @@ def _try_mirror_prefetch(
     bugs in the mirror module surface as real stack traces instead of
     silently routing to ``snapshot_download``.
     """
-    from vllm_mlx.model_aliases import subfolder_allow_patterns
-
-    # A subfolder-per-quant repo ships several quants side by side, so the
-    # mirror holds ONE quant's directory (uploaded via
-    # ``mirror_to_r2.py --subfolder <quant>``) and we hand the same
-    # ``allow_patterns`` down so the R2 pull fetches only that directory —
-    # never the whole ~20 GB quant matrix. ``None`` for the ordinary
-    # one-quant-per-repo layout leaves the mirror serving the full repo.
-    # (This used to hard-decline the mirror for every subfolder repo on the
-    # assumption that none were mirrored; ``lfm2.5-2.6b-4bit`` is, and the
-    # decline stranded its R2 copy while the HF path could hang the desktop
-    # at "Starting…".)
-    allow_patterns = subfolder_allow_patterns(model_name)
     try:
         from vllm_mlx._mirror import download_with_mirror_fallback
     except ImportError:
         # Mirror module not available (minimal-deps install or
         # deliberately removed). Use the legacy HF path.
         return False
-    return download_with_mirror_fallback(
-        model_name,
-        on_pull_start=on_pull_start,
-        allow_patterns=allow_patterns,
-        out=out,
-    )
+    return download_with_mirror_fallback(model_name)
 
 
-def _env_flag_active(raw: str | None) -> bool:
-    """True when an HF/transformers offline-style env flag is enabled.
-
-    Bounded local truth-value predicate reproducing huggingface_hub's
-    ``_is_true`` semantics exactly (only ``1``/``ON``/``YES``/``TRUE`` count;
-    ``0``/``false``/empty leave it off) without depending on the library's
-    private ``constants._is_true`` helper, whose return type is untyped.
-    """
-    return raw is not None and str(raw).lower() in {"1", "on", "yes", "true"}
-
-
-def _offline_hub_mode_active() -> bool:
-    """True when the HF/transformers offline switches pin hub access local-only.
-
-    Reads both offline switches live (so tests monkeypatching them stay
-    truthful) and treats each **independently** before OR-ing: folding them
-    with ``os.environ.get(...) or os.environ.get(...)`` into one string lets a
-    ``HF_HUB_OFFLINE=0`` mask ``TRANSFORMERS_OFFLINE=1`` (or vice-versa), which
-    the download layer does not do.
-    """
-    return _env_flag_active(os.environ.get("HF_HUB_OFFLINE")) or _env_flag_active(
-        os.environ.get("TRANSFORMERS_OFFLINE")
-    )
-
-
-def _offline_uncached_error(model_name: str) -> str:
-    """Render the offline + uncached refusal body (one actionable message).
-
-    Reused verbatim by the ``main()`` confirmation gate (so the refusal fires
-    BEFORE any "About to download" notice) and by ``_ensure_model_downloaded``
-    (the belt-and-suspenders defense). A lane override is never recommended:
-    no ``--mllm``/``--no-mllm`` flag can supply a checkpoint that is simply
-    absent from the cache.
-    """
-    from huggingface_hub.constants import HF_HUB_CACHE
-
-    return (
-        f"\n  Error: {model_name} is not cached and the network is "
-        "unavailable (offline mode is enabled).\n"
-        f"  After connectivity is restored, disable offline mode "
-        f"(unset HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE) and run "
-        f"`rapid-mlx pull {model_name}`, then serve again.\n"
-        f"  Expected cache location: {HF_HUB_CACHE}\n"
-    )
-
-
-def _refuse_offline_uncached(model_name: str) -> None:
-    """Print the offline + uncached refusal and exit(1)."""
-    print(_offline_uncached_error(model_name), file=sys.stderr)
-    sys.exit(1)
-
-
-def _ensure_model_downloaded(
-    model_name: str, *, force_disk_check: bool = False
-) -> None:
+def _ensure_model_downloaded(model_name: str) -> None:
     """Pre-fetch a model in the foreground so HF's tqdm progress is visible.
 
     Used by ``rapid-mlx chat``: the chat REPL spawns ``serve`` as a
@@ -1719,139 +1372,49 @@ def _ensure_model_downloaded(
     """
     if os.path.exists(model_name):
         return
-    # Reuse the cache inventory's single runnability probe core
-    # (``_cache_runnability``, the same source ``models --cached`` uses) so
-    # what counts as "already cached" is identical everywhere and spans every
-    # modality: text ``model*.safetensors`` (``is_repo_cached``), mflux
-    # component weights, component-split video, and family-scoped Whisper
-    # ``weights.npz``. A text-only ``is_repo_cached`` check would wrongly read
-    # a fully-downloaded mflux / split-video model as uncached and re-download
-    # on every start — a slow start at best, a hung one (SYN_SENT against a
-    # poisoned address) on a hostile DNS path (codex round-3 BLOCKING #2).
-    #
-    # Keep the tri-state result here, not the boolean wrapper: only a
-    # definitively-runnable result short-circuits the download, and only a
-    # definitively-not-runnable result triggers the offline refusal. A probe
-    # fault (``None``) must neither skip the download (never assume usable
-    # weights we couldn't verify) nor refuse offline (never assert uncached we
-    # couldn't establish) — it falls through to the normal online path.
-    cachedness = _cache_runnability(model_name)
-    if cachedness is True:
-        return
+    # Reuse the same weight-file-presence probe as ``is_repo_cached``:
+    # the older ``try_to_load_from_cache('config.json')`` check
+    # short-circuits on a partial cache (metadata downloaded, weight
+    # shards still in flight), letting the spawned ``serve`` quietly
+    # finish the download inside its logfile. Codex round-3 BLOCKING #2.
+    try:
+        from vllm_mlx._download_gate import is_repo_cached
 
-    # Offline + uncached refusal (#2357): reaching this point means the model is
-    # NOT cached (the probes above returned on every cached/complete shape) and
-    # it is not a local path. Refuse ONLY when uncachedness is actually
-    # established (``is False``) — a probe fault is inconclusive and must not
-    # be refused. If the hub is pinned to offline mode, a download is
-    # impossible, so refuse NOW with one actionable message instead of falling
-    # through to the network attempts that each fail and let the serve
-    # subprocess re-download — which duplicates "First-time download" /
-    # "Pre-download skipped" and eventually ends in misleading --mllm/--no-mllm
-    # lane advice when the checkpoint is simply absent. This mirrors the
-    # TimeoutError / disk-space exits: refuse before server initialization.
-    if _offline_hub_mode_active() and cachedness is False:
-        _refuse_offline_uncached(model_name)
+        if is_repo_cached(model_name):
+            return
+    except Exception:
+        # Probe failed (filesystem permission error, unexpected layout) —
+        # fall through to the heavy snapshot_download path; HF will
+        # short-circuit on its own cache check if the repo really is
+        # fully present.
+        pass
 
-    # Disk-space gate + mirror pull. Both the disk probe (HF ``model_info``)
-    # and the mirror's own metadata + ``/api/models`` catalog round-trips run
-    # BEFORE the first "Pulling"/"First-time download" line — up to a few
-    # seconds of total silence at the most fragile first-run moment, where it
-    # reads as a hang. Cover it with a "Resolving…" spinner (TTY-only; inert on
-    # CI/pipe) that the mirror retires via ``on_pull_start`` the instant real
-    # progress begins, and that ``__exit__`` clears on every other exit path.
-    _short = model_name.split("/")[-1]
-    spinner = _StatusSpinner(f"Resolving {_short} …")
-    with spinner:
-        # ``_check_disk_space`` queries HF for the repo size and aborts with a
-        # clear message + exit(1) if there isn't enough room on the resolved
-        # HF cache filesystem. Clear the spinner first on that fatal path so
-        # the abort message and the shell prompt after it land on clean lines.
-        try:
-            _check_disk_space(model_name, force=force_disk_check)
-        except SystemExit:
-            spinner.stop()
-            raise
+    # Disk-space gate: a 20 GB partial download that fails on the last
+    # shard wastes the user's time. ``_check_disk_space`` queries HF for
+    # the repo size and aborts with a clear message + exit(1) if there
+    # isn't enough room on the resolved HF cache filesystem.
+    _check_disk_space(model_name)
 
-        # User-configured mirror path (R2/S3/any HTTP host). When the mirror
-        # serves every file the repo declares, populate the HF cache layout
-        # ourselves and skip snapshot_download. On any miss we fall through
-        # to the normal HuggingFace download below.
-        mirror_ok = _try_mirror_prefetch(model_name, on_pull_start=spinner.stop)
-    if mirror_ok:
+    # User-configured mirror path (R2/S3/any HTTP host). When the mirror
+    # serves every file the repo declares, populate the HF cache layout
+    # ourselves and skip snapshot_download. On any miss we fall through
+    # to the normal HuggingFace download below.
+    if _try_mirror_prefetch(model_name):
         return
 
     try:
         from huggingface_hub import model_info, snapshot_download
 
-        from vllm_mlx._download_gate import (
-            _HF_RESOLVE_TIMEOUT_SECONDS,
-            call_with_deadline,
-            pin_main_ref,
-        )
-        from vllm_mlx.model_aliases import subfolder_allow_patterns
-
-        # Repos that ship one folder per quantization: fetch and measure
-        # ONLY this alias's folder. Without the filter a 1.6 GB 4-bit pull
-        # reports and downloads the repo's whole ~20 GB quant matrix.
-        allow_patterns = subfolder_allow_patterns(model_name)
-        _prefix = allow_patterns[0][:-1] if allow_patterns else None
-
-        # This bounded call resolves the revision ahead of the download.
-        # ``snapshot_download`` otherwise resolves it through httpx with
-        # an explicit ``timeout=None``, which *disables* the client timeout
-        # rather than inheriting it, so that call has no deadline and hangs
-        # indefinitely on a blackholed route — the desktop then sits at
-        # "Starting" until its 30-minute stall window. Proving the Hub answers
-        # within a deadline first turns that hang into an error.
-        #
-        # Pinning the resolved SHA is essential: treating this probe merely as
-        # a reachability check leaves a TOCTOU window where the network can go
-        # dark before snapshot_download repeats the same unbounded lookup.
-        # huggingface_hub does not write refs/main for an explicit SHA, so we
-        # publish that ref ourselves, atomically, only after the download wins.
         size_gb = 0.0
-        resolved_sha: str | None = None
         try:
-            info = call_with_deadline(
-                model_info,
-                _HF_RESOLVE_TIMEOUT_SECONDS,
-                model_name,
-                files_metadata=True,
-            )
-            resolved_sha = getattr(info, "sha", None)
-            if not resolved_sha:
-                raise RuntimeError("HuggingFace metadata did not include a revision")
+            info = model_info(model_name, files_metadata=True)
             size_bytes = sum(
                 (s.size or 0)
                 for s in (getattr(info, "siblings", None) or [])
                 if hasattr(s, "size")
-                and (_prefix is None or s.rfilename.startswith(_prefix))
             )
             size_gb = size_bytes / (1024**3)
-        except TimeoutError:
-            # The Hub did not answer within the deadline. Falling through to
-            # ``snapshot_download`` would re-enter the unbounded lookup and
-            # hang; the desktop would sit at "Starting" until its 30-minute
-            # stall window. Abort via ``sys.exit`` rather than an exception:
-            # the generic handler at the bottom of this function turns any
-            # non-404 exception into "Pre-download skipped; server will retry"
-            # and lets the serve subprocess start, which would walk straight
-            # back into the same hang. ``SystemExit`` is re-raised there, which
-            # is the same escape hatch ``_check_disk_space`` already uses.
-            print(
-                f"\n  Error: could not reach HuggingFace to resolve "
-                f"{model_name} within {_HF_RESOLVE_TIMEOUT_SECONDS:.0f}s.\n"
-                "  The model is not fully downloaded yet, so it cannot be "
-                "started offline.\n"
-                "  Check your network or proxy settings and try again.\n",
-                file=sys.stderr,
-            )
-            sys.exit(1)
         except Exception:
-            # Any other metadata failure stays best-effort: an outage, a gated
-            # repo or a missing token costs us the size quote, and the download
-            # proceeds to fail (or succeed) with its own clearer error.
             pass
 
         is_tty = sys.stdout.isatty() and "NO_COLOR" not in os.environ
@@ -1870,15 +1433,7 @@ def _ensure_model_downloaded(
                 f"fetching {model_name} from HuggingFace ..."
             )
 
-        download_kwargs = {"revision": resolved_sha} if resolved_sha else {}
-        if allow_patterns:
-            snapshot_download(
-                model_name, allow_patterns=allow_patterns, **download_kwargs
-            )
-        else:
-            snapshot_download(model_name, **download_kwargs)
-        if resolved_sha:
-            pin_main_ref(model_name, resolved_sha)
+        snapshot_download(model_name)
         print()
     except SystemExit:
         # _check_disk_space aborts via sys.exit(1) — let it through.
@@ -1924,12 +1479,10 @@ def _add_pflash_args(parser) -> None:
     parser.add_argument(
         "--pflash-keep-ratio",
         type=float,
-        default=None,
-        help="Fraction of prompt tokens to keep when compressing. Unset lets "
-        "the engine resolve it: a per-alias ``pflash_keep_ratio`` override if "
-        "the alias pins one (e.g. 0.50 for a ternary arch), else the default "
-        "0.20 (the bench-validated profile in PR #649: TTFT 3.87x-8.5x, needle "
-        "recall 5/5). An explicit value here always wins.",
+        default=0.20,
+        help="Fraction of prompt tokens to keep when compressing "
+        "(default: 0.20 — matches the bench-validated profile in PR #649: "
+        "TTFT 3.87x-8.5x, needle recall 5/5 across tested cells).",
     )
     parser.add_argument(
         "--pflash-min-keep-tokens",
@@ -1998,162 +1551,22 @@ def _build_benchmark_context(target_tokens: int) -> str:
     return (block * repeats).strip()
 
 
-def _alias_mtp_declaration(model_name) -> tuple[str | None, int | None]:
-    """Return ``(mtp_draft_model, mtp_speculative_tokens)`` declared by an alias.
-
-    ``(None, None)`` when the model is not a known alias, declares no MTP
-    sidecar, or the registry cannot be read. Resolution is best-effort by
-    design: this only supplies DEFAULTS for a request that already asked for
-    MTP, so a registry problem must degrade to "no default" and let the
-    injector's own hard-fail speak — never turn a serve into a crash of its
-    own (#1998).
-
-    ``mtp_speculative_tokens`` is returned only when it is a positive int. The
-    alias schema already rejects the alternatives (``model_aliases`` requires
-    ``mtp_draft_model`` alongside it), so this is belt-and-braces against a
-    hand-edited registry rather than a live shape.
-    """
-    if not model_name:
-        return None, None
-    try:
-        from .model_aliases import resolve_profile as _resolve_alias
-
-        profile = _resolve_alias(model_name)
-    except Exception:  # noqa: BLE001 — see docstring: never fail the serve here
-        return None, None
-    if profile is None:
-        return None, None
-    # Type-check BEFORE ``.strip()``: the value reaches us straight off a
-    # profile object, and a non-str there would raise ``AttributeError`` out of
-    # this helper — breaking the totality the docstring promises, in the exact
-    # hand-edited-registry case it promises it for (codex nit).
-    raw_sidecar = getattr(profile, "mtp_draft_model", None)
-    sidecar = raw_sidecar.strip() or None if isinstance(raw_sidecar, str) else None
-    if sidecar is None:
-        # Depth without a sidecar is meaningless — the injector has nothing to
-        # load — so don't hand back a lone K either.
-        return None, None
-    depth = getattr(profile, "mtp_speculative_tokens", None)
-    if not isinstance(depth, int) or isinstance(depth, bool) or depth <= 0:
-        depth = None
-    return sidecar, depth
-
-
 def _normalize_speculative_config_or_exit(args):
-    """Parse ``--speculative-config`` and map methods to runtime fields."""
-    import json
+    """Parse ``--speculative-config`` and map method shorthands to flags."""
     import sys
 
     from .spec_decode.config import (
         SpeculativeConfigError,
+        legacy_ddtree_config,
+        legacy_dflash_config,
+        legacy_mtp_config,
+        legacy_suffix_config,
         parse_speculative_config,
         require_migrated_speculative_config,
     )
 
     raw_config = getattr(args, "speculative_config", None)
-    raw_config_was_explicit = raw_config is not None
     config = None
-
-    def _fill_runtime_defaults(*, overwrite: bool) -> None:
-        defaults = {
-            "enable_ddtree": False,
-            "enable_dflash": False,
-            "spec_decode": "none",
-            "dflash_drafter_path": "",
-            "enable_mtp": False,
-            "mtp_num_draft_tokens": 1,
-            "mtp_optimistic": False,
-            "mtp_sidecar": None,
-            "mtp_max_k": 1,
-            "mtp_disable_auto_k": False,
-            "suffix_decoding": False,
-        }
-        for name, value in defaults.items():
-            if overwrite or not hasattr(args, name) or getattr(args, name) is None:
-                setattr(args, name, value)
-
-    def _reject_no_spec_decode_runtime_conflicts() -> None:
-        if not getattr(args, "no_spec_decode", False):
-            return
-        conflicts = []
-        if getattr(args, "enable_ddtree", False):
-            conflicts.append("enable_ddtree")
-        if getattr(args, "enable_dflash", False):
-            conflicts.append("enable_dflash")
-        spec_decode = getattr(args, "spec_decode", "none")
-        if spec_decode not in (None, "none"):
-            conflicts.append(f"spec_decode={spec_decode}")
-        if (getattr(args, "dflash_drafter_path", "") or "").strip():
-            conflicts.append("dflash_drafter_path")
-        if getattr(args, "enable_mtp", False):
-            conflicts.append("enable_mtp")
-        if (getattr(args, "mtp_sidecar", None) or "").strip():
-            conflicts.append("mtp_sidecar")
-        # Idempotency guard: after ``_fill_runtime_defaults(overwrite=True)``
-        # a disabled config normalizes to ``mtp_max_k=1``. Only flag the
-        # value as a ``--no-spec-decode`` conflict when it diverges from
-        # that disabled default (i.e., an explicit non-default was passed).
-        if getattr(args, "mtp_max_k", None) not in (None, 1):
-            conflicts.append("mtp_max_k")
-        if getattr(args, "mtp_num_draft_tokens", 1) != 1:
-            conflicts.append("mtp_num_draft_tokens")
-        if getattr(args, "mtp_disable_auto_k", False):
-            conflicts.append("mtp_disable_auto_k")
-        if getattr(args, "mtp_optimistic", False):
-            conflicts.append("mtp_optimistic")
-        if getattr(args, "suffix_decoding", False):
-            conflicts.append("suffix_decoding")
-        if getattr(args, "suffix_max_draft", None) is not None:
-            conflicts.append("suffix_max_draft")
-        if getattr(args, "suffix_max_suffix_len", None) is not None:
-            conflicts.append("suffix_max_suffix_len")
-        if getattr(args, "suffix_min_confidence", None) is not None:
-            conflicts.append("suffix_min_confidence")
-        if getattr(args, "suffix_min_draft_len", None) is not None:
-            conflicts.append("suffix_min_draft_len")
-        if not conflicts:
-            return
-        joined = ", ".join(conflicts)
-        print(
-            f"error: --no-spec-decode is mutually exclusive with {joined}.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
-    def _legacy_speculative_fields() -> list[str]:
-        fields = []
-        if getattr(args, "enable_ddtree", False):
-            fields.append("enable_ddtree")
-        if getattr(args, "enable_dflash", False):
-            fields.append("enable_dflash")
-        spec_decode = getattr(args, "spec_decode", "none")
-        if spec_decode not in (None, "none"):
-            fields.append(f"spec_decode={spec_decode}")
-        if (getattr(args, "dflash_drafter_path", "") or "").strip():
-            fields.append("dflash_drafter_path")
-        if getattr(args, "enable_mtp", False):
-            fields.append("enable_mtp")
-        if (getattr(args, "mtp_sidecar", None) or "").strip():
-            fields.append("mtp_sidecar")
-        if getattr(args, "mtp_max_k", None) is not None:
-            fields.append("mtp_max_k")
-        if getattr(args, "mtp_num_draft_tokens", 1) != 1:
-            fields.append("mtp_num_draft_tokens")
-        if getattr(args, "mtp_disable_auto_k", False):
-            fields.append("mtp_disable_auto_k")
-        if getattr(args, "mtp_optimistic", False):
-            fields.append("mtp_optimistic")
-        if getattr(args, "suffix_decoding", False):
-            fields.append("suffix_decoding")
-        if getattr(args, "suffix_max_draft", None) is not None:
-            fields.append("suffix_max_draft")
-        if getattr(args, "suffix_max_suffix_len", None) is not None:
-            fields.append("suffix_max_suffix_len")
-        if getattr(args, "suffix_min_confidence", None) is not None:
-            fields.append("suffix_min_confidence")
-        if getattr(args, "suffix_min_draft_len", None) is not None:
-            fields.append("suffix_min_draft_len")
-        return fields
 
     def _fill_suffix_defaults() -> None:
         if getattr(args, "suffix_max_draft", None) is None:
@@ -2165,146 +1578,13 @@ def _normalize_speculative_config_or_exit(args):
         if getattr(args, "suffix_min_draft_len", None) is None:
             args.suffix_min_draft_len = 2
 
-    def _legacy_speculative_config_payload() -> dict | None:
-        methods: list[tuple[str, dict]] = []
-
-        def add_method(method: str, payload: dict) -> None:
-            methods.append((method, payload))
-
-        def reject_orphan(knob: str, selector: str) -> None:
-            print(
-                f"error: legacy speculative decoding knob {knob} requires {selector}.",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-
-        spec_decode = getattr(args, "spec_decode", "none")
-        dflash_model = (getattr(args, "dflash_drafter_path", "") or "").strip()
-        if getattr(args, "enable_ddtree", False):
-            add_method("ddtree", {"method": "ddtree"})
-        dflash_requested = (
-            getattr(args, "enable_dflash", False) or spec_decode == "dflash"
-        )
-        if dflash_model and not dflash_requested:
-            reject_orphan("dflash_drafter_path", "enable_dflash or spec_decode=dflash")
-        if dflash_requested:
-            payload = {"method": "dflash"}
-            if dflash_model:
-                payload["model"] = dflash_model
-            add_method("dflash", payload)
-
-        mtp_payload = {"method": "mtp"}
-        mtp_requested = getattr(args, "enable_mtp", False) or spec_decode == "mtp"
-        sidecar = (getattr(args, "mtp_sidecar", None) or "").strip()
-        if sidecar:
-            if not mtp_requested:
-                reject_orphan("mtp_sidecar", "enable_mtp or spec_decode=mtp")
-            mtp_payload["model"] = sidecar
-        mtp_max_k = getattr(args, "mtp_max_k", None)
-        if mtp_max_k is not None:
-            if not mtp_requested:
-                reject_orphan("mtp_max_k", "enable_mtp or spec_decode=mtp")
-            mtp_payload["num_speculative_tokens"] = mtp_max_k
-        mtp_num_draft_tokens = getattr(args, "mtp_num_draft_tokens", 1)
-        if (
-            mtp_max_k is not None
-            and mtp_num_draft_tokens != 1
-            and mtp_max_k != mtp_num_draft_tokens
-        ):
-            print(
-                "error: legacy MTP aliases mtp_max_k and mtp_num_draft_tokens "
-                "conflict; pass only one token-count value.",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-        if mtp_num_draft_tokens != 1:
-            if not mtp_requested:
-                reject_orphan("mtp_num_draft_tokens", "enable_mtp or spec_decode=mtp")
-            mtp_payload["num_speculative_tokens"] = mtp_num_draft_tokens
-        if getattr(args, "mtp_disable_auto_k", False):
-            if not mtp_requested:
-                reject_orphan("mtp_disable_auto_k", "enable_mtp or spec_decode=mtp")
-            mtp_payload["disable_auto_k"] = True
-        if getattr(args, "mtp_optimistic", False):
-            if not mtp_requested:
-                reject_orphan("mtp_optimistic", "enable_mtp or spec_decode=mtp")
-            # Unified spec-decode interface (PR #1050): even legacy
-            # ``--enable-mtp`` normalizes to ``spec_decode="mtp"`` and
-            # installs the vendored MTP runtime, which does not honour
-            # ``mtp_optimistic``. Hard-reject the flag on every entry
-            # point so behavior stays consistent (fail loud > silent
-            # ignore).
-            print(
-                "error: legacy speculative decoding knob mtp_optimistic "
-                "is not supported under the unified spec-decode "
-                "interface; the vendored MTP installer does not "
-                "implement optimistic mode. Remove --mtp-optimistic.",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-        if mtp_requested:
-            add_method("mtp", mtp_payload)
-
-        suffix_payload = {"method": "suffix"}
-        suffix_requested = getattr(args, "suffix_decoding", False)
-        suffix_fields = (
-            ("suffix_max_draft", "num_speculative_tokens"),
-            ("suffix_max_suffix_len", "max_suffix_len"),
-            ("suffix_min_confidence", "min_confidence"),
-            ("suffix_min_draft_len", "min_draft_len"),
-        )
-        for attr, key in suffix_fields:
-            value = getattr(args, attr, None)
-            if value is not None:
-                if not suffix_requested:
-                    reject_orphan(attr, "suffix_decoding")
-                suffix_payload[key] = value
-        if suffix_requested:
-            add_method("suffix", suffix_payload)
-
-        if not methods:
-            return None
-        distinct = {method for method, _payload in methods}
-        if len(distinct) > 1:
-            joined = ", ".join(method for method, _payload in methods)
-            print(
-                "error: legacy speculative decoding aliases select multiple "
-                f"methods ({joined}); use one --speculative-config payload.",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-        return methods[0][1]
-
-    legacy_payload = None
-    legacy_enable_mtp_requested = raw_config is None and getattr(
-        args, "enable_mtp", False
-    )
-    legacy_mtp_optimistic_requested = raw_config is None and getattr(
-        args, "mtp_optimistic", False
-    )
-    if raw_config_was_explicit:
-        legacy_fields = _legacy_speculative_fields()
-        if legacy_fields:
-            joined = ", ".join(legacy_fields)
-            print(
-                "error: --speculative-config is mutually exclusive with "
-                f"legacy speculative decoding aliases: {joined}.",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-
-    if raw_config is None:
-        _reject_no_spec_decode_runtime_conflicts()
-        legacy_payload = _legacy_speculative_config_payload()
-        if legacy_payload is not None:
-            raw_config = json.dumps(legacy_payload, separators=(",", ":"))
-            args.speculative_config = raw_config
-
-    if raw_config is None:
-        _fill_runtime_defaults(overwrite=False)
-        args._speculative_config = None
-        _fill_suffix_defaults()
-        return
+    def _fill_mtp_defaults() -> None:
+        if not hasattr(args, "mtp_sidecar"):
+            args.mtp_sidecar = None
+        if getattr(args, "mtp_max_k", None) is None:
+            args.mtp_max_k = 3
+        if not hasattr(args, "mtp_disable_auto_k"):
+            args.mtp_disable_auto_k = False
 
     if raw_config is not None:
         try:
@@ -2314,70 +1594,142 @@ def _normalize_speculative_config_or_exit(args):
         except SpeculativeConfigError as exc:
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(2)
+        config_method = config.method if config is not None else "none"
+        conflicts = []
+        if getattr(args, "enable_ddtree", False):
+            conflicts.append("--enable-ddtree")
+        if getattr(args, "enable_dflash", False):
+            conflicts.append("--enable-dflash")
+        spec_decode = getattr(args, "spec_decode", "none")
+        if spec_decode != "none":
+            conflicts.append(f"--spec-decode {spec_decode}")
+        if (getattr(args, "dflash_drafter_path", "") or "").strip():
+            conflicts.append("--dflash-drafter-path")
+        if (getattr(args, "mtp_sidecar", None) or "").strip():
+            conflicts.append("--mtp-sidecar")
+        if getattr(args, "mtp_max_k", None) is not None:
+            conflicts.append("--mtp-max-k")
+        if getattr(args, "mtp_disable_auto_k", False):
+            conflicts.append("--mtp-disable-auto-k")
+        # DFlash has a dedicated preflight that historically reports
+        # these runtime conflicts as "cannot combine" (exit 1) before
+        # probing mlx-vlm. Preserve that user-facing contract; other
+        # methods stay on the generic config/legacy mutual-exclusion path.
+        if getattr(args, "enable_mtp", False) and config_method != "dflash":
+            conflicts.append("--enable-mtp")
+        if getattr(args, "suffix_decoding", False) and config_method != "dflash":
+            conflicts.append("--suffix-decoding")
         if getattr(args, "no_spec_decode", False):
+            conflicts.append("--no-spec-decode")
+        if getattr(args, "suffix_max_draft", None) is not None:
+            conflicts.append("--suffix-max-draft")
+        if getattr(args, "suffix_max_suffix_len", None) is not None:
+            conflicts.append("--suffix-max-suffix-len")
+        if getattr(args, "suffix_min_confidence", None) is not None:
+            conflicts.append("--suffix-min-confidence")
+        if getattr(args, "suffix_min_draft_len", None) is not None:
+            conflicts.append("--suffix-min-draft-len")
+        if conflicts:
+            joined = ", ".join(conflicts)
             print(
                 "error: --speculative-config is mutually exclusive with "
-                "--no-spec-decode.",
+                f"{joined}; express speculative decoding settings inside "
+                "--speculative-config.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+    if raw_config is None and getattr(args, "no_spec_decode", False):
+        conflicts = []
+        if getattr(args, "enable_ddtree", False):
+            conflicts.append("--enable-ddtree")
+        if getattr(args, "enable_dflash", False):
+            conflicts.append("--enable-dflash")
+        spec_decode = getattr(args, "spec_decode", "none")
+        if spec_decode != "none":
+            conflicts.append(f"--spec-decode {spec_decode}")
+        if getattr(args, "enable_mtp", False):
+            conflicts.append("--enable-mtp")
+        if getattr(args, "suffix_decoding", False):
+            conflicts.append("--suffix-decoding")
+        if conflicts:
+            joined = ", ".join(conflicts)
+            print(
+                f"error: --no-spec-decode is mutually exclusive with {joined}.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    if raw_config is None and getattr(args, "spec_decode", "none") == "mtp":
+        conflicts = []
+        if getattr(args, "enable_ddtree", False):
+            conflicts.append("--enable-ddtree")
+        if getattr(args, "enable_dflash", False):
+            conflicts.append("--enable-dflash")
+        if getattr(args, "enable_mtp", False):
+            conflicts.append("--enable-mtp")
+        if getattr(args, "suffix_decoding", False):
+            conflicts.append("--suffix-decoding")
+        if conflicts:
+            joined = ", ".join(conflicts)
+            print(
+                "error: --spec-decode mtp is mutually exclusive with "
+                f"{joined}; express speculative decoding settings inside "
+                "--speculative-config.",
                 file=sys.stderr,
             )
             sys.exit(2)
 
     if config is None:
-        _fill_runtime_defaults(overwrite=True)
-        args._speculative_config = None
+        if getattr(args, "spec_decode", "none") == "mtp":
+            print(
+                "warning: --spec-decode mtp is deprecated; use "
+                '--speculative-config \'{"method":"mtp"}\' instead.',
+                file=sys.stderr,
+            )
+            config = legacy_mtp_config(
+                model=(getattr(args, "mtp_sidecar", "") or "").strip() or None,
+                num_speculative_tokens=getattr(args, "mtp_max_k", None),
+                disable_auto_k=getattr(args, "mtp_disable_auto_k", None),
+            )
+        try:
+            if config is not None:
+                pass
+            elif getattr(args, "enable_ddtree", False):
+                config = legacy_ddtree_config()
+            elif getattr(args, "enable_dflash", False) or (
+                getattr(args, "spec_decode", "none") == "dflash"
+            ):
+                config = legacy_dflash_config(
+                    (getattr(args, "dflash_drafter_path", "") or "").strip() or None
+                )
+            elif getattr(args, "suffix_decoding", False):
+                config = legacy_suffix_config(
+                    num_speculative_tokens=getattr(args, "suffix_max_draft", None),
+                    max_suffix_len=getattr(args, "suffix_max_suffix_len", None),
+                    min_confidence=getattr(args, "suffix_min_confidence", None),
+                    min_draft_len=getattr(args, "suffix_min_draft_len", None),
+                )
+        except SpeculativeConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(2)
+    args._speculative_config = config
+    if config is None:
+        _fill_mtp_defaults()
         _fill_suffix_defaults()
         return
-
-    _fill_runtime_defaults(overwrite=True)
-    args._speculative_config = config
     if config.method == "ddtree":
         args.enable_ddtree = True
     elif config.method == "dflash":
+        legacy_spec_decode_dflash = getattr(args, "spec_decode", "none") == "dflash"
         args.enable_dflash = True
-        if config.model:
-            args.dflash_drafter_path = config.model
-    elif config.method == "dspark":
-        args.spec_decode = "dspark"
-        args.dspark_num_speculative_tokens = config.num_speculative_tokens or 5
+        if legacy_spec_decode_dflash:
+            args._legacy_spec_decode_dflash = True
+            args.spec_decode = "none"
     elif config.method == "mtp":
         args.spec_decode = "mtp"
-        if legacy_enable_mtp_requested:
-            args.enable_mtp = True
-            if config.num_speculative_tokens is not None:
-                args.mtp_num_draft_tokens = config.num_speculative_tokens
-            if legacy_mtp_optimistic_requested:
-                args.mtp_optimistic = True
-        # #1998: an alias may DECLARE its own MTP sidecar and draft depth
-        # (``mtp_draft_model`` / ``mtp_speculative_tokens``). Those were
-        # rendered by ``rapid-mlx models`` as ``✓ MTP  MTP@<repo>@<k>`` and
-        # then read NOWHERE on the serve path, so the command that listing
-        # implies — ``serve <alias> --speculative-config '{"method":"mtp"}'``
-        # — reached the injector with ``sidecar=None`` and hard-failed at
-        # boot, quoting an unrelated model in the remedy. Fill ONLY what the
-        # request left unset; an explicit ``model`` /
-        # ``num_speculative_tokens`` in the JSON always wins.
-        alias_sidecar, alias_k = _alias_mtp_declaration(getattr(args, "model", None))
-        args.mtp_sidecar = config.model or alias_sidecar
+        args.mtp_sidecar = config.model
         if config.num_speculative_tokens is not None:
             args.mtp_max_k = config.num_speculative_tokens
-        elif alias_k is not None:
-            # A depth the alias declares for THIS checkpoint beats the generic
-            # --force-spec-decode fallback below: it is the more specific fact.
-            args.mtp_max_k = alias_k
-        elif getattr(args, "force_spec_decode", False):
-            # User explicitly opted into spec-decode via --force-spec-decode
-            # but didn't pin a draft depth. K=1 chain-of-1 carries draft
-            # overhead with no net speedup; default to K=3 (the EV auto-K
-            # controller's intended default) so MTP actually accelerates.
-            #
-            # Only two draft-depth sources exist for the mtp method and
-            # neither is set here: (a) ``num_speculative_tokens`` in the JSON
-            # is handled by the branch above; (b) the legacy ``--mtp-max-k``
-            # flag CANNOT co-occur with ``--speculative-config`` — the
-            # mutual-exclusion guard (`_legacy_speculative_fields` lists
-            # ``mtp_max_k``) exits with code 2 before we reach this branch.
-            # So K=3 here never overwrites a user-pinned depth.
-            args.mtp_max_k = 3
         if config.disable_auto_k is not None:
             args.mtp_disable_auto_k = config.disable_auto_k
     elif config.method == "suffix":
@@ -2391,21 +1743,18 @@ def _normalize_speculative_config_or_exit(args):
         if config.min_draft_len is not None:
             args.suffix_min_draft_len = config.min_draft_len
 
+    _fill_mtp_defaults()
     _fill_suffix_defaults()
 
 
-def _resolve_dflash_drafter_repo(args, profile) -> str | None:
+def _resolve_dflash_drafter_repo(args, profile) -> str:
     """Return the effective DFlash drafter repo for normalized CLI args."""
 
     spec_config = getattr(args, "_speculative_config", None)
     if spec_config is not None and spec_config.method == "dflash" and spec_config.model:
         return spec_config.model
-    # Only verified aliases may inherit a curated registry default. An
-    # experimental pair is enabled by the operator explicitly naming its
-    # drafter, never by stale/residual profile metadata.
-    if profile.supports_dflash:
-        return profile.dflash_draft_model
-    return None
+    legacy_override = (getattr(args, "dflash_drafter_path", "") or "").strip()
+    return legacy_override or profile.dflash_draft_model
 
 
 def _preflight_dflash_mutexes_or_exit(args) -> None:
@@ -2416,28 +1765,17 @@ def _preflight_dflash_mutexes_or_exit(args) -> None:
 
     import sys
 
-    spec_config = getattr(args, "_speculative_config", None)
-    if spec_config is not None and getattr(spec_config, "method", None) == "dflash":
-        if getattr(args, "suffix_decoding", False):
-            print(
-                "\n  Error: DFlash cannot combine with other spec-decode methods. "
-                "DFlash runs a dedicated single-user server that bypasses "
-                "BatchedEngine; other spec-decode methods only apply to the "
-                "BatchedEngine path.\n"
-            )
-            sys.exit(1)
-        return
-
+    spec_decode = getattr(args, "spec_decode", "none")
     if (
         getattr(args, "suffix_decoding", False)
         or getattr(args, "enable_mtp", False)
-        or getattr(args, "spec_decode", "none") != "none"
+        or spec_decode != "none"
     ):
         print(
-            "\n  Error: DFlash cannot combine with other spec-decode methods. "
-            "DFlash runs a dedicated single-user server that bypasses "
-            "BatchedEngine; other spec-decode methods only apply to the "
-            "BatchedEngine path.\n"
+            "\n  Error: DFlash cannot combine with --suffix-decoding "
+            "or other spec-decode methods. DFlash runs a dedicated "
+            "single-user server that bypasses BatchedEngine; other "
+            "spec-decode methods only apply to the BatchedEngine path.\n"
         )
         sys.exit(1)
     if getattr(args, "no_spec_decode", False):
@@ -2449,103 +1787,81 @@ def _preflight_dflash_mutexes_or_exit(args) -> None:
         sys.exit(2)
 
 
+def _maybe_print_legacy_dflash_redirect(args) -> None:
+    """Preserve the legacy ``--spec-decode dflash`` redirect notice."""
+
+    if not getattr(args, "_legacy_spec_decode_dflash", False):
+        return
+
+    import sys
+
+    print(
+        "Spec-decode: --spec-decode dflash routed to --enable-dflash "
+        "(mlx-vlm bridge; BatchedEngine integration deferred to 0.10).",
+        file=sys.stderr,
+    )
+
+
 def _preflight_ddtree_or_exit(args):
     """Validate DDTree flag/alias/runtime gates and cache the profile."""
     import sys
 
-    spec_config = getattr(args, "_speculative_config", None)
-    if spec_config is None or spec_config.method != "ddtree":
-        print(
-            'error: DDTree requires --speculative-config \'{"method":"ddtree"}\'.',
-            file=sys.stderr,
-        )
-        sys.exit(2)
+    from .spec_decode.config import legacy_ddtree_config
 
-    if getattr(args, "enable_dflash", False):
-        print(
-            "\n  Error: DDTree cannot combine with DFlash. Pick one "
-            "block-diffusion speculative-decoding server.\n"
-        )
-        sys.exit(1)
-    if (
-        getattr(args, "suffix_decoding", False)
-        or getattr(args, "spec_decode", "none") != "none"
+    spec_config = getattr(args, "_speculative_config", None)
+    if spec_config is None and getattr(args, "enable_ddtree", False):
+        spec_config = legacy_ddtree_config()
+        args._speculative_config = spec_config
+
+    if getattr(args, "enable_dflash", False) or (
+        getattr(args, "spec_decode", "none") == "dflash"
     ):
         print(
-            "\n  Error: DDTree cannot combine with other spec-decode methods. "
-            "DDTree runs a dedicated single-user server that bypasses "
-            "BatchedEngine; other spec-decode methods only apply to the "
-            "BatchedEngine path.\n"
+            "\n  Error: --enable-ddtree cannot combine with --enable-dflash "
+            "or --spec-decode dflash. Pick one block-diffusion "
+            "speculative-decoding server.\n"
+        )
+        sys.exit(1)
+    if getattr(args, "suffix_decoding", False) or getattr(args, "enable_mtp", False):
+        print(
+            "\n  Error: --enable-ddtree cannot combine with --suffix-decoding "
+            "or --enable-mtp. DDTree runs a dedicated single-user server "
+            "that bypasses BatchedEngine; other spec-decode methods only "
+            "apply to the BatchedEngine path.\n"
         )
         sys.exit(1)
     if getattr(args, "no_spec_decode", False):
         print(
-            "error: DDTree and --no-spec-decode are mutually "
+            "error: --enable-ddtree and --no-spec-decode are mutually "
             "exclusive — DDTree is a speculative-decode mode.",
             file=sys.stderr,
         )
         sys.exit(2)
 
     from .model_aliases import resolve_profile
-    from .model_profile import ModelProfile
     from .speculative.ddtree import DDTreeUnavailable, check
-    from .speculative.ddtree.eligibility import (
-        have_runtime,
-        runtime_probe_error,
-    )
-    from .speculative.ddtree.eligibility import (
-        report as ddtree_report,
-    )
+    from .speculative.ddtree.eligibility import have_runtime, runtime_probe_error
 
     alias_name = getattr(args, "_original_alias", None) or args.model
     profile = resolve_profile(alias_name)
     if profile is None:
-        profile = ModelProfile(hf_path=args.model)
-    if profile.supports_ddtree:
-        drafter = spec_config.model or profile.ddtree_draft_model
-        speculative_tokens = (
-            spec_config.num_speculative_tokens
-            if spec_config.num_speculative_tokens is not None
-            else profile.ddtree_speculative_tokens
+        print(
+            f"\n  Error: --enable-ddtree requires a known alias, got "
+            f"{alias_name!r}. DDTree eligibility is recorded per-alias "
+            f"in aliases.json; ad-hoc HuggingFace paths can't be "
+            f"validated. Try ``rapid-mlx info qwen3.5-9b-8bit``.\n"
         )
-        tree_budget = (
-            spec_config.tree_budget
-            if spec_config.tree_budget is not None
-            else profile.ddtree_tree_budget
-        )
-    else:
-        # Experimental profiles never inherit residual registry metadata:
-        # explicit opt-in means the operator supplies the whole pair.
-        drafter = spec_config.model
-        speculative_tokens = spec_config.num_speculative_tokens
-        tree_budget = spec_config.tree_budget
+        sys.exit(1)
     try:
-        assessment = ddtree_report(
-            profile,
-            alias=alias_name,
-            explicit=True,
-            drafter_model=drafter,
-            speculative_tokens=speculative_tokens,
-            tree_budget=tree_budget,
-        )
-        check(
-            profile,
-            alias=alias_name,
-            explicit=True,
-            drafter_model=drafter,
-            speculative_tokens=speculative_tokens,
-            tree_budget=tree_budget,
-        )
+        check(profile, alias=alias_name)
     except DDTreeUnavailable as e:
         print(f"\n  Error: {e}\n")
         sys.exit(1)
-    for warning in assessment.warnings:
-        print(f"\n  ⚠ Experimental DDTree: {warning}.\n")
     if not have_runtime():
         probe_error = runtime_probe_error()
         detail = f" Probe failure: {probe_error}." if probe_error else ""
         print(
-            "\n  Error: DDTree requires the experimental dtree-mlx "
+            "\n  Error: --enable-ddtree requires the experimental dtree-mlx "
             "runtime. Install with: ``pip install 'dtree-mlx @ "
             f"git+https://github.com/DrHB/dtree-mlx.git'``.{detail}\n"
         )
@@ -2553,345 +1869,12 @@ def _preflight_ddtree_or_exit(args):
 
     args._ddtree_alias_name = alias_name
     args._ddtree_profile = profile
-    args._ddtree_drafter_repo = drafter
-    args._ddtree_speculative_tokens = speculative_tokens
-    args._ddtree_tree_budget = tree_budget
+    args._ddtree_drafter_repo = spec_config.model or profile.ddtree_draft_model
+    args._ddtree_speculative_tokens = (
+        spec_config.num_speculative_tokens or profile.ddtree_speculative_tokens
+    )
+    args._ddtree_tree_budget = spec_config.tree_budget or profile.ddtree_tree_budget
     return alias_name, profile
-
-
-_DEFAULT_HYBRID_CACHE_ENTRIES = 8
-_DEFAULT_RECURRENT_PREFILL_STEP_SIZE = 512
-
-
-def _resolve_hybrid_cache_entries(
-    *,
-    enable_prefix_cache: bool,
-    explicit_value: int,
-    user_set_explicit: bool,
-    model_name: str,
-    model_config: ModelProfile | None = None,
-) -> int:
-    """Return the effective ``hybrid_cache_entries`` value.
-
-    Auto-defaults to 8 when prefix cache is enabled for a hybrid model
-    and the user did NOT explicitly pass ``--hybrid-cache-entries``.
-    Without this, ``--enable-prefix-cache`` has no effect on hybrid
-    models (#1122).
-    """
-    import logging as _logging
-
-    if not enable_prefix_cache or explicit_value != 0 or user_set_explicit:
-        return explicit_value
-
-    needs_bounded_reuse = _needs_bounded_trim_free_reuse(
-        model_name, model_config=model_config
-    )
-    if needs_bounded_reuse:
-        _logging.getLogger(__name__).info(
-            "Non-trimmable model cache detected with --enable-prefix-cache: "
-            "auto-setting --hybrid-cache-entries=%d "
-            "(pass --hybrid-cache-entries 0 to disable)",
-            _DEFAULT_HYBRID_CACHE_ENTRIES,
-        )
-        return _DEFAULT_HYBRID_CACHE_ENTRIES
-    return explicit_value
-
-
-def _config_declares_sliding_window(config: dict | None) -> bool:
-    """True if the checkpoint config declares sliding-window (local) attention.
-
-    Gemma-2/3/4 and other local-attention families run their sliding layers on
-    ``RotatingKVCache``, which reports ``is_trimmable() == False`` once the ring
-    has rotated past its window (the front is overwritten, so a trim-then-
-    continue would reconstruct wrong KV — see ``memory_cache`` ``_layer_forbids_
-    trim``). Such a cache is non-trimmable but still REUSABLE at an exact token
-    boundary, so these models need the bounded trim-free snapshot path — exactly
-    like the recurrent-state families — or every agentic turn re-prefills the
-    whole accumulated context (#2061).
-
-    The signal is read straight off the checkpoint config so it is
-    architecture-driven rather than a name list: it covers the whole sliding-
-    window family, future additions, and bare local paths that resolve to no
-    alias.
-
-    The LANGUAGE backbone's attention config is authoritative — VLM checkpoints
-    nest it under ``text_config``, so that is judged first and alone when it
-    carries a signal (a top-level ``sliding_window`` scalar on such a checkpoint
-    is often a vision/default value unrelated to the LM's attention). Within the
-    chosen config, ``layer_types`` (Gemma-3/4's explicit per-layer attention
-    kinds) is authoritative: a config listing only ``full_attention`` is NOT
-    sliding even if it also carries a leftover ``sliding_window`` value (that
-    field is inert without a sliding layer to apply it). A bare positive
-    ``sliding_window`` is consulted only as the fallback for older configs that
-    omit ``layer_types``. Only if the nested language config carries no signal
-    at all does the top level get a look, for checkpoints that place attention
-    fields at the root.
-    """
-    if not isinstance(config, dict):
-        return False
-
-    def _level_signal(cfg: object) -> bool | None:
-        """True/False if ``cfg`` declares sliding-window state, None if it
-        carries no attention signal at all (so the caller may look elsewhere)."""
-        if not isinstance(cfg, dict):
-            return None
-        layer_types = [
-            lt for lt in (cfg.get("layer_types") or []) if isinstance(lt, str)
-        ]
-        if layer_types:
-            return any("sliding" in lt for lt in layer_types)
-        # Qwen2 / Mistral carry a ``sliding_window`` scalar but gate it behind an
-        # explicit ``use_sliding_window`` flag — a positive scalar with the flag
-        # off is inert, so honour the disable before the legacy scalar. Treating
-        # it as active would auto-allocate bounded snapshots and regress memory.
-        if cfg.get("use_sliding_window") is False:
-            return False
-        sliding_window = cfg.get("sliding_window")
-        if isinstance(sliding_window, int):
-            return sliding_window > 0
-        return None
-
-    text_config = config.get("text_config")
-    if isinstance(text_config, dict):
-        nested = _level_signal(text_config)
-        if nested is not None:
-            return nested
-    return bool(_level_signal(config))
-
-
-def _resolve_checkpoint_config(model_name: str, profile) -> dict | None:
-    """Read the checkpoint ``config.json`` for ``model_name`` offline.
-
-    Works for a bare local path or HF repo id directly, and for a registered
-    alias by resolving it to its ``hf_path`` (the alias name itself is not a
-    readable checkpoint dir). Never touches the network — mirrors the offline
-    metadata probes ``is_mllm_model`` already relies on.
-    """
-    from .api.utils import read_model_metadata
-
-    metadata = read_model_metadata(model_name)
-    if metadata is not None and metadata.config:
-        return metadata.config
-    hf_path = getattr(profile, "hf_path", None) if profile is not None else None
-    if isinstance(hf_path, str) and hf_path and hf_path != model_name:
-        metadata = read_model_metadata(hf_path)
-        if metadata is not None and metadata.config:
-            return metadata.config
-    return None
-
-
-def _config_declares_linear_attention(config: dict | None) -> bool:
-    """Whether the language backbone declares recurrent/linear attention.
-
-    Keep the checkpoint signals aligned with ``mllm_backbone_is_hybrid``: this
-    variant accepts an already-resolved config so aliases and bare local paths
-    can share the serve prefill policy without another metadata lookup.
-    """
-    from .model_auto_config import config_declares_linear_attention
-
-    return config_declares_linear_attention(config)
-
-
-def _prefers_recurrent_prefill_chunks(model_name: str) -> bool:
-    """Whether this model profile has a bench-verified smaller chunk.
-
-    Do not infer this from recurrent/hybrid architecture.  Qwen3.5 4B/9B keeps
-    throughput while reducing memory at 512, but repeated measurements found
-    6--16% regressions on Bonsai, LFM2.5, and Qwen3.5 MoE.  Keep this explicit
-    and separate from ``_needs_bounded_trim_free_reuse``.
-    """
-    from .model_aliases import resolve_profile as _resolve_alias
-
-    profile = _resolve_alias(model_name)
-    return bool(
-        profile is not None
-        and getattr(profile, "recommended_prefill_step_size", None) is not None
-    )
-
-
-def _resolve_prefill_step_size(
-    *, model_name: str, configured: int, user_set_explicit: bool
-) -> int:
-    """Resolve the architecture-aware serve prefill chunk size."""
-    import logging as _logging
-
-    if user_set_explicit or not _prefers_recurrent_prefill_chunks(model_name):
-        return configured
-    from .model_aliases import resolve_profile as _resolve_alias
-
-    profile = _resolve_alias(model_name)
-    recommendation = getattr(profile, "recommended_prefill_step_size", None)
-    resolved = min(configured, recommendation or _DEFAULT_RECURRENT_PREFILL_STEP_SIZE)
-    if resolved != configured:
-        _logging.getLogger(__name__).info(
-            "Bench-verified model profile: auto-setting "
-            "--prefill-step-size=%d (pass --prefill-step-size explicitly to override)",
-            resolved,
-        )
-    return resolved
-
-
-def _resolve_vision_prefill_token_budget(
-    *,
-    configured: int | None,
-    prefill_step_size: int,
-    prefill_user_set_explicit: bool,
-    mllm_default: int = 8192,
-) -> int:
-    """Resolve the independent MLLM vision admission budget."""
-    if configured is not None:
-        return configured
-    if prefill_user_set_explicit:
-        return prefill_step_size
-    return max(prefill_step_size, mllm_default)
-
-
-def _needs_bounded_trim_free_reuse(
-    model_name: str, *, model_config: ModelProfile | None = None
-) -> bool:
-    """Whether this model's cache can reuse prefixes but not trim exact hits."""
-    from .model_aliases import resolve_profile as _resolve_alias
-    from .utils.deepseek_v4_0731 import is_deepseek_v4_0731
-
-    profile = model_config if model_config is not None else _resolve_alias(model_name)
-    if profile is not None:
-        if profile.is_hybrid:
-            return True
-        # Dense GatedDeltaNet models (Qwen3.5 / Qwen3.6 4B/9B/27B,
-        # Ternary-Bonsai) are deliberately pinned ``is_hybrid=False`` to keep
-        # them OFF the hybrid scheduler — the r6-A R6-C1 metal::malloc (499000)
-        # wedge fires when their dense recurrent weights hit the hybrid
-        # allocation path. But architecturally they DO carry non-trimmable
-        # ArraysCache / GatedDeltaNet recurrent layers, so their state can only
-        # be reused through the bounded snapshot path (``hybrid_cache_entries``),
-        # never the ordinary *trimmable* prefix cache. The
-        # ``is_hybrid_explicit=True`` + ``is_hybrid=False`` pinning uniquely
-        # identifies that "recurrent but routed non-hybrid" set (the explicit
-        # flag is only ever set to suppress the boot-time ArraysCache promotion,
-        # i.e. it implies the model has ArraysCache layers). Without this branch
-        # #1122's auto-default never fires for them, so ``--enable-prefix-cache``
-        # is a silent no-op: every agent turn re-prefills the full accumulated
-        # context (measured turn-2 TTFT ~22s with reuse off vs ~0.85s on for
-        # qwen3.5-9b-4bit). This does NOT touch routing — is_hybrid stays False,
-        # so no throttle, no snapshot path, no wedge.
-        if profile.is_hybrid_explicit and not profile.is_hybrid:
-            return True
-
-    # Sliding-window attention families (Gemma-2/3/4, …) carry RotatingKVCache
-    # local-attention layers that go non-trimmable once the ring rotates past
-    # their window, so — like the recurrent families above — they can only
-    # reuse a prefix through the bounded snapshot path, never the ordinary
-    # trimmable prefix cache. Without this, --enable-prefix-cache is a silent
-    # no-op for them and every agentic turn re-prefills the whole accumulated
-    # context (#2061). Detected from the checkpoint config (architecture-driven,
-    # so it also covers a bare local path that resolves to no alias, which is
-    # exactly how #2061 was served). This does NOT touch routing — is_hybrid is
-    # untouched, so no throttle and no hybrid allocation path / wedge.
-    if _config_declares_sliding_window(_resolve_checkpoint_config(model_name, profile)):
-        return True
-
-    return is_deepseek_v4_0731(model_name)
-
-
-def _serve_will_run_on_mllm_lane(args) -> bool:
-    """Whether ``serve`` will actually run this model on the MLLM/VLM
-    continuous-batching lane — the ONLY lane that needs the optional
-    ``mlx-vlm`` runtime (shipped behind the ``[vision]`` extra).
-
-    Delegates to #1178's :func:`resolve_serving_lane` so the boot-time
-    ``[vision]``-required guard agrees with the load-time routing decision.
-    A multimodal alias whose LANGUAGE backbone is hybrid/linear-attention
-    (Qwen3.6 GatedDeltaNet) auto-downgrades to the text-only mlx-lm lane and
-    never touches mlx-vlm, so it must NOT be pushed into a ~1 GB ``[vision]``
-    install. A genuine VLM (non-hybrid backbone, e.g. qwen3-vl) stays on the
-    MLLM lane and still needs it. ``--mllm`` / ``--no-mllm`` are honoured via
-    ``resolve_serving_lane``'s explicit-flag short-circuits.
-
-    The probe reads the cached checkpoint config offline (no network, no
-    weight load). On a first-time uncached start the config isn't
-    materialized yet, so the hybrid probe answers "not hybrid" and the model
-    keeps the SAFE ``[vision]``-required default — the guard's error message
-    then points at ``--no-mllm`` for a text-capable backbone.
-    """
-    from .api.utils import resolve_serving_lane
-
-    requested_spec_decode = getattr(args, "spec_decode", "none") or "none"
-    if requested_spec_decode == "none" and getattr(args, "enable_mtp", False):
-        requested_spec_decode = "mtp"
-    elif requested_spec_decode == "none" and getattr(args, "force_spec_decode", False):
-        requested_spec_decode = "auto"
-    is_mllm_lane, _auto_text_fallback = resolve_serving_lane(
-        args.model,
-        force_mllm=getattr(args, "mllm", False),
-        force_text=getattr(args, "no_mllm", False),
-        requested_spec_decode=requested_spec_decode,
-    )
-    return is_mllm_lane
-
-
-def kv_cache_flag_conflict(args) -> str | None:
-    """Return the operator-facing reason the KV-cache flags conflict, else None.
-
-    Pure predicate over the parsed args — no I/O, no model resolution, no
-    process exit. ``serve_command`` prints the returned message and exits 1.
-
-    Extracted from ``serve_command`` because the rejections were only
-    reachable by spawning a real ``serve``, and the test that covered them
-    did exactly that: it ran ``serve <alias> --reasoning
-    --kv-cache-quantization --kv-cache-quantization-bits 4`` in a subprocess
-    with a 30 s timeout and asserted a non-zero exit. Alias resolution and
-    the weight download run *before* this point, so on a machine without the
-    fixture model cached the child spent the whole budget downloading and the
-    test timed out — it passed or failed on local Hugging Face cache state
-    rather than on whether the rejection still fired. A guard whose colour is
-    decided by something other than the behaviour it guards is not a guard.
-
-    The three checks and their messages are unchanged; only their location is.
-    """
-    # Mutual exclusion: turboquant (any mode) vs standard quantization.
-    # The argparse layer normalizes the flag to either ``None`` (off),
-    # ``"v4"``, or ``"k8v4"``. Anything truthy means TurboQuant is on.
-    if args.kv_cache_turboquant and args.kv_cache_quantization:
-        return (
-            "--kv-cache-turboquant and --kv-cache-quantization are "
-            "mutually exclusive. Choose one."
-        )
-
-    if not args.kv_cache_quantization:
-        return None
-
-    # codex r1 BLOCKING #1: ``--reasoning`` must override the legacy
-    # ``--kv-cache-quantization`` flag too — otherwise ``rapid-mlx serve
-    # --reasoning --kv-cache-quantization --kv-cache-quantization-bits 4``
-    # silently resolves to int4 and the operator who deliberately asked for
-    # the reasoning profile gets the AIME-class quality cliff. Reject the
-    # conflicting combo explicitly: silently flipping the legacy bits to 8
-    # would hide the misconfiguration. bits=8 is equivalent to
-    # ``--reasoning``'s int8 pin and is harmless; only bits=4 conflicts.
-    if args.reasoning and args.kv_cache_quantization_bits == 4:
-        return (
-            "--reasoning is incompatible with --kv-cache-quantization "
-            "--kv-cache-quantization-bits 4. The reasoning profile pins KV "
-            "cache to int8 because sub-4-bit drops -20pt on AIME-class math. "
-            "Either drop --reasoning or drop --kv-cache-quantization-bits 4 "
-            "(or both; use --kv-cache-dtype int8 instead)."
-        )
-
-    # codex r2 BLOCKING #1: argparse pins ``--kv-cache-quantization-bits`` to
-    # ``choices={4,8}``, but programmatic callers (tests, library users that
-    # bypass argparse) can land an out-of-range bits value here. The old
-    # ``"int4" if bits == 4 else "int8"`` silently labeled every non-4 value
-    # as ``int8`` even when KV would actually be quantized at the requested
-    # bit width. Fail fast instead so the gauge / banner / SchedulerConfig
-    # never lie about the active dtype.
-    if args.kv_cache_quantization_bits not in (4, 8):
-        return (
-            f"--kv-cache-quantization-bits must be 4 or 8 "
-            f"(got {args.kv_cache_quantization_bits}). Use --kv-cache-dtype "
-            f"for the canonical knob."
-        )
-
-    return None
 
 
 def serve_command(args):
@@ -2899,18 +1882,6 @@ def serve_command(args):
     import logging
     import os
     import sys
-
-    if bounds_error := _vision_pixel_bounds_error(
-        getattr(args, "vision_min_pixels", 0),
-        getattr(args, "vision_max_pixels", 0),
-    ):
-        print(f"error: {bounds_error}", file=sys.stderr)
-        raise SystemExit(2)
-
-    if os.environ.get("RAPID_PYSAMPLE"):
-        from ._pysample import install as _pysample_install
-
-        _pysample_install()
 
     # Parent-PID watchdog (rapid-desktop issue #449): if the supervisor
     # passed its own PID via ``--watchdog-ppid`` or
@@ -2931,23 +1902,6 @@ def serve_command(args):
     _arg_max_tokens = getattr(args, "max_tokens", None)
     _max_tokens_is_explicit = _arg_max_tokens is not None
     effective_max_tokens = _arg_max_tokens if _arg_max_tokens is not None else 32768
-
-    # Video aliases use a dedicated MLX-native runtime. Check the optional
-    # package and ffmpeg before version prompts or a 22+ GB model download.
-    from .model_aliases import resolve_profile as _resolve_serve_profile
-
-    _serve_profile = _resolve_serve_profile(
-        getattr(args, "_original_alias", None) or getattr(args, "model", "")
-    )
-    _is_wan_video = False
-    if _serve_profile is not None and _serve_profile.modality == "video-gen":
-        from .runtime.video_lane import require_video_runtime_or_exit
-        from .video.wan import is_wan_model
-
-        # Used by the generic model-prefetch guard later in this function;
-        # Wan owns its own revision-pinned download path.
-        _is_wan_video = is_wan_model(args.model)
-        require_video_runtime_or_exit(args.model)
 
     # F-H08-INCOMPLETE: the ``[embeddings]`` extra-required guard MUST
     # fire first thing in ``serve_command`` — before
@@ -2976,27 +1930,17 @@ def serve_command(args):
     # path BEFORE the missing-dep error surfaced (deep ImportError
     # after weight download + alias resolution). Probe here so the
     # operator sees an actionable hint before the long download starts.
-    #
-    # 0.10.16 dogfood follow-up (④): consult the SAME resolved-lane signal
-    # the engine uses (#1178 ``resolve_serving_lane`` + ``_auto_text_
-    # fallback``) instead of the raw ``is_mllm_model`` classification. A
-    # multimodal alias whose LANGUAGE backbone is hybrid/linear-attention
-    # (Qwen3.6 GatedDeltaNet) auto-downgrades to the text-only mlx-lm lane
-    # and NEVER touches mlx-vlm — forcing a base-wheel user into a ~1 GB
-    # ``[vision]`` install for a model that then serves text-only was the
-    # dogfood pain point. ``_serve_will_run_on_mllm_lane`` is True only when
-    # the model will actually run on the MLLM lane, so:
-    #   * genuine VLM (qwen3-vl, non-hybrid backbone) → still requires it,
-    #   * hybrid-backbone VLM (qwen3.6) → boots text-only from the base wheel,
-    #   * ``--mllm`` force-on / ``--no-mllm`` escape hatch → honoured by
-    #     ``resolve_serving_lane``, matching the engine-side semantics.
-    # An uncached checkpoint (config not yet materialized) probes "not
-    # hybrid" and keeps the SAFE ``[vision]``-required default; the guard's
-    # message points at ``--no-mllm`` for a text-capable backbone.
-    if _serve_will_run_on_mllm_lane(args):
-        from .models.mllm import require_mlx_vlm_or_exit
+    # Honors ``--mllm`` force-on AND the alias-name / HF-path probe
+    # used downstream by ``pflash.validate_model_support``. The
+    # ``--no-mllm`` escape hatch (force_text in load_model) bypasses
+    # this guard, matching the engine-side semantics.
+    if not getattr(args, "no_mllm", False):
+        from .api.utils import is_mllm_model as _boot_is_mllm
 
-        require_mlx_vlm_or_exit(args.model)
+        if getattr(args, "mllm", False) or _boot_is_mllm(args.model):
+            from .models.mllm import require_mlx_vlm_or_exit
+
+            require_mlx_vlm_or_exit(args.model)
 
     # R6-H4 (Eva 0.8.7 dogfood): same boot-guard shape for audio aliases.
     # ``mlx-audio`` lives behind the ``[audio]`` extra; pre-fix
@@ -3023,43 +1967,44 @@ def serve_command(args):
     _normalize_speculative_config_or_exit(args)
 
     # DDTree has an external experimental runtime and its validated target
-    # can be multi-GB. Fail the cheap config/alias/runtime gates before the
+    # can be multi-GB. Fail the cheap flag/alias/runtime gates before the
     # version prompt and before any model prefetch so a missing dtree-mlx
-    # install doesn't start a large download first.
+    # install doesn't start a large download first. This runs before the
+    # DFlash runtime probe so --enable-ddtree + --enable-dflash surfaces
+    # the mutual-exclusion error instead of an optional-dependency hint.
     if getattr(args, "enable_ddtree", False):
         _preflight_ddtree_or_exit(args)
 
-    if getattr(args, "enable_dflash", False):
-        _preflight_dflash_mutexes_or_exit(args)
+    _preflight_dflash_mutexes_or_exit(args)
 
-    # DFlash depends on the optional ``mlx-vlm`` bridge that ships in
-    # the ``[dflash]`` extra. Pre-0.9.3 the missing-runtime error only
-    # surfaced ~50 lines into serve_command, AFTER:
+    # 0.9.2 dogfood (parallels the [embeddings]/[vision]/[audio] guards
+    # immediately above): ``--enable-dflash`` and the equivalent
+    # ``--spec-decode dflash`` both depend on the optional ``mlx-vlm``
+    # bridge that ships in the ``[dflash]`` extra. Pre-0.9.3 the missing-
+    # runtime error only surfaced ~50 lines into serve_command, AFTER:
     #   - alias profile resolved (logged twice via pflash)
     #   - tool/reasoning parsers auto-configured
     #   - CORS allow-origin warning printed
     # so the operator saw five INFO lines and a banner before the
-    # actionable optional-extra install instructions,
+    # actionable ``Install with: pip install 'rapid-mlx[dflash]'`` line,
     # matching Diego's earlier ``[embeddings]`` regression shape exactly.
     # Hoist the cheap ``have_runtime()`` probe to the same boot-guard tier
     # as the other extras so the error lands FIRST. ``importlib.util.
     # find_spec("mlx_vlm")`` doesn't trigger a load — safe to run on the
     # hot CLI path.
-    _wants_dflash = getattr(args, "enable_dflash", False)
+    _wants_dflash = getattr(args, "enable_dflash", False) or (
+        getattr(args, "spec_decode", "none") == "dflash"
+    )
     if _wants_dflash:
         from .speculative.dflash.eligibility import have_runtime
 
         if not have_runtime():
             print(
                 "\n  Error: DFlash speculative decoding "
-                '(--speculative-config \'{"method":"dflash"}\') requires '
-                "mlx-vlm 0.5.0+ for the DFlash drafter hooks.\n"
-                "\n  Install in a Python environment with:\n"
-                "    pip install 'rapid-mlx[dflash]'\n"
-                "\n  Homebrew installs the text-only package. Homebrew users "
-                "can switch to the isolated full install with:\n"
-                "    brew uninstall rapid-mlx\n"
-                "    uv tool install 'rapid-mlx[dflash]'\n"
+                '(``--speculative-config \'{"method":"dflash"}\'``, '
+                "--enable-dflash, or --spec-decode dflash) requires "
+                "mlx-vlm 0.5.0+ for the DFlash drafter hooks. Install with: "
+                "``pip install 'rapid-mlx[dflash]'``.\n"
             )
             sys.exit(1)
 
@@ -3091,19 +2036,6 @@ def serve_command(args):
         # routes still accept both forms because the registry's
         # reverse HF-id index covers full ids too.
         args.model = audio_entry.hf_id
-        # Offline + uncached audio (#2357): refuse BEFORE the audio-mode
-        # fork. The main() B2 gate only fires for ids containing '/', so a
-        # short audio alias (``serve whisper``) never reaches it — and
-        # ``_serve_audio_mode`` loads weights lazily on first request, so
-        # without this the server would boot and only fail mid-request.
-        # Judge runnability with the SAME probe core (which family-scopes the
-        # Whisper ``weights.npz`` probe). The offline-refusal decision uses the
-        # tri-state ``is False`` so a probe fault (``None``) does not refuse.
-        if (
-            _offline_hub_mode_active()
-            and _cache_runnability(audio_entry.hf_id) is False
-        ):
-            _refuse_offline_uncached(audio_entry.hf_id)
         _serve_audio_mode(args, audio_entry)
         return
 
@@ -3116,80 +2048,13 @@ def serve_command(args):
     if prompt_upgrade_if_available():
         sys.exit(0)
 
-    # Finding ⑥ (0.10.16 dogfood): a "weightless stub" cache — config.json
-    # present but ``model*.safetensors`` absent (a warm cache commonly holds
-    # ~20 Gemma-4 repos in exactly this state, from a metadata-only config
-    # probe or an interrupted pull) — LOOKS cached, so ``serve`` eats a
-    # surprise multi-GB download with no upfront signal. Surface a one-line
-    # notice BEFORE the prefetch. Purely informational and unconditional
-    # (fires even in non-TTY / RAPID_MLX_AUTO_PULL=1 runs where the B2
-    # confirmation gate self-skips); it does NOT gate or change the download
-    # (that stays with ``_ensure_model_downloaded``). Best-effort — a
-    # diagnostic must never break serve.
-    try:
-        from vllm_mlx._download_gate import weightless_stub_notice
-        from vllm_mlx.model_aliases import resolve_model as _resolve_model
-
-        # Canonicalize alias → ``org/repo`` BEFORE probing the cache. A
-        # shorthand alias (``gemma-4-12b``) has its config-only stub on disk
-        # under the RESOLVED HF id, so probing the raw alias string would
-        # miss the cache dir and the notice would silently no-op for the
-        # common naive-user invocation. ``resolve_model`` is idempotent for
-        # already-resolved ids / local paths, and mirrors the resolution the
-        # download path (``_ensure_model_downloaded`` on ``args.model``)
-        # relies on.
-        _probe_model = _resolve_model(args.model)
-        _stub_notice = weightless_stub_notice(_probe_model)
-        if _stub_notice:
-            # stderr + flush: in the exact non-TTY / RAPID_MLX_AUTO_PULL=1
-            # case this notice targets, block-buffered stdout may never
-            # flush before the multi-GB download + server lifetime, leaving
-            # the warning invisible. stderr is line-buffered/unbuffered and
-            # is the correct stream for an operational warning anyway.
-            print(_stub_notice, file=sys.stderr, flush=True)
-    except Exception:
-        pass
-
     # Pre-fetch the model via the R2 mirror (with HF fallback) BEFORE the
     # heavy server boot. Without this, ``serve`` falls into
     # ``mlx_lm.load`` → ``huggingface_hub.snapshot_download`` directly and
     # skips the mirror entirely (#651). ``_ensure_model_downloaded`` is a
     # no-op on local paths and on fully-cached repos, so this is free on
     # the warm path.
-    # WanVideoEngine resolves registered repositories at an audited pinned
-    # revision (or uses RAPID_MLX_WAN_MODEL_DIR). The generic prefetch has no
-    # revision parameter and could otherwise download repository HEAD first,
-    # duplicating tens of gigabytes before the pinned snapshot is loaded.
-    if not _is_wan_video:
-        if getattr(args, "force_disk_check", False):
-            _ensure_model_downloaded(args.model, force_disk_check=True)
-        else:
-            # Keep the historical one-argument call on the default path; a
-            # number of embedders/tests replace this hook with a one-argument
-            # prefetch function.
-            _ensure_model_downloaded(args.model)
-
-    # The prefetch above swallows transport errors on purpose ("server will
-    # retry"), which is right for a text model — the loader retries and raises
-    # something legible. An mflux checkpoint has no such backstop: it loads
-    # whatever shards arrived and renders noise, so a pull that ended early
-    # would boot a server whose only possible output is garbage. Refuse here
-    # instead, while the operator is still watching the command they typed.
-    if _serve_profile is not None and _serve_profile.modality == "image-gen":
-        from ._download_gate import mflux_missing_weights
-
-        _missing = mflux_missing_weights(args.model)
-        if _missing:
-            _shown = getattr(args, "_original_alias", None) or args.model
-            print(
-                f"\n  Error: {_shown} is only partially downloaded — "
-                f"{len(_missing)} required file(s) missing, starting with "
-                f"{_missing[0]}.\n"
-                f"  Finish the download with `rapid-mlx pull {_shown}`, "
-                "then serve again.\n",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+    _ensure_model_downloaded(args.model)
 
     # Import unified server
     from . import server
@@ -3247,19 +2112,6 @@ def serve_command(args):
             "Error: --gpu-memory-utilization must be between 0.0 (exclusive) and 1.0 (inclusive)"
         )
         sys.exit(1)
-    if getattr(args, "resident_memory_limit_gb", 0.0) < 0:
-        print("Error: --resident-memory-limit-gb must be >= 0")
-        sys.exit(1)
-    if getattr(args, "resident_model_idle_ttl", 0.0) < 0:
-        print("Error: --resident-model-idle-ttl must be >= 0")
-        sys.exit(1)
-    idle_cache_clear_seconds = getattr(args, "idle_cache_clear_seconds", None)
-    if idle_cache_clear_seconds is not None:
-        import math
-
-        if not math.isfinite(idle_cache_clear_seconds) or idle_cache_clear_seconds < 0:
-            print("Error: --idle-cache-clear-seconds must be finite and >= 0")
-            sys.exit(1)
 
     # Validate PFlash config and reject unsupported model combinations
     # at startup. Done here (not lazily in the scheduler) so a typo in
@@ -3271,80 +2123,24 @@ def serve_command(args):
     # Qwen3.6 aliases, ``"off"`` everywhere else) is materialized into
     # ``args.pflash``. The resolved value then flows through the same
     # validation path the user-explicit case takes.
-    from .api.utils import resolve_serving_lane
+    from .api.utils import is_mllm_model
     from .pflash import (
-        resolve_pflash_config,
+        config_from_args,
+        resolve_pflash_mode_default,
         validate_model_support,
     )
 
-    # Lazily resolve checkpoint/profile metadata at most once for the serve-time
-    # defaults below. Fully explicit startup must not inspect metadata at all.
-    # PFlash/TurboQuant historically propagate inspection failures (while a
-    # missing import degrades to no default); parser/cache detection is
-    # non-fatal. The first consumer keeps its established error policy.
-    auto_config = None
-    auto_config_resolved = False
-
-    def resolve_auto_config(*, non_fatal: bool):
-        nonlocal auto_config, auto_config_resolved
-        if auto_config_resolved:  # pragma: no cover - callers guard resolved state
-            return auto_config
-        try:
-            from .model_auto_config import detect_model_config
-        except ImportError:
-            auto_config_resolved = True
-            return None
-        try:
-            auto_config = detect_model_config(args.model)
-        except Exception as e:
-            if not non_fatal:
-                raise
-            logger.debug(f"Auto-detection failed (non-fatal): {e}")
-            return None
-        auto_config_resolved = True
-        return auto_config
-
-    # Resolve the FINAL serving lane ONCE (the model is already downloaded by
-    # ``_ensure_model_downloaded`` above, so the offline probes have real
-    # evidence). PFlash defaulting and ``validate_model_support`` must both see
-    # the effective lane, NOT the raw multimodal classification: a hybrid VLM
-    # that auto-downgrades to the text-only lane is PFlash-capable there,
-    # exactly as an explicit ``--text-only`` run would be (#352 dogfood P1-②).
-    if not args.enable_dflash:
-        _requested_spec_decode = getattr(args, "spec_decode", "none") or "none"
-        if _requested_spec_decode == "none" and getattr(
-            args, "force_spec_decode", False
-        ):
-            _requested_spec_decode = "auto"
-        _serve_is_mllm, _ = resolve_serving_lane(
-            args.model,
-            force_mllm=getattr(args, "mllm", False),
-            force_text=getattr(args, "no_mllm", False),
-            requested_spec_decode=_requested_spec_decode,
+    args.pflash = resolve_pflash_mode_default(args, model_name=args.model)
+    try:
+        pflash_config = config_from_args(args)
+        validate_model_support(
+            pflash_config,
+            model_name=args.model,
+            is_mllm=getattr(args, "mllm", False) or is_mllm_model(args.model),
         )
-        # Resolve BOTH per-alias PFlash defaults (mode + keep_ratio, e.g.
-        # bonsai-27b-2bit → always @ 0.50) and build the config in one shared
-        # helper; an explicit --pflash / --pflash-keep-ratio still wins inside.
-        try:
-            pflash_detection = {}
-            if args.pflash is None or args.pflash_keep_ratio is None:
-                pflash_detection["_detected_config"] = resolve_auto_config(
-                    non_fatal=False
-                )
-            pflash_config = resolve_pflash_config(
-                args,
-                model_name=args.model,
-                is_multimodal=_serve_is_mllm,
-                **pflash_detection,
-            )
-            validate_model_support(
-                pflash_config,
-                model_name=args.model,
-                is_mllm=_serve_is_mllm,
-            )
-        except ValueError as e:
-            print(f"Error: {e}")
-            sys.exit(1)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
     # Auto-detect parser config from model name when not explicitly set.
     # --no-tool-call-parser / --no-reasoning-parser are escape hatches
@@ -3377,31 +2173,34 @@ def serve_command(args):
     # warning grounded in user intent even if a helper-side regression
     # ever started flagging in-spec cases.)
     _user_explicit_tool_call_parser = bool(args.tool_call_parser)
-    if not auto_config_resolved and (
-        not args.tool_call_parser or not args.reasoning_parser
-    ):
-        resolve_auto_config(non_fatal=True)
-    if auto_config:
-        if (
-            not args.tool_call_parser
-            and not _opt_out_tool
-            and auto_config.tool_call_parser
-        ):
-            args.tool_call_parser = auto_config.tool_call_parser
-            args.enable_auto_tool_choice = True
-            logger.info(
-                f"Auto-configured --tool-call-parser {auto_config.tool_call_parser}"
-            )
-        if (
-            not args.reasoning_parser
-            and not _opt_out_reasoning
-            and not args.no_thinking
-            and auto_config.reasoning_parser
-        ):
-            args.reasoning_parser = auto_config.reasoning_parser
-            logger.info(
-                f"Auto-configured --reasoning-parser {auto_config.reasoning_parser}"
-            )
+    if not args.tool_call_parser or not args.reasoning_parser:
+        try:
+            from .model_auto_config import detect_model_config
+
+            auto_config = detect_model_config(args.model)
+            if auto_config:
+                if (
+                    not args.tool_call_parser
+                    and not _opt_out_tool
+                    and auto_config.tool_call_parser
+                ):
+                    args.tool_call_parser = auto_config.tool_call_parser
+                    args.enable_auto_tool_choice = True
+                    logger.info(
+                        f"Auto-configured --tool-call-parser {auto_config.tool_call_parser}"
+                    )
+                if (
+                    not args.reasoning_parser
+                    and not _opt_out_reasoning
+                    and not args.no_thinking
+                    and auto_config.reasoning_parser
+                ):
+                    args.reasoning_parser = auto_config.reasoning_parser
+                    logger.info(
+                        f"Auto-configured --reasoning-parser {auto_config.reasoning_parser}"
+                    )
+        except Exception as e:
+            logger.debug(f"Auto-detection failed (non-fatal): {e}")
     if _opt_out_tool:
         logger.info(
             "Tool-call parser auto-detection disabled via --no-tool-call-parser"
@@ -3571,16 +2370,6 @@ def serve_command(args):
     # when ``*`` is in the origin list. Operators who need cookie /
     # ``Authorization`` auto-forwarding must pin to specific origins.
     cors_origins = server.configure_cors_from_env(args.cors_origins)
-
-    # WH-1: OPT-IN Host-header allowlist (DNS-rebinding hardening).
-    server.configure_trusted_hosts(getattr(args, "trusted_hosts", None))
-
-    # Request logging middleware — installed AFTER CORS so it is the
-    # outermost layer (Starlette prepends, so last install runs first).
-    from vllm_mlx.middleware.request_logging import install_request_logging_middleware
-
-    install_request_logging_middleware(server.app)
-
     if args.rate_limit > 0:
         server._rate_limiter = configure_rate_limiter(args.rate_limit, enabled=True)
 
@@ -3593,9 +2382,6 @@ def serve_command(args):
 
     # Configure system prompt pinning
     server._pin_system_prompt = args.pin_system_prompt
-    server._relocate_mid_conversation_system = getattr(
-        args, "relocate_mid_conversation_system", False
-    )
 
     # Configure tool calling
     if args.enable_auto_tool_choice and args.tool_call_parser:
@@ -3649,17 +2435,35 @@ def serve_command(args):
     else:
         server._reasoning_parser = None
 
+    # R15-P1 #313 follow-up (#318): ``--spec-decode dflash`` routes to
+    # the prod path. The originally vendored BatchedEngine adapter at
+    # ``vllm_mlx/spec_decode/dflash/drafter.py:275`` called
+    # ``drafter.draft_block(prefix_tokens, current_position)`` with 2 args,
+    # but mlx-vlm 0.5.0's ``DFlashDraftModel.draft_block`` requires 6 args:
+    # ``(last_bonus, hidden, cache, block_size, sampler, token_dtype)``.
+    # The BatchedEngine adapter never wired the verifier→drafter hidden-
+    # state + cache + sampler thread, so the new --spec-decode dflash
+    # flag was 100% broken at first request — never validated end-to-end.
+    # The OLD ``--enable-dflash`` flag (``vllm_mlx/speculative/dflash/`` +
+    # mlx-vlm's ``_dflash_rounds``) IS the prod-tested path. We unify the
+    # CLI surface by routing ``--spec-decode dflash`` to
+    # ``--enable-dflash`` so users hit the working bridge. The
+    # ``spec_decode/dflash/{generator,drafter,verifier}.py`` modules
+    # remain importable but inert; the ``accept_counter`` /
+    # ``drafter_registry`` siblings stay active for metric scaffolding.
+    _maybe_print_legacy_dflash_redirect(args)
+
     # DFlash / DDTree mutual-exclusion gates fire BEFORE the startup banner so
     # the user sees a clean error instead of an optimistic "Features:
     # dflash" / "ddtree" line immediately followed by an exit. The deeper
     # SchedulerConfig mutex (suffix vs. mtp) stays below since it doesn't
     # involve the dedicated single-user servers.
-    if args.enable_dflash and args.suffix_decoding:
+    if args.enable_dflash and (args.suffix_decoding or args.enable_mtp):
         print(
-            "\n  Error: DFlash cannot combine with other spec-decode methods. "
-            "DFlash runs a dedicated single-user server that bypasses "
-            "BatchedEngine; other spec-decode methods only apply to the "
-            "BatchedEngine path.\n"
+            "\n  Error: DFlash cannot combine with --suffix-decoding "
+            "or --enable-mtp. DFlash runs a dedicated single-user server "
+            "that bypasses BatchedEngine; other spec-decode methods only "
+            "apply to the BatchedEngine path.\n"
         )
         sys.exit(1)
 
@@ -3669,38 +2473,25 @@ def serve_command(args):
     # aliases.json + checks the module spec); no model load yet.
     if args.enable_dflash:
         from .model_aliases import resolve_profile
-        from .model_profile import ModelProfile
         from .speculative.dflash import DFlashUnavailable, check
-        from .speculative.dflash.eligibility import report as dflash_report
 
         # ``have_runtime()`` validated at the top-of-function boot-guard
         # tier — see the 0.9.2 dogfood comment near the audio probe.
         _alias_name = getattr(args, "_original_alias", None) or args.model
         _profile = resolve_profile(_alias_name)
         if _profile is None:
-            _profile = ModelProfile(hf_path=args.model)
-        _drafter = _resolve_dflash_drafter_repo(args, _profile)
+            print(
+                f"\n  Error: DFlash requires a known alias, got "
+                f"{_alias_name!r}. DFlash eligibility is recorded per-alias "
+                f"in aliases.json; ad-hoc HuggingFace paths can't be "
+                f"validated. Try ``rapid-mlx info qwen3.5-27b-8bit``.\n"
+            )
+            sys.exit(1)
         try:
-            _assessment = dflash_report(
-                _profile,
-                alias=_alias_name,
-                explicit=True,
-                drafter_model=_drafter,
-            )
-            check(
-                _profile,
-                alias=_alias_name,
-                explicit=True,
-                drafter_model=_drafter,
-            )
+            check(_profile, alias=_alias_name)
         except DFlashUnavailable as e:
             print(f"\n  Error: {e}\n")
             sys.exit(1)
-        for _warning in _assessment.warnings:
-            print(f"\n  ⚠ Experimental DFlash: {_warning}.\n")
-        args._dflash_profile = _profile
-        args._dflash_drafter_repo = _drafter
-        args._dflash_experimental = _assessment.recommendation != "verified"
         # ``have_runtime()`` is already validated by the boot-guard tier
         # at the top of ``serve_command`` — see the 0.9.2 dogfood comment
         # there. We keep the import + the deeper DFlashUnavailable / alias
@@ -3715,16 +2506,10 @@ def serve_command(args):
         # the user explicitly set away from their default.
         _GPU_MEM_DEFAULT = 0.90  # keep in sync with the serve_parser default
         _dflash_ignored: list[str] = []
-        # Prefix caching is enabled by default in the shared serve parser,
-        # so it is not evidence that the user explicitly requested it.
-        # DFlash already documents its no-prefix-cache limitation; avoid a
-        # warning on every normal DFlash startup.
+        if getattr(args, "enable_prefix_cache", False):
+            _dflash_ignored.append("--enable-prefix-cache")
         if getattr(args, "kv_cache_quantization", None):
             _dflash_ignored.append("--kv-cache-quantization")
-        if getattr(args, "kv_cache_turboquant", None):
-            _dflash_ignored.append("--kv-cache-turboquant")
-        if getattr(args, "pflash", None) not in (None, "auto"):
-            _dflash_ignored.append("--pflash")
         # gpu-memory-utilization defaults to 0.90 (not None) in the serve
         # parser, so an ``is not None`` check would fire on every invocation.
         # Compare to the real default — only warn when the user explicitly
@@ -3732,8 +2517,12 @@ def serve_command(args):
         _gpu_mem = getattr(args, "gpu_memory_utilization", _GPU_MEM_DEFAULT)
         if _gpu_mem is not None and abs(_gpu_mem - _GPU_MEM_DEFAULT) > 1e-6:
             _dflash_ignored.append("--gpu-memory-utilization")
-        if getattr(args, "enable_tool_logits_bias", False):
-            _dflash_ignored.append("--enable-tool-logits-bias")
+        if getattr(args, "enable_auto_tool_choice", False):
+            _dflash_ignored.append("--enable-auto-tool-choice")
+        if getattr(args, "tool_call_parser", None):
+            _dflash_ignored.append("--tool-call-parser")
+        if getattr(args, "reasoning_parser", None):
+            _dflash_ignored.append("--reasoning-parser")
         if getattr(args, "embedding_model", None):
             _dflash_ignored.append("--embedding-model")
         if getattr(args, "mcp_config", None):
@@ -3772,12 +2561,12 @@ def serve_command(args):
             _ddtree_ignored.append("--mcp-config")
         if _ddtree_ignored:
             print(
-                "\n  ⚠ The following flags are ignored under DDTree mode"
+                "\n  ⚠ The following flags are ignored under --enable-ddtree"
                 "\n    (DDTree uses a dedicated experimental single-user "
                 "server that bypasses BatchedEngine):"
                 f"\n      {', '.join(_ddtree_ignored)}"
                 "\n    Drop them from your serve command, or run without"
-                "\n    DDTree if you need them.\n"
+                "\n    --enable-ddtree if you need them.\n"
             )
 
     # Startup summary
@@ -3803,9 +2592,11 @@ def serve_command(args):
         features.append(auth_feature)
     if args.rate_limit > 0:
         features.append(f"rate-limit: {args.rate_limit}/min")
-    if gc_control and not args.enable_dflash:
+    if args.cloud_model:
+        features.append(f"cloud: {args.cloud_model}")
+    if gc_control:
         features.append("gc-control")
-    if args.pin_system_prompt and not args.enable_dflash:
+    if args.pin_system_prompt:
         features.append("pin-system-prompt")
     # Show CORS in the startup banner when CLI flag or env-var-driven
     # config produced an origin list (``configure_cors_from_env`` is what
@@ -3820,58 +2611,9 @@ def serve_command(args):
         print(f"  Features: {', '.join(features)}")
     print(f"  Model: {args.model}")
     # Store MCP config path for FastAPI startup
-    if args.mcp_config and not args.enable_dflash:
+    if args.mcp_config:
         print(f"MCP config: {args.mcp_config}")
         os.environ["RAPID_MLX_MCP_CONFIG"] = args.mcp_config
-
-    # DFlash owns a dedicated single-user runtime. Fork before constructing
-    # BatchedEngine-only cache/TurboQuant/PFlash state so startup output and
-    # initialization describe capabilities that actually apply.
-    if args.enable_dflash:
-        if getattr(args, "no_spec_decode", False):
-            print(
-                "error: DFlash and --no-spec-decode are mutually "
-                "exclusive — DFlash is a speculative-decode mode.",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-
-        from .model_aliases import resolve_profile
-        from .speculative.dflash.server import run_dflash_server
-
-        _alias_name = getattr(args, "_original_alias", None) or args.model
-        _profile = getattr(args, "_dflash_profile", None) or resolve_profile(
-            _alias_name
-        )
-
-        _check_disk_space(args.model, force=getattr(args, "force_disk_check", False))
-        _check_memory_capacity(args.model)
-        server._sync_config()
-        run_dflash_server(
-            main_model_repo=_profile.hf_path if _profile else args.model,
-            drafter_repo=getattr(args, "_dflash_drafter_repo", None)
-            or _resolve_dflash_drafter_repo(args, _profile),
-            host=args.host,
-            port=args.port,
-            served_model_name=args.served_model_name or _alias_name,
-            default_max_tokens=effective_max_tokens,
-            cors_origins=cors_origins,
-            uvicorn_log_level=uvicorn_log_level,
-            no_thinking=args.no_thinking,
-            api_key=server._api_key,
-            rate_limit=args.rate_limit,
-            max_request_bytes=server._max_request_bytes,
-            body_receive_timeout_seconds=server._body_receive_timeout_seconds,
-            default_timeout=server._default_timeout,
-            max_concurrent_requests=args.max_concurrent_requests,
-            cors_policy=server.get_resolved_cors_policy(),
-            tool_call_parser=(
-                args.tool_call_parser if args.enable_auto_tool_choice else None
-            ),
-            reasoning_parser_name=args.reasoning_parser,
-            experimental_opt_in=getattr(args, "_dflash_experimental", False),
-        )
-        return
 
     # Pre-load embedding model if specified.
     #
@@ -3888,6 +2630,31 @@ def serve_command(args):
     if args.embedding_model:
         _load_embedding_model_or_exit(args, server.load_embedding_model)
 
+    # Warn about deprecated flags
+    if getattr(args, "simple_engine", False):
+        print(
+            "\n  ⚠ --simple-engine is deprecated and has no effect."
+            "\n    BatchedEngine is now the sole engine — it handles both"
+            "\n    single-user and multi-user workloads with equal performance.\n"
+        )
+    if getattr(args, "kv_bits", None) is not None:
+        print(
+            "\n  ⚠ --kv-bits is deprecated and has no effect."
+            "\n    For prefix cache quantization, use --kv-cache-quantization instead.\n"
+        )
+    if getattr(args, "draft_model", None):
+        print(
+            "\n  ⚠ --draft-model is deprecated and has no effect."
+            "\n    For DFlash speculative decoding, use "
+            """--speculative-config '{"method":"dflash"}' """
+            "(requires a DFlash-eligible alias). "
+            "For MTP, use "
+            """--speculative-config '{"method":"mtp"}' """
+            "(requires a model with MTP head).\n"
+        )
+    if getattr(args, "specprefill", False):
+        print("\n  ⚠ --specprefill is deprecated and has no effect.\n")
+
     # Resolve per-alias TurboQuant default before the mutual-exclusion
     # check below — operator-explicit values still win. The
     # ``turboquant_scheduler_kwargs`` helper is the shared invariant
@@ -3900,23 +2667,18 @@ def serve_command(args):
         turboquant_scheduler_kwargs as _turboquant_scheduler_kwargs,
     )
 
-    turboquant_detection = {}
-    if auto_config_resolved:
-        turboquant_detection["_detected_config"] = auto_config
-    elif getattr(args, "kv_cache_turboquant", None) is None and not getattr(
-        args, "kv_cache_quantization", False
-    ):
-        turboquant_detection["_detected_config"] = resolve_auto_config(non_fatal=False)
     args.kv_cache_turboquant = resolve_turboquant_mode_default(
-        args, model_name=args.model, **turboquant_detection
+        args, model_name=args.model
     )
 
-    # Reject conflicting KV-cache flag combinations before anything else in
-    # this block reads them. Extracted so the rejection can be tested without
-    # spawning ``serve`` — see ``kv_cache_flag_conflict``.
-    _kv_conflict = kv_cache_flag_conflict(args)
-    if _kv_conflict is not None:
-        print(f"\n  Error: {_kv_conflict}\n")
+    # Mutual exclusion: turboquant (any mode) vs standard quantization.
+    # The argparse layer normalizes the flag to either ``None`` (off),
+    # ``"v4"``, or ``"k8v4"``. Anything truthy means TurboQuant is on.
+    if args.kv_cache_turboquant and args.kv_cache_quantization:
+        print(
+            "\n  Error: --kv-cache-turboquant and --kv-cache-quantization are "
+            "mutually exclusive. Choose one.\n"
+        )
         sys.exit(1)
 
     # R15 #300: resolve --kv-cache-dtype + --reasoning + safelist BEFORE
@@ -3968,10 +2730,42 @@ def serve_command(args):
             KVCacheDtypeDecision,
         )
 
-        # The two rejections that used to live here (``--reasoning`` +
-        # bits=4, and an out-of-range bits value) moved into
-        # ``kv_cache_flag_conflict`` and already fired above, so anything
-        # reaching this point has a legal bits value.
+        # codex r1 BLOCKING #1: ``--reasoning`` must override the
+        # legacy ``--kv-cache-quantization`` flag too — otherwise
+        # ``rapid-mlx serve --reasoning --kv-cache-quantization
+        # --kv-cache-quantization-bits 4`` silently resolves to int4
+        # and the operator who deliberately asked for the reasoning
+        # profile gets the AIME-class quality cliff. Reject the
+        # conflicting combo with an explicit error: silently flipping
+        # the legacy bits to 8 would hide the misconfiguration.
+        # bits=8 is equivalent to --reasoning's int8 pin and is
+        # harmless; only bits=4 conflicts.
+        if args.reasoning and args.kv_cache_quantization_bits == 4:
+            print(
+                "\n  Error: --reasoning is incompatible with "
+                "--kv-cache-quantization --kv-cache-quantization-bits 4. "
+                "The reasoning profile pins KV cache to int8 because "
+                "sub-4-bit drops -20pt on AIME-class math. Either drop "
+                "--reasoning or drop --kv-cache-quantization-bits 4 "
+                "(or both; use --kv-cache-dtype int8 instead).\n"
+            )
+            sys.exit(1)
+
+        # codex r2 BLOCKING #1: argparse pins ``--kv-cache-quantization-bits``
+        # to ``choices={4,8}``, but programmatic callers (tests, library
+        # users that bypass argparse) can land an out-of-range bits value
+        # here. The old ``"int4" if bits == 4 else "int8"`` silently
+        # labeled every non-4 value as ``int8`` even when KV would actually
+        # be quantized at the requested bit width. Fail fast instead so
+        # the gauge / banner / SchedulerConfig never lie about the
+        # active dtype.
+        if args.kv_cache_quantization_bits not in (4, 8):
+            print(
+                f"\n  Error: --kv-cache-quantization-bits must be 4 or 8 "
+                f"(got {args.kv_cache_quantization_bits}). Use "
+                f"--kv-cache-dtype for the canonical knob.\n"
+            )
+            sys.exit(1)
         legacy_dtype = "int4" if args.kv_cache_quantization_bits == 4 else "int8"
         # When --reasoning is set alongside the (compatible) bits=8
         # legacy flag, the operator-facing reason should still
@@ -4003,53 +2797,28 @@ def serve_command(args):
         except Exception:
             pass
 
+    # Mutual exclusion: only one spec-decode method may wrap _step at a time.
+    # (The DFlash-vs-{suffix,mtp} check is upstream, before the banner.)
+    if args.suffix_decoding and args.enable_mtp:
+        print(
+            "\n  Error: --suffix-decoding and --enable-mtp are mutually "
+            "exclusive (both monkey-patch the BatchGenerator step). "
+            "Pick one.\n"
+        )
+        sys.exit(1)
+
     # Build scheduler config
     enable_prefix_cache = args.enable_prefix_cache and not args.disable_prefix_cache
-
-    # #1122: when prefix cache is enabled for a hybrid model and the user
-    # did NOT explicitly pass --hybrid-cache-entries, auto-default to 8 so
-    # the cache actually stores entries instead of silently dropping them.
-    hybrid_cache_user_explicit = "--hybrid-cache-entries" in sys.argv or any(
-        a.startswith("--hybrid-cache-entries=") for a in sys.argv
-    )
-    hybrid_cache_explicit_value = getattr(args, "hybrid_cache_entries", 0)
-    if (
-        not auto_config_resolved
-        and enable_prefix_cache
-        and hybrid_cache_explicit_value == 0
-        and not hybrid_cache_user_explicit
-    ):
-        resolve_auto_config(non_fatal=True)
-    _hybrid_cache_entries = _resolve_hybrid_cache_entries(
-        enable_prefix_cache=enable_prefix_cache,
-        explicit_value=hybrid_cache_explicit_value,
-        user_set_explicit=hybrid_cache_user_explicit,
-        model_name=getattr(args, "_original_alias", None) or args.model,
-        model_config=auto_config,
-    )
-    _prefill_user_set_explicit = "--prefill-step-size" in sys.argv or any(
-        a.startswith("--prefill-step-size=") for a in sys.argv
-    )
-    _prefill_step_size = _resolve_prefill_step_size(
-        model_name=getattr(args, "_original_alias", None) or args.model,
-        configured=args.prefill_step_size,
-        user_set_explicit=_prefill_user_set_explicit,
-    )
-    _vision_prefill_token_budget = _resolve_vision_prefill_token_budget(
-        configured=getattr(args, "vision_prefill_token_budget", None),
-        prefill_step_size=_prefill_step_size,
-        prefill_user_set_explicit=_prefill_user_set_explicit,
-    )
 
     # 0.9.13 PR-A codex round-E blocker #2: resolve model_type on the
     # CLI's asyncio thread and thread it down through SchedulerConfig
     # so the engine's model-load-executor dispatch step does not need
     # to re-read ``config.json`` (offline HF cache races vs. the CLI's
     # own read were being collapsed into a silent MTP no-op). Only
-    # runs when the operator explicitly asked for MTP through
-    # ``--speculative-config``; for the "none" path the field stays
-    # None and the engine takes the pre-0.9.13 fallback branch that
-    # best-effort re-reads the config on the executor.
+    # runs when the operator explicitly asked for ``--spec-decode
+    # mtp``; for the "none" path the field stays None and the engine
+    # takes the pre-0.9.13 fallback branch that best-effort re-reads
+    # the config on the executor.
     _cli_mtp_model_type: str | None = None
     if getattr(args, "spec_decode", "none") == "mtp":
         try:
@@ -4074,41 +2843,25 @@ def serve_command(args):
         use_memory_aware_cache=not args.no_memory_aware_cache,
         cache_memory_mb=args.cache_memory_mb,
         cache_memory_percent=args.cache_memory_percent,
-        idle_cache_clear_seconds=getattr(args, "idle_cache_clear_seconds", None),
-        # #1103/#1122: bounded trim-free hybrid (recurrent-state) prefix reuse.
-        # Auto-defaulted to 8 for hybrid models when prefix cache is enabled.
-        hybrid_cache_entries=_hybrid_cache_entries,
-        # Operator override for the D-METAL-CAP projection; 0 keeps the
-        # architecture-aware auto-derivation. Needed by quantized-KV
-        # deployments, whose real footprint the fp16 estimate over-states.
-        metal_cap_kv_bytes_per_token=getattr(args, "metal_cap_kv_bytes_per_token", 0),
-        non_trimmable_exact_prefix_reuse=(
-            _hybrid_cache_entries > 0
-            and _needs_bounded_trim_free_reuse(
-                getattr(args, "_original_alias", None) or args.model,
-                model_config=auto_config,
-            )
-        ),
-        # Opt-in prompt-deterministic response cache (exact-match short-circuit).
-        response_cache_entries=getattr(args, "response_cache_entries", 0),
         # Paged cache options
         use_paged_cache=args.use_paged_cache,
         paged_cache_block_size=args.paged_cache_block_size,
         max_cache_blocks=args.max_cache_blocks,
+        # Chunked prefill
+        chunked_prefill_tokens=args.chunked_prefill_tokens,
         # Prefill step size (chunk size). Must be plumbed here — BatchedEngine
         # reads it off scheduler_config only; the legacy load_model kwarg was
         # accepted but never used. See #400 and the CLI ↔ Config fidelity
         # audit at scripts/audit_cli_config_fidelity.py.
-        prefill_step_size=_prefill_step_size,
-        vision_prefill_token_budget=_vision_prefill_token_budget,
-        vision_min_pixels=getattr(args, "vision_min_pixels", 0),
-        vision_max_pixels=getattr(args, "vision_max_pixels", 0),
-        # Speculative decoding selection.
-        enable_mtp=getattr(args, "enable_mtp", False),
-        mtp_num_draft_tokens=getattr(args, "mtp_num_draft_tokens", 1),
-        mtp_optimistic=getattr(args, "mtp_optimistic", False),
+        prefill_step_size=args.prefill_step_size,
+        # MTP
+        enable_mtp=args.enable_mtp,
+        mtp_num_draft_tokens=args.mtp_num_draft_tokens,
+        mtp_optimistic=args.mtp_optimistic,
+        # Speculative decoding selection. ``mtp`` is set internally by
+        # --speculative-config only; legacy --spec-decode remains limited
+        # to none/dflash.
         spec_decode=getattr(args, "spec_decode", "none"),
-        dspark_num_speculative_tokens=getattr(args, "dspark_num_speculative_tokens", 5),
         dflash_drafter_path=getattr(args, "dflash_drafter_path", "") or "",
         # Optional external MTP sidecar path. ``None`` is the "no
         # sidecar; native-MTP path only" sentinel.
@@ -4146,12 +2899,11 @@ def serve_command(args):
         # the boolean ``kv_cache_turboquant`` for downstream callers;
         # the mode string rides on the dedicated ``_mode`` field.
         **_turboquant_scheduler_kwargs(args),
-        # R15-P1 (task #296): disk-backed KV checkpointing. ``0``
-        # (default) disables; each snapshot blocks the decode thread for
-        # O(context) so the feature is opt-in (#1853). The runtime module
-        # guards every hot-path call with ``should_checkpoint`` so the
-        # cost when off is one int comparison.
-        kv_disk_checkpoint_interval=getattr(args, "kv_disk_checkpoint_interval", 0),
+        # R15-P1 (task #296): disk-backed KV checkpointing at 256-tok
+        # boundaries. ``0`` disables; the runtime module guards every
+        # hot-path call with ``should_checkpoint`` so the cost when off
+        # is one int comparison.
+        kv_disk_checkpoint_interval=getattr(args, "kv_disk_checkpoint_interval", 256),
         # PFlash long-prompt compression (#287)
         pflash_config=pflash_config,
         # D-METAL-CAP: thread the user's --gpu-memory-utilization into
@@ -4167,36 +2919,10 @@ def serve_command(args):
     )
 
     print("Mode: Continuous batching (for multiple concurrent users)")
-    if getattr(args, "spec_decode", "none") == "mtp":
-        print(
-            "MTP: enabled via --speculative-config, "
-            f"max_k={getattr(args, 'mtp_max_k', 1)}"
-        )
-    if getattr(args, "spec_decode", "none") == "dspark":
-        from vllm_mlx.spec_decode.dspark import detect_dspark_metadata
-
-        metadata = detect_dspark_metadata(args.model)
-        if metadata is None:
-            print(
-                "error: DSpark requires a complete DeepSeek V4 DSpark "
-                "checkpoint (3 mtp stages plus Markov heads).",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-        requested_k = getattr(args, "dspark_num_speculative_tokens", 5)
-        if requested_k != metadata.block_size:
-            print(
-                "error: requested DSpark num_speculative_tokens="
-                f"{requested_k} does not match checkpoint block_size="
-                f"{metadata.block_size}. Rapid-MLX currently requires the "
-                "checkpoint's complete DSpark block.",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-        print(
-            "DSpark: enabled via --speculative-config, "
-            f"max_k={requested_k}, checkpoint_k={metadata.block_size}"
-        )
+    if args.chunked_prefill_tokens > 0:
+        print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
+    if args.enable_mtp:
+        print(f"MTP: enabled, draft_tokens={args.mtp_num_draft_tokens}")
     # Native Qwen3.5/3.6 MTP via vendored mlx-lm PR #990. The
     # config-only entrypoint is ``--speculative-config '{"method":"mtp"}'``.
     # Boot-time eligibility check fires here so misuse bounces with a clear
@@ -4260,11 +2986,11 @@ def serve_command(args):
         )
         print(f"Spec-decode: mtp ({eligibility.value}){sidecar_note}")
 
-    # DFlash is normalized from ``--speculative-config`` near the top of
-    # serve_command. By the time we reach here, args.spec_decode is
-    # "none" for dflash callers. The speculative.dflash gate at the
-    # start of serve_command runs the actual eligibility +
-    # drafter-binding checks via the prod bridge.
+    # ``--spec-decode dflash`` is normalized to ``--enable-dflash`` near
+    # the top of serve_command (#318 redirect); by the time we reach
+    # here, args.spec_decode is "none" for dflash callers. The
+    # speculative.dflash gate at the start of serve_command runs the
+    # actual eligibility + drafter-binding checks via the prod bridge.
     if args.suffix_decoding:
         print(
             f"SuffixDecoding: enabled, max_draft={args.suffix_max_draft}, "
@@ -4328,18 +3054,54 @@ def serve_command(args):
         # a wildcard alias.
         _port_preflight_or_die(args.host, args.port, model=args.model)
 
-    # Alias-level unified-memory floor (codex #1069 round 3 [NIT #3]).
-    # Fires BEFORE _check_disk_space so the user sees the actionable
-    # "your Mac is too small for this Ultra-only alias" hint before we
-    # start a 166 GB download.
-    _check_alias_min_memory(args.model)
-
     # Check disk space before downloading model
     _check_disk_space(args.model, force=getattr(args, "force_disk_check", False))
 
     # Pre-flight memory check — warn (don't abort) if model + working set
     # would push unified memory past the kernel-panic threshold (issue #324).
     _check_memory_capacity(args.model)
+
+    # DFlash fork: when --enable-dflash is set, skip BatchedEngine entirely
+    # and run the dedicated DFlash server. The eligibility check above has
+    # already validated the alias, so by here we have a known-good profile.
+    if args.enable_dflash:
+        # DFlash IS a speculative-decode path. The --no-spec-decode escape
+        # hatch (SOP §10) must reject it here — otherwise the user thinks
+        # they've disabled spec-decode but DFlash silently proceeds via
+        # its dedicated server, never touching EngineCore / ModelConfig.
+        if getattr(args, "no_spec_decode", False):
+            print(
+                "error: DFlash and --no-spec-decode are mutually "
+                "exclusive — DFlash is a speculative-decode mode.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        from .model_aliases import resolve_profile
+        from .speculative.dflash.server import run_dflash_server
+
+        _alias_name = getattr(args, "_original_alias", None) or args.model
+        _profile = resolve_profile(_alias_name)
+        # The eligibility check at top of serve_command guarantees this
+        # passes — assert to be defensive against future refactors.
+        assert _profile is not None and _profile.supports_dflash, (
+            f"DFlash profile invariant violated for {_alias_name!r}"
+        )
+        # The vLLM-style surface uses ``model`` for the drafter override.
+        # Legacy ``--dflash-drafter-path`` is normalized into
+        # ``_speculative_config.model`` above, with a direct fallback here
+        # for defensive compatibility.
+        run_dflash_server(
+            main_model_repo=_profile.hf_path,
+            drafter_repo=_resolve_dflash_drafter_repo(args, _profile),
+            host=args.host,
+            port=args.port,
+            served_model_name=args.served_model_name or _alias_name,
+            default_max_tokens=effective_max_tokens,
+            cors_origins=cors_origins,
+            uvicorn_log_level=uvicorn_log_level,
+            no_thinking=args.no_thinking,
+        )
+        return
 
     # DDTree fork: same blast-radius boundary as DFlash. It is a
     # speculative-decode mode, but the MVP runs through the external
@@ -4351,8 +3113,14 @@ def serve_command(args):
         _profile = getattr(args, "_ddtree_profile", None)
         if _alias_name is None or _profile is None:
             _alias_name, _profile = _preflight_ddtree_or_exit(args)
+        assert _profile is not None and _profile.supports_ddtree, (
+            f"DDTree profile invariant violated for {_alias_name!r}"
+        )
+        assert _profile.ddtree_draft_model is not None
+        assert _profile.ddtree_speculative_tokens is not None
+        assert _profile.ddtree_tree_budget is not None
         run_ddtree_server(
-            main_model_repo=_profile.hf_path or args.model,
+            main_model_repo=_profile.hf_path,
             drafter_repo=getattr(args, "_ddtree_drafter_repo", None)
             or _profile.ddtree_draft_model,
             speculative_tokens=getattr(args, "_ddtree_speculative_tokens", None)
@@ -4404,11 +3172,6 @@ def serve_command(args):
             file=sys.stderr,
         )
         sys.exit(2)
-    server.configure_model_residency(
-        memory_limit_gb=getattr(args, "resident_memory_limit_gb", 0.0),
-        idle_ttl_seconds=getattr(args, "resident_model_idle_ttl", 0.0),
-        gpu_memory_utilization=args.gpu_memory_utilization,
-    )
     try:
         load_model(
             args.model,
@@ -4419,7 +3182,12 @@ def serve_command(args):
             force_mllm=args.mllm,
             force_text=args.no_mllm,
             gpu_memory_utilization=args.gpu_memory_utilization,
+            cloud_model=args.cloud_model,
+            cloud_threshold=args.cloud_threshold,
+            cloud_api_base=args.cloud_api_base,
+            cloud_api_key=args.cloud_api_key,
             served_model_name=args.served_model_name,
+            mtp=args.enable_mtp,
             force_hybrid=getattr(args, "force_hybrid", False),
             no_hybrid=getattr(args, "no_hybrid", False),
             force_spec_decode=getattr(args, "force_spec_decode", False),
@@ -4430,20 +3198,8 @@ def serve_command(args):
             no_openai_harmony_streaming=getattr(
                 args, "no_openai_harmony_streaming", False
             ),
-            enable_disk_stream=getattr(args, "disk_stream", False),
-            disk_stream_cache_gb=getattr(args, "disk_stream_cache_gb", 1.0),
         )
     except Exception as e:
-        # Opt-in telemetry (Phase 2.2 error wiring): record that a model
-        # failed to load on the ``serve`` path. The payload carries only a
-        # bucketed category + a traceback fingerprint (basename:func:lineno
-        # + exception class) — never the model name, message text, or path.
-        # ``emit.error`` is ``is_enabled()``-gated and ``@_safe``, so it is a
-        # no-op when telemetry is off and can never mask the user-facing
-        # error handled just below.
-        from vllm_mlx.telemetry import emit as _telemetry_emit
-
-        _telemetry_emit.error(category="model_load_failure", exc=e, phase="startup")
         # Show clean error instead of raw traceback. Catch the typed
         # HF exception class for the 404 case; fall back to substring
         # match for legacy callers (older huggingface_hub) and for
@@ -4496,17 +3252,14 @@ def serve_command(args):
         )
     from vllm_mlx._version_check import print_staleness_warning_if_any
 
-    # Long-lived launchd/daemon servers have no interactive prompt. Preserve
-    # the explicit opt-outs, but leave the passive notice in startup logs.
-    print_staleness_warning_if_any(allow_non_tty=True)
+    print_staleness_warning_if_any()
     print()
 
     # Stash the source of truth for the lifespan "Ready:" banner —
     # which shape depends on the bind mode:
     #
     #   * Default (host+port): stamp ``bind_host``/``bind_port`` so the
-    #     SSOT banner prints ``Ready: http://host:port`` (base URL; the
-    #     OpenAI/Anthropic paths are separate rows).
+    #     banner prints ``Ready: http://host:port/v1``.
     #   * ``--listen-fd``: stamp ``bind_listen_fd`` instead. The
     #     supervisor's ``getsockname`` is the only honest source for the
     #     address — stamping ``args.host``/``args.port`` here would lie
@@ -4567,7 +3320,7 @@ def _run_tier_submit_flow(args) -> int:
     # have rejected anything else — a programmatic Namespace (e.g.
     # someone constructing args directly) could bypass argparse, and
     # the previous ``assert`` would be stripped under ``python -O``
-    # (Codex PR #623 raised in review). Explicit guard returns 2 with a
+    # (Codex PR #623 review NIT-1). Explicit guard returns 2 with a
     # readable error rather than blowing up later inside the submit
     # flow with a less targeted traceback.
     if tier not in ("smoke", "speed", "harness", "all"):
@@ -4736,6 +3489,7 @@ def _run_submit_flow(
     from pathlib import Path
 
     from huggingface_hub.utils import RepositoryNotFoundError
+    from mlx_lm import load
 
     from .community_bench.hardware import collect as collect_hw
     from .community_bench.hardware import is_apple_silicon
@@ -4747,11 +3501,6 @@ def _run_submit_flow(
     from .engine_core import AsyncEngineCore, EngineConfig
     from .model_aliases import resolve_profile
     from .scheduler import SchedulerConfig
-
-    # Same gemma4 routing fix as ``bench_command``: ``mlx_lm.load`` cannot
-    # construct ``gemma4_unified``, so every ``gemma-4-12b-*`` alias failed
-    # to load here and could never be submitted to the community corpus.
-    from .utils.tokenizer import load_model_with_fallback as load
 
     if not is_apple_silicon():
         print(
@@ -4817,7 +3566,7 @@ def _run_submit_flow(
     # thread executor spins up. Without this, ``mlx_lm.load`` runs inside
     # the executor and delegates to ``huggingface_hub.snapshot_download``
     # directly, skipping the mirror entirely (bug: --submit diverged from
-    # ``serve``/``chat``/``pull`` which all prefetch via the
+    # ``serve``/``chat``/``pull``/``jlens`` which all prefetch via the
     # mirror first). Running this in the main thread — before the executor
     # is created — surfaces the mirror's per-file progress lines to the
     # contributor's terminal; if we deferred to the executor, the tqdm
@@ -4870,12 +3619,9 @@ def _run_submit_flow(
             # in mlx-vlm (the model classes are vision-aware even for the
             # text-only checkpoints), so a bare ``pip install rapid-mlx``
             # without the ``[vision]`` extras hits this every time. The
-            # ``gemma-4-*`` aliases are still in the served catalog (no
-            # recommendation surface points at them anymore, but
-            # ``rapid-mlx models`` lists them), so anyone picking one on
-            # a base install would otherwise see a raw traceback and
-            # conclude the model is broken — translate to an actionable
-            # hint. Placed BEFORE
+            # README still recommends ``gemma-4-*`` aliases so newcomers
+            # would otherwise see a raw traceback and conclude the model
+            # is broken — translate to an actionable hint. Placed BEFORE
             # the broader ``OSError`` clause so a future maintainer can't
             # accidentally make the broad branch swallow it (Codex PR
             # #600 round-1 BLOCKING).
@@ -4900,9 +3646,7 @@ def _run_submit_flow(
                     "  Or, if you only need text inference (smaller "
                     "footprint, ~16 MB vs ~450 MB):"
                 )
-                # Match the validated runtime used by the vision extra and
-                # packaged app so every recovery path installs the same lane.
-                print("    pip install --no-deps 'mlx-vlm==0.6.16'")
+                print("    pip install --no-deps 'mlx-vlm>=0.6.1'")
                 print()
             else:
                 print(f"  Error loading model: {e}")
@@ -4916,40 +3660,17 @@ def _run_submit_flow(
         # Standardized config: B=1, no batching, prefix-cache off so the
         # numbers reflect cold prefill on each round (which is what the
         # tg/pp metrics are supposed to measure).
-        # The spec-decode arm is the ONE comparability knob --submit lets the
-        # caller move, because the whole point of the A/B is to measure it.
-        # Everything else stays locked.
-        _arm = getattr(args, "spec_decode", "none") or "none"
         scheduler_config = SchedulerConfig(
             max_num_seqs=1,
             max_concurrent_requests=1,
             prefill_batch_size=1,
             completion_batch_size=1,
             enable_prefix_cache=False,
-            spec_decode=_arm,
         )
         engine_config = EngineConfig(
             model_name=hf_path,
             scheduler_config=scheduler_config,
         )
-        _spec_payload = (
-            None
-            if _arm == "none"
-            else {
-                "method": _arm,
-                "num_speculative_tokens": getattr(scheduler_config, "mtp_max_k", None),
-            }
-        )
-        import re as _re
-
-        _run_group = getattr(args, "run_group", None) or None
-        if _run_group is not None and not _re.fullmatch(r"[0-9a-f]{12}", _run_group):
-            print(
-                "  Error: --run-group must be exactly 12 lowercase hex chars "
-                f"(got {_run_group!r}). Generate one with: "
-                "python3 -c 'import secrets;print(secrets.token_hex(6))'"
-            )
-            return 2
 
         print("  Collecting hardware fingerprint…")
         hardware, software = collect_hw()
@@ -5026,8 +3747,6 @@ def _run_submit_flow(
                     tier=tier,
                     smoke_result=smoke_result,
                     harness_result=harness_result,
-                    spec_decode=_spec_payload,
-                    run_group=_run_group,
                 )
                 rc = submit_interactive(payload, repo_root)
                 if rc != 0:
@@ -5086,21 +3805,15 @@ def bench_command(args):
     if getattr(args, "submit", False):
         sys.exit(_run_submit_flow(args))
 
-    # Use the SAME loader ``serve`` uses, not the bare ``mlx_lm.load``.
-    # ``mlx_lm`` has no ``gemma4_unified`` architecture (the model classes
-    # live in mlx-vlm), so a bare ``load`` raises "Model type
-    # gemma4_unified not supported" for EVERY ``gemma-4-12b-*`` alias and
-    # bench can never run them — even though ``serve`` runs them fine.
-    # ``load_model_with_fallback`` carries the gemma4 router (plus the
-    # vendored-arch and tokenizer-fallback routes) and calls
-    # ``validate_local_model_file`` internally.
+    from mlx_lm import load
+
+    from .api.utils import is_mllm_model as _bench_is_mllm_model
     from .engine_core import AsyncEngineCore, EngineConfig
-    from .pflash import resolve_pflash_config as _pflash_resolve_config
+    from .pflash import config_from_args as _pflash_config_from_args
+    from .pflash import resolve_pflash_mode_default as _pflash_resolve_default
     from .pflash import validate_model_support as _bench_pflash_validate
     from .request import SamplingParams
     from .scheduler import SchedulerConfig
-    from .utils.model_file_guard import validate_local_model_file
-    from .utils.tokenizer import load_model_with_fallback as load
 
     _check_disk_space(args.model, force=getattr(args, "force_disk_check", False))
     _check_memory_capacity(args.model)
@@ -5109,7 +3822,7 @@ def bench_command(args):
     # heavy bench boot. Without this, ``bench`` falls into ``mlx_lm.load``
     # → ``huggingface_hub.snapshot_download`` directly and skips the
     # mirror entirely, wasting the user's bandwidth and hitting HF rate
-    # limits (bug: bench diverged from ``serve``/``chat``/``pull``
+    # limits (bug: bench diverged from ``serve``/``chat``/``pull``/``jlens``
     # which all prefetch via the mirror first).
     # ``_ensure_model_downloaded`` is a no-op on local paths and on
     # fully-cached repos and swallows mirror errors gracefully (mlx_lm.load
@@ -5128,42 +3841,13 @@ def bench_command(args):
     # bench previously skipped this check, so ``rapid-mlx bench
     # --pflash always <mllm-alias>`` would admit a combo PFlash
     # explicitly rejects elsewhere).
-    # ``bench`` has no MLLM/continuous-batching lane: it ALWAYS loads the text
-    # model via ``mlx_lm.load`` and drives ``AsyncEngineCore`` with it (see
-    # ``run_benchmark`` below — there is no ``force_text``/``force_mllm`` engine
-    # surface here the way ``serve``'s ``BatchedEngine`` has). So the effective
-    # bench lane is text for EVERY model, hybrid or not — there is no MLLM lane
-    # here for which PFlash would be unavailable. PFlash defaulting AND
-    # validation therefore use ``is_mllm=False`` unconditionally: an ordinary
-    # (non-hybrid) VLM resolves to ``is_mllm=True`` on the serve path, but here
-    # that would wrongly reject PFlash options as if an MLLM lane were in use
-    # (#352 dogfood P1-②; codex NIT #1178). We still resolve the lane to surface
-    # the hybrid auto-downgrade for lane attribution, and to keep a future
-    # reader from "fixing" this by wiring an MLLM lane that would crash on the
-    # hybrid backbone (GatedDeltaNet vs BatchKVCache, GH #352).
-    from .api.utils import resolve_serving_lane as _bench_resolve_serving_lane
-
-    _, _bench_auto_text_fallback = _bench_resolve_serving_lane(
-        args.model,
-        force_mllm=getattr(args, "mllm", False),
-        force_text=getattr(args, "no_mllm", False),
-    )
-    if _bench_auto_text_fallback:
-        print(
-            f"Note: {args.model!r} is a hybrid VLM — benching on the text-only "
-            "mlx-lm lane, matching 'serve' auto-downgrade (#352)."
-        )
-    # Same shared wiring as serve: resolve mode + per-alias keep_ratio override
-    # and build the config, so bench measures the SAME effective PFlash config
-    # serve would run. is_multimodal=False — bench has no MLLM lane (see above).
+    args.pflash = _pflash_resolve_default(args, model_name=args.model)
     try:
-        bench_pflash_config = _pflash_resolve_config(
-            args, model_name=args.model, is_multimodal=False
-        )
+        bench_pflash_config = _pflash_config_from_args(args)
         _bench_pflash_validate(
             bench_pflash_config,
             model_name=args.model,
-            is_mllm=False,
+            is_mllm=getattr(args, "mllm", False) or _bench_is_mllm_model(args.model),
         )
     except ValueError as e:
         print(f"Error: {e}")
@@ -5172,38 +3856,8 @@ def bench_command(args):
     async def run_benchmark():
         print(f"Loading model: {args.model}")
         try:
-            validate_local_model_file(args.model)
-            # Load the weights ON the mlx-step worker (created + explained at
-            # the ``bench_command`` call site below) and reuse that worker for
-            # AsyncEngineCore. mlx-lm 0.31.3+ binds the generation stream to
-            # whichever thread first touches MLX, so loading here — on the same
-            # worker the engine later steps on — is what keeps the first batch
-            # step from raising "There is no Stream(gpu, N) in current thread"
-            # (which aborts every request and reports 0.00 tok/s).
-            if getattr(args, "disk_stream", False):
-                # --disk-stream: load lazily (routed-expert weights never
-                # materialized) and patch the MoE blocks to stream them
-                # from disk before this model reaches AsyncEngineCore.
-                # Same helper `serve` uses, run on this SAME mlx-step
-                # worker (#170 stream-ownership requirement above).
-                from .engine.batched import _load_lazy_and_install_disk_stream
-
-                model, tokenizer = model_load_executor.submit(
-                    _load_lazy_and_install_disk_stream,
-                    args.model,
-                    {},
-                    getattr(args, "disk_stream_cache_gb", 1.0),
-                ).result()
-            else:
-                model, tokenizer = model_load_executor.submit(load, args.model).result()
+            model, tokenizer = load(args.model)
         except Exception as e:
-            # Opt-in telemetry (Phase 2.2 error wiring): mirror the
-            # ``serve`` path — record a bucketed model-load failure
-            # (category + traceback fingerprint only, no model name /
-            # message / path). ``is_enabled()``-gated + ``@_safe``.
-            from vllm_mlx.telemetry import emit as _telemetry_emit
-
-            _telemetry_emit.error(category="model_load_failure", exc=e, phase="startup")
             # Mirror serve_command: clean message instead of a 30-line
             # traceback when the user typed a missing repo / bad alias.
             from huggingface_hub.utils import RepositoryNotFoundError
@@ -5236,16 +3890,6 @@ def bench_command(args):
             use_memory_aware_cache=not args.no_memory_aware_cache,
             cache_memory_mb=args.cache_memory_mb,
             cache_memory_percent=args.cache_memory_percent,
-            # #1103: bounded trim-free hybrid (recurrent-state) prefix reuse.
-            # Bench path mirrors serve so hybrid-reuse effects show up in
-            # `rapid-mlx bench` numbers too.
-            hybrid_cache_entries=getattr(args, "hybrid_cache_entries", 0),
-            # The prompt-deterministic response cache is a chat/serve
-            # feature — its lookup/store logic lives only in the chat route
-            # (vllm_mlx/routes/chat.py), and `rapid-mlx bench` never consumes
-            # it. The bench parser therefore does not expose
-            # --response-cache-entries; SchedulerConfig defaults it to 0 here,
-            # leaving bench semantics unchanged.
             # Paged cache options
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
@@ -5256,10 +3900,11 @@ def bench_command(args):
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
             # R15-P1 (task #296): disk-backed KV checkpointing. Bench
-            # path mirrors serve (0 = off by default, #1853) so a
-            # regression in the boundary trigger surfaces in
-            # `rapid-mlx bench` numbers too.
-            kv_disk_checkpoint_interval=getattr(args, "kv_disk_checkpoint_interval", 0),
+            # path mirrors serve so a regression in the boundary trigger
+            # surfaces in `rapid-mlx bench` numbers too.
+            kv_disk_checkpoint_interval=getattr(
+                args, "kv_disk_checkpoint_interval", 256
+            ),
             # PFlash long-prompt compression (#287)
             pflash_config=bench_pflash_config,
         )
@@ -5313,12 +3958,7 @@ def bench_command(args):
         total_prompt_tokens = 0
         total_completion_tokens = 0
 
-        # Reuse the model-load worker as the engine's mlx-step thread so
-        # weights + forward passes + cache state stay on one owning thread
-        # (see the load-executor comment above).
-        async with AsyncEngineCore(
-            model, tokenizer, engine_config, executor=model_load_executor
-        ) as engine:
+        async with AsyncEngineCore(model, tokenizer, engine_config) as engine:
             await asyncio.sleep(0.1)  # Warm up
 
             start_time = time.perf_counter()
@@ -5358,50 +3998,7 @@ def bench_command(args):
         print(f"  Tokens/second: {total_completion_tokens / total_time:.2f}")
         print(f"  Throughput: {total_tokens / total_time:.2f} tok/s")
 
-    import concurrent.futures
-
-    from .engine_core import _init_mlx_step_thread
-
-    # Create the single mlx-step worker BEFORE loading weights and reuse it
-    # for AsyncEngineCore so weights + forward passes + cache state all live
-    # on one owning thread (#170). mlx-lm 0.31.3+ binds the module-level
-    # generation stream to whichever thread first touches MLX; loading on the
-    # main thread and generating on the engine worker raises "There is no
-    # Stream(gpu, N) in current thread" on the first batch step → every
-    # request aborts → the run silently reports 0.00 tok/s (the app's "Speed
-    # on this Mac" card then shows a confident, wrong zero). Mirrors the
-    # proven ``bench --submit`` path (``_run``) and ``BatchedEngine._start_llm``
-    # — the exact reason ``serve``/``chat`` work and this freeform path did not.
-    model_load_executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix="mlx-step",
-        initializer=_init_mlx_step_thread,
-    )
-    interrupted = False
-    try:
-        asyncio.run(run_benchmark())
-    except KeyboardInterrupt:
-        interrupted = True
-        raise
-    finally:
-        # Caller-supplied executors are NOT owned or shut down by
-        # AsyncEngineCore.stop(), so reap the worker here on every exit path.
-        # On a normal or load-error (sys.exit) exit the worker is idle — the
-        # engine closed its BatchGenerator on it during stop(), or the load
-        # future already finished — so this join returns immediately.
-        # ``cancel_futures`` drops any still-queued (never-started) work.
-        #
-        # Ctrl-C landing INSIDE the native ``load`` (an uninterruptible mlx
-        # weight read) is a known, inherent limitation, NOT a regression from
-        # this change: pre-PR this path loaded on the MAIN thread, equally
-        # uninterruptible, so exit already blocked until the read finished.
-        # ``wait=False`` here just avoids re-blocking in this ``finally``;
-        # concurrent.futures' atexit hook still joins the non-daemon worker at
-        # interpreter shutdown, so the wall-clock is unchanged either way and
-        # no GPU work ever escapes the process. Truly aborting a native load
-        # mid-read would need ``os._exit`` and risk leaving Metal state dirty
-        # — not worth it for a benchmark command.
-        model_load_executor.shutdown(wait=not interrupted, cancel_futures=True)
+    asyncio.run(run_benchmark())
 
 
 def _format_bytes(n: int) -> str:
@@ -5430,103 +4027,27 @@ def _format_bytes(n: int) -> str:
 
 
 def _dir_size_bytes(path: str) -> int:
-    """Bytes of the distinct files under ``path``, each counted once.
+    """Recursive on-disk size of ``path`` (follows blob symlinks).
 
-    The HF cache keeps one copy of every model file under
-    ``blobs/<sha>`` and references it from ``snapshots/<rev>/<file>``.
-    Counting both sides tallies the same bytes twice, plus once more for
-    every extra cached revision, so a 7.9 GB model was reported as
-    15.9 GiB in ``ls --cached`` and in the macOS app's Settings → Models
-    panel. That number is what tells a user how much disk deleting the
-    model would free, so being 2x off is a lie — and it disagreed with
-    ``rapid-mlx rm``, which gets its figure from
-    ``huggingface_hub``'s own (correct) ``size_on_disk``.
-
-    Two rules keep the count honest:
-
-    * Only regular files are measured. Symlinks found during the walk
-      are skipped, not followed: their bytes live somewhere else and a
-      snapshot link is just a second name for a blob already counted.
-      A dangling link therefore costs nothing and raises nothing, and
-      a link cannot be descended into, so the walk neither loops nor
-      leaves the tree it was pointed at.
-    * Files are deduped by ``(st_dev, st_ino)``, so a hardlinked layout
-      (``cp -al`` cache clones, restored CI caches, older hub versions)
-      and a blob shared by several revisions each contribute once. When
-      the hub genuinely *copies* a blob into a snapshot instead of
-      linking it, the two copies have distinct inodes and are counted
-      twice — which is right, because they really do occupy twice the
-      disk.
-
-    Deduping by identity rather than by the ``blobs``/``snapshots``
-    directory names is deliberate: the name-based shortcut breaks on
-    hardlinked caches and on directories holding several revisions.
-    ``HFCacheByteMonitor.directoryByteCount`` in the macOS app takes the
-    same approach via ``fileResourceIdentifierKey``, so the two agree on
-    the same directory up to allocation granularity: this sums logical
-    ``st_size``, the Swift side sums allocated blocks, so every file
-    differs a little through block rounding and sparse or compressed
-    files can differ a lot (model weights are neither). ``st_size`` is
-    also the quantity ``huggingface_hub`` reports as
-    ``CachedRepoInfo.size_on_disk``, which is what ``rapid-mlx rm``
-    already prints — matching it makes the two surfaces agree.
-
-    ``path`` itself is resolved through symlinks before the walk starts:
-    it names the directory the caller wants measured, so a relocated
-    cache entry reports its real contents rather than 0, which would be
-    a fresh lie in the same column. Callers pass a
-    ``models--<org>--<repo>`` cache root (or any plain directory of real
-    files), never a bare ``snapshots/<rev>`` — that subtree owns no
-    bytes of its own, and sizing one is ``_snapshot_size_bytes``' job.
-
-    Missing or unreadable paths report 0 rather than raising: this feeds
-    a listing, not a decision. For the same reason the walk is not
-    hardened against another process swapping a subdirectory for a
-    symlink between the moment it is queued and the moment it is
-    scanned. Racing that window inflates a number in a table the user
-    asked for about their own cache; anyone able to run it can rewrite
-    the weights outright. Descriptor-relative traversal
-    (``O_DIRECTORY | O_NOFOLLOW`` plus ``dir_fd``) would close it and is
-    not worth the fd bookkeeping here.
+    HF cache stores model weights as ``blobs/<sha>`` files referenced via
+    symlinks under ``snapshots/<rev>/<file>``. ``os.scandir`` recurses
+    through both — we follow links so a snapshot's reported size matches
+    the user's mental model of "how much disk this model uses".
     """
     total = 0
-    seen: set[tuple[int, int]] = set()
-    # Resolve once, up front, so the walk starts inside a real directory
-    # and every subdirectory below is reached without crossing a link.
     try:
-        root = os.path.realpath(path)
-    except OSError:
-        return 0
-    stack = [root]
-    while stack:
-        current = stack.pop()
-        try:
-            with os.scandir(current) as it:
-                entries = list(it)
-        except OSError:
-            # Vanished mid-walk, or a directory we may not read.
-            continue
-        for entry in entries:
+        for entry in os.scandir(path):
             try:
                 if entry.is_dir(follow_symlinks=False):
-                    stack.append(entry.path)
-                    continue
-                if not entry.is_file(follow_symlinks=False):
-                    # Symlink, fifo, socket, device — nothing this
-                    # directory owns on disk.
-                    continue
-                st = entry.stat(follow_symlinks=False)
+                    total += _dir_size_bytes(entry.path)
+                else:
+                    # follow_symlinks=True so blob symlinks count their
+                    # underlying file size, matching ``du -sL``.
+                    total += entry.stat(follow_symlinks=True).st_size
             except OSError:
                 continue
-            # A few network/FUSE mounts report ``st_ino == 0`` for every
-            # file. Deduping on that would collapse the whole tree into
-            # a single file, so fall back to counting each entry.
-            if st.st_ino:
-                key = (st.st_dev, st.st_ino)
-                if key in seen:
-                    continue
-                seen.add(key)
-            total += st.st_size
+    except OSError:
+        return total
     return total
 
 
@@ -5563,264 +4084,6 @@ def _scan_hf_cache_models() -> list[tuple[str, int, float]]:
     return out
 
 
-def _external_model_roots() -> list[str]:
-    """Directories to scan for models another MLX runtime downloaded.
-
-    Read from ``RAPID_MLX_EXTRA_MODEL_ROOTS`` (``os.pathsep``-separated,
-    same convention as ``PATH``). Empty by default: scanning a user's
-    disk uninvited is not ours to decide, and a wrong guess costs a slow
-    recursive walk on every ``ls``.
-
-    The desktop app populates this from the folder the user picked in
-    Settings, which is why the env var is the interface rather than a
-    hardcoded list of every MLX tool's default location.
-    """
-    raw = os.environ.get("RAPID_MLX_EXTRA_MODEL_ROOTS", "").strip()
-    if not raw:
-        return []
-    from vllm_mlx.model_aliases import _external_model_root_values
-
-    roots: list[str] = []
-    for part in _external_model_root_values(raw):
-        path = os.path.expanduser(part.strip())
-        if path and os.path.isdir(path):
-            roots.append(os.path.realpath(path))
-    return roots
-
-
-def _scan_external_model_dirs(
-    roots: list[str] | None = None,
-) -> list[tuple[str, int, float]]:
-    """Find MLX-servable models sitting outside the HF hub cache.
-
-    Other MLX runtimes write ``<root>/<publisher>/<repo>/`` rather than
-    the hub's ``models--<org>--<name>/snapshots/<sha>/``, so
-    :func:`_scan_hf_cache_models` cannot see them and a user who already
-    has the weights is asked to download them again — on a machine where
-    disk is usually the scarce resource.
-
-    Returns the same ``(repo, size_bytes, mtime)`` triples as the hub
-    scanner so both feed one renderer.
-
-    What counts as a model is decided by
-    :func:`vllm_mlx._download_gate._snapshot_is_complete`, the same check
-    ``serve`` uses. That matters for two reasons: it mirrors mlx-lm's
-    actual loader glob (``model*.safetensors``), so we never advertise a
-    directory the loader would then refuse; and it excludes GGUF
-    structurally rather than by blacklist — mlx-lm can *export* GGUF but
-    has no load path for it, so listing one would offer a model that
-    fails on start.
-
-    Depth is capped at two levels (``<root>/<a>/<b>``). Every MLX tool
-    lays models out as publisher/repo, and an uncapped walk over a
-    directory the user pointed at could descend into an entire home
-    folder.
-    """
-    from vllm_mlx._download_gate import _snapshot_is_complete
-    from vllm_mlx.model_aliases import (
-        _external_model_identifier_parts,
-        _external_model_tree_is_contained,
-    )
-
-    if roots is None:
-        roots = _external_model_roots()
-
-    out: list[tuple[str, int, float]] = []
-    seen_paths: set[str] = set()
-    seen_repos: set[str] = set()
-
-    def _complete(directory: str) -> bool:
-        try:
-            return _snapshot_is_complete(directory)
-        except OSError:
-            return False
-
-    def _looks_like_model_root(directory: str) -> bool:
-        try:
-            with os.scandir(directory) as entries:
-                return any(
-                    entry.name == "model.safetensors.index.json"
-                    or (
-                        entry.name.startswith("model")
-                        and entry.name.endswith(".safetensors")
-                    )
-                    for entry in entries
-                )
-        except OSError:
-            return False
-
-    canonical_roots = [os.path.realpath(root) for root in roots]
-
-    def _record(directory: str, repo: str, canonical_root: str) -> None:
-        real = os.path.realpath(directory)
-        try:
-            if os.path.commonpath((canonical_root, real)) != canonical_root:
-                return
-        except (OSError, ValueError):
-            return
-        # Ordered root precedence: the first configured occurrence of a repo
-        # wins.  Dedup by both identity and display/launch identifier so two
-        # separate roots cannot print duplicate rows or double-count bytes.
-        if real in seen_paths or repo in seen_repos:
-            return
-        try:
-            # The loader probe is root-only and bounded. Run it before the
-            # recursive symlink audit/size walk so a broad selected folder
-            # does not turn every ordinary directory into a deep traversal.
-            if not _looks_like_model_root(real):
-                return
-            if not _external_model_tree_is_contained(real, canonical_roots):
-                return
-            if not _complete(real):
-                return
-            mtime = os.path.getmtime(real)
-        except OSError:
-            return
-        try:
-            size = _external_tree_size_bytes(real)
-        except OSError:
-            # External trees are owned by another process and may disappear,
-            # lose permission, or contain a broken link while we scan. One
-            # racy entry must not take down the entire ``rapid-mlx ls`` view.
-            return
-        seen_paths.add(real)
-        seen_repos.add(repo)
-        out.append((repo, size, mtime))
-
-    for root in roots:
-        canonical_root = os.path.realpath(root)
-
-        def _contained(path: str, *, _root: str = canonical_root) -> bool:
-            try:
-                return os.path.commonpath((_root, os.path.realpath(path))) == _root
-            except (OSError, ValueError):
-                return False
-
-        try:
-            first_level = sorted(os.listdir(root))
-        except OSError:
-            continue
-        for publisher in first_level:
-            if _external_model_identifier_parts(publisher) is None:
-                continue
-            # Skip the hub layout: those belong to the hub scanner, and
-            # listing them twice would double-count disk usage.
-            if publisher.startswith(("models--", "datasets--", "spaces--")):
-                continue
-            pub_dir = os.path.join(root, publisher)
-            if not os.path.isdir(pub_dir):
-                continue
-
-            # A model may sit directly at <root>/<name>/ as well as at
-            # <root>/<publisher>/<name>/ — accept both.
-            if _contained(pub_dir):
-                _record(pub_dir, publisher, canonical_root)
-                if publisher in seen_repos:
-                    continue
-
-            try:
-                second_level = sorted(os.listdir(pub_dir))
-            except OSError:
-                continue
-            for name in second_level:
-                repo = f"{publisher}/{name}"
-                if _external_model_identifier_parts(repo) is None:
-                    continue
-                model_dir = os.path.join(pub_dir, name)
-                if os.path.isdir(model_dir) and _contained(model_dir):
-                    _record(model_dir, repo, canonical_root)
-
-    return out
-
-
-def _cache_runnability(repo: str) -> bool | None:
-    """Tri-state cache runnability: ``True`` runnable, ``False`` definitively
-    not, ``None`` = inconclusive (a probe fault masked a real verdict).
-
-    This is the probe-level core. A probe fault — cache-dir permission,
-    malformed index/header — does NOT tell us whether the checkpoint is
-    cached (it may well be). Callers must decide what ``None`` means:
-
-      * Skip-download / inventory callers (``_ensure_model_downloaded``,
-        ``models --cached``) treat ``None`` as **not runnable** (via
-        :func:`_cache_entry_is_runnable`, which collapses ``None`` to
-        ``False``) — they must never skip a download or show a checkmark on
-        a checkpoint whose cachedness could not be verified.
-      * Offline-refusal callers treat ``None`` as **do not refuse** (they
-        compare ``is False`` directly) — offline refuses only when
-        uncachedness is actually established, never on a probe fault.
-
-    Unexpected exceptions are genuine bugs and still propagate.
-    """
-    try:
-        from vllm_mlx._download_gate import (
-            _snapshot_is_complete_audio_model,
-            _snapshot_is_complete_mflux_model,
-            _snapshot_is_complete_split_model,
-            _snapshot_is_complete_wan_model,
-            is_repo_cached,
-        )
-        from vllm_mlx.audio.registry import resolve_audio_alias
-        from vllm_mlx.model_metadata import resolve_unreferenced_cached_snapshot
-        from vllm_mlx.video.wan import WAN_REVISIONS
-
-        audio_entry = resolve_audio_alias(repo)
-        if audio_entry is not None and audio_entry.family in ("whisper", "kokoro"):
-            # Audio repos don't share the text ``model*.safetensors`` layout;
-            # judge whisper/kokoro by their family-appropriate VERIFIED weight
-            # file (Whisper ``weights.npz``/``weights.safetensors``, Kokoro
-            # ``kokoro-v1_0.safetensors``) just like a text cache. Other audio
-            # families fall through to the generic cache probes below — their
-            # layout is not pinned here, so never claim them non-runnable.
-            return _snapshot_is_complete_audio_model(repo, audio_entry.family)
-        if repo in WAN_REVISIONS:
-            # Wan snapshots are authoritative: they are pinned to an exact
-            # commit with a strict verified-filename contract (config +
-            # t5_encoder + vae + transformer), so the generic text probe (which
-            # matches a lone ``model.safetensors``) must NOT mark an incomplete
-            # Wan snapshot runnable. Complete -> runnable; incomplete -> not.
-            return _snapshot_is_complete_wan_model(repo)
-        return (
-            is_repo_cached(repo)
-            or _snapshot_is_complete_split_model(repo)
-            or _snapshot_is_complete_mflux_model(repo)
-            or _snapshot_is_complete_wan_model(repo)
-            or resolve_unreferenced_cached_snapshot(repo) is not None
-        )
-    except (OSError, KeyError, ValueError) as exc:
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "Could not probe cachedness of %r: %s", repo, exc
-        )
-        return None
-
-
-def _cache_entry_is_runnable(repo: str) -> bool:
-    """Whether a cache directory contains a complete runnable snapshot.
-
-    A Hugging Face repo directory appears as soon as metadata starts
-    downloading.  Treating directory presence as "cached" made interrupted
-    downloads (config/tokenizer only, no weights) look ready in ``ls`` and in
-    the desktop model picker. Reuse the serve download gate's authoritative
-    completeness checks for both text and component-split video layouts.
-
-    ``resolve_unreferenced_cached_snapshot`` closes the #2351 gap: a complete,
-    unambiguous SINGLE snapshot with no ``refs/main`` (a commit-pinned
-    ``snapshot_download`` / manual pull) is loadable by the routing & loader
-    contract — the inventory must report it available, not ``(incomplete)``,
-    so ``models --cached`` and the serve gate agree with the loader. Multiple
-    snapshots are ambiguous and stay unresolved there.
-
-    A probe fault (see :func:`_cache_runnability`) collapses to ``False``
-    here: skip-download and inventory callers must not treat a checkpoint
-    whose cachedness could not be established as runnable. The offline-refusal
-    callers use the tri-state core directly (``is False``) so that a probe
-    fault does not make them refuse.
-    """
-    return _cache_runnability(repo) is True
-
-
 def _print_cached_models() -> None:
     """Render the ``--cached`` view: locally-downloaded HF cache entries
     cross-referenced against the alias registry.
@@ -5835,18 +4098,8 @@ def _print_cached_models() -> None:
     from vllm_mlx.model_aliases import list_profiles
 
     rows = _scan_hf_cache_models()
-    external_rows = _scan_external_model_dirs()
-    # A RUNNABLE hub copy wins because it is managed by Rapid. Keep an
-    # incomplete same-named hub row alongside the external copy: it is a real,
-    # independently removable cache entry, and hiding it makes `rm <repo>` look
-    # like it targets the read-only external row.
-    runnable_hub_repos = {repo for repo, _, _ in rows if _cache_entry_is_runnable(repo)}
-    external_rows = [r for r in external_rows if r[0] not in runnable_hub_repos]
-    tagged_rows = [(*row, False) for row in rows] + [
-        (*row, True) for row in external_rows
-    ]
     print()
-    if not tagged_rows:
+    if not rows:
         print(
             "  No models cached yet. Run 'rapid-mlx pull <alias>' or "
             "'rapid-mlx chat <alias>' to download one."
@@ -5864,17 +4117,13 @@ def _print_cached_models() -> None:
     cols = (
         ("Alias", 22),
         ("HF repo", 50),
-        # Width is presentation only. Rows use an explicit two-space
-        # delimiter below because the desktop parser splits on 2+ spaces;
-        # padding alone cannot guarantee that invariant for a value that
-        # exactly fills (or exceeds) its field.
-        ("Size", 10),
+        ("Size", 9),
         ("Modified", 12),
     )
-    width = sum(w for _, w in cols) + 2 * (len(cols) - 1)
+    width = sum(w for _, w in cols) + len(cols) - 1
     sep = "  " + "─" * width
-    header = "  " + "  ".join(f"{name:<{w}}" for name, w in cols)
-    print(f"  Cached models ({len(tagged_rows)} on disk)")
+    header = "  " + " ".join(f"{name:<{w}}" for name, w in cols)
+    print(f"  Cached models ({len(rows)} on disk)")
     print(sep)
     print(header)
     print(sep)
@@ -5883,29 +4132,9 @@ def _print_cached_models() -> None:
     total_bytes = 0
     # Sort by size descending so the biggest-disk-hog row is first — the
     # most useful ordering for "what do I rm to free space?".
-    for repo, size, mtime, is_external_row in sorted(
-        tagged_rows, key=lambda row: -row[1]
-    ):
+    for repo, size, mtime in sorted(rows, key=lambda r: -r[1]):
         total_bytes += size
         alias = hf_to_alias.get(repo, "(unmapped)")
-        # Models found outside the hub cache are listed but never labelled
-        # with an alias, and the desktop parser drops every parenthesized
-        # alias except ``(unmapped)``. That is deliberate: ``rm`` and the
-        # app's delete path both rebuild a target as
-        # ``<hub-root>/models--<repo>``, which is not where these live.
-        # Advertising one as deletable would either miss (nothing at that
-        # path) or, worse, delete an unrelated hub entry that happens to
-        # share the name. Read-only is the honest state — we did not
-        # download them and we cannot manage them.
-        if is_external_row:
-            alias = "(external)"
-        # Keep partial directories visible for disk cleanup, but never label
-        # one as downloaded/runnable. This includes unmapped audio repos: the
-        # desktop joins those to its audio registry by HF id, so leaving a
-        # partial row as `(unmapped)` gives it a green checkmark and Start.
-        # The desktop deliberately rejects `(incomplete)` status rows.
-        elif not _cache_entry_is_runnable(repo):
-            alias = "(incomplete)"
         # Render modified as a human delta: "2 days ago" beats raw epoch.
         if mtime <= 0:
             mod = "?"
@@ -5919,280 +4148,13 @@ def _print_cached_models() -> None:
                 mod = f"{delta // 86400}d ago"
         # Truncate over-long HF paths so the row doesn't wrap on a
         # narrow terminal; the alias column carries the canonical name.
-        # External identifiers are machine-consumed by the desktop and must
-        # remain byte-for-byte launchable. Hub rows may still be truncated for
-        # interactive display because their registered alias is the canonical
-        # launch identity; external rows have no independent alias channel.
-        repo_disp = repo if is_external_row or len(repo) <= 50 else (repo[:47] + "...")
-        print(f"  {alias:<22}  {repo_disp:<50}  {_format_bytes(size):<10}  {mod:<12}")
+        repo_disp = repo if len(repo) <= 50 else (repo[:47] + "...")
+        print(f"  {alias:<22} {repo_disp:<50} {_format_bytes(size):<9} {mod:<12}")
     print(sep)
     print(f"  Total: {_format_bytes(total_bytes)}")
-    if external_rows:
-        print(
-            "  Note: total is logical model size; shared external weights may repeat."
-        )
     print()
-    if external_rows:
-        print("  Tip: `rapid-mlx rm` only removes Rapid-managed cache entries.")
-        print("       Remove external models in the app that downloaded them.")
-    else:
-        print("  Tip: `rapid-mlx rm <hf-repo>` to free disk space")
+    print("  Tip: `rapid-mlx rm <hf-repo>` to free disk space")
     print()
-
-
-def recipe_command(args) -> None:
-    """Recommend exactly two curated models for this Mac's RAM tier.
-
-    Recommendations stay anchored to the shared, curated RAM-tier SSOT. Disk
-    pressure is presentation state, not a reason to silently substitute a
-    lower-quality model: an unavailable pick remains visible, but we do not
-    print a copy-paste ``serve`` command that is known to fail mid-download.
-    """
-    import json
-    import math
-
-    from vllm_mlx.model_aliases import resolve_profile
-    from vllm_mlx.model_sizes import size_bytes
-    from vllm_mlx.recommendations import physical_ram_gb, recommendation_payload
-
-    ram_gb = (
-        float(args.max_ram)
-        if getattr(args, "max_ram", None) is not None
-        else physical_ram_gb()
-    )
-    if ram_gb <= 0:
-        raise SystemExit("Could not detect physical RAM. Pass --max-ram GB explicitly.")
-    payload = recommendation_payload(ram_gb)
-    cached_repos = {repo.casefold() for repo, _, _ in _scan_hf_cache_models()}
-    free_disk_gb = _recipe_free_disk_gb()
-    # Free space rounds DOWN while required space below rounds UP for display.
-    # Fit itself still compares the unrounded measurements: presentation must
-    # not reject a download that really has enough room. Two directed decimal
-    # places ensure a failing boundary cannot render as equal values.
-    payload["free_disk_gb"] = (
-        None if free_disk_gb is None else math.floor(free_disk_gb * 100) / 100
-    )
-    for pick in payload["picks"]:
-        try:
-            profile = resolve_profile(pick["alias"])
-            hf_path = profile.hf_path if profile is not None else None
-        except ValueError:
-            hf_path = None
-        pick["hf_path"] = hf_path
-        pick["cached"] = bool(
-            hf_path
-            and hf_path.casefold() in cached_repos
-            and _cache_entry_is_runnable(hf_path)
-        )
-        # ``footprint_gb`` is measured 8K peak RAM, not bytes on disk. Use the
-        # checked-in download-size manifest that powers ``rapid-mlx models``;
-        # this keeps recipe offline and prevents a 20 GB RAM peak from being
-        # misreported as a 20 GB download. Match the live download gate's 10%
-        # headroom for xet temporary files and the final cache move.
-        download_bytes = 0 if pick["cached"] else size_bytes(hf_path or "")
-        required_disk_gb = (
-            None if download_bytes is None else (download_bytes * 1.1) / float(1 << 30)
-        )
-        pick["download_size_gb"] = (
-            None
-            if download_bytes is None
-            else round(download_bytes / float(1 << 30), 1)
-        )
-        pick["required_disk_gb"] = (
-            None
-            if required_disk_gb is None
-            else math.ceil(required_disk_gb * 100) / 100
-        )
-        pick["disk_fit"] = (
-            None
-            if free_disk_gb is None or required_disk_gb is None
-            else free_disk_gb >= required_disk_gb
-        )
-
-    if getattr(args, "json", False):
-        print(json.dumps(payload, indent=2, sort_keys=True))
-        return
-
-    print(
-        f"Recommended for this {payload['physical_ram_gb']:.1f} GB Mac "
-        f"({payload['tier_floor_gb']} GB tier)"
-    )
-    labels = {"smart": "Smart", "fast": "Fast"}
-    for index, pick in enumerate(payload["picks"], start=1):
-        # Label the footprint as RAM: it is measured 8K peak memory, a
-        # different axis from the on-disk ``required_disk_gb`` shown in the
-        # won't-fit line below. Without the label the two GB numbers read as
-        # contradictory (e.g. "20.0 GB" then "needs ~16.72 GB").
-        stats = [f"{pick['footprint_gb']:.1f} GB RAM"]
-        if pick.get("caveat"):
-            stats.append(pick["caveat"])
-        else:
-            stats.append(f"{pick['capability_pct']}% capability")
-        if pick.get("tokens_per_sec") is not None:
-            stats.append(f"~{round(pick['tokens_per_sec'])} tok/s")
-        cache_badge = " · cached" if pick["cached"] else ""
-        print(f"\n{index}. {labels[pick['role']]} — {pick['alias']}{cache_badge}")
-        print(f"   {' · '.join(stats)}")
-        if pick["disk_fit"] is False:
-            print(
-                f"   ⚠ won't fit: needs ~{pick['required_disk_gb']:.2f} GB "
-                f"including download headroom; {payload['free_disk_gb']:.2f} GB free"
-            )
-            print("   Free disk space or set HF_HOME/HF_HUB_CACHE to another drive.")
-            continue
-        command = f"rapid-mlx serve {pick['alias']}"
-        if pick["launch_flags"]:
-            command += " " + " ".join(pick["launch_flags"])
-        print(f"   {command}")
-
-
-def _recipe_free_disk_gb() -> float | None:
-    """Return free GiB on the filesystem that receives HF downloads.
-
-    ``HF_HUB_CACHE`` can name a directory that does not exist yet, including
-    one on an external volume. Walk to its nearest existing ancestor before
-    probing, matching the real download gate rather than assuming ``$HOME``.
-    Unknown disk state is deliberately ``None``: recipe then preserves its
-    historical output instead of claiming that a model fits.
-    """
-    import shutil
-    from pathlib import Path
-
-    try:
-        from huggingface_hub.constants import HF_HUB_CACHE
-    except Exception:
-        HF_HUB_CACHE = str(Path.home() / ".cache" / "huggingface" / "hub")
-    try:
-        probe = Path(HF_HUB_CACHE).expanduser().absolute()
-        while not probe.exists() and probe.parent != probe:
-            probe = probe.parent
-        if not probe.exists():
-            return None
-        return shutil.disk_usage(probe).free / float(1 << 30)
-    except (OSError, TypeError, ValueError):
-        return None
-
-
-def _cached_models_json_payload() -> dict:
-    """Structured form of the ``models --cached`` view — the same rows the
-    text table renders, with stable keys instead of fixed-width columns.
-
-    Sizes are raw bytes; ``state`` is one of ``ok`` / ``unmapped`` /
-    ``incomplete`` / ``external`` mirroring the alias column's parenthesized
-    tags; ``alias`` is ``None`` for any non-``ok`` row (those are not
-    launchable by alias). Sorted biggest-first, like the table.
-    """
-    import time as _time
-
-    from vllm_mlx.model_aliases import list_profiles
-
-    rows = _scan_hf_cache_models()
-    external_rows = _scan_external_model_dirs()
-    runnable_hub_repos = {repo for repo, _, _ in rows if _cache_entry_is_runnable(repo)}
-    external_rows = [r for r in external_rows if r[0] not in runnable_hub_repos]
-
-    profiles = list_profiles()
-    hf_to_alias: dict[str, str] = {}
-    for alias, p in profiles.items():
-        hf_to_alias.setdefault(p.hf_path, alias)
-
-    now = _time.time()
-    tagged = [(*row, False) for row in rows] + [(*row, True) for row in external_rows]
-    models = []
-    total_bytes = 0
-    for repo, size, mtime, is_external in tagged:
-        total_bytes += size
-        if is_external:
-            alias, state = None, "external"
-        elif not _cache_entry_is_runnable(repo):
-            alias, state = None, "incomplete"
-        else:
-            mapped = hf_to_alias.get(repo)
-            alias, state = (mapped, "ok") if mapped is not None else (None, "unmapped")
-        models.append(
-            {
-                "alias": alias,
-                "repo": repo,
-                "size_bytes": int(size),
-                "modified_epoch": int(mtime) if mtime and mtime > 0 else None,
-                "age_seconds": int(max(0, now - mtime))
-                if mtime and mtime > 0
-                else None,
-                "state": state,
-                "external": is_external,
-            }
-        )
-    models.sort(key=lambda m: -m["size_bytes"])
-    return {"cached": models, "count": len(models), "total_bytes": int(total_bytes)}
-
-
-def _available_models_json_payload() -> dict:
-    """Structured form of the default ``models`` view: every alias with the
-    profile facts the table shows, split by modality (text / audio / video /
-    image) exactly as the text sections are. Sizes are download bytes from the
-    checked-in manifest (``None`` when unknown); no per-invocation HF I/O.
-    """
-    from vllm_mlx.model_aliases import list_builtin_aliases, list_profiles
-    from vllm_mlx.model_sizes import size_bytes
-
-    all_profiles = list_profiles()
-    builtin_aliases = set(list_builtin_aliases())
-
-    def _modality(p) -> str:
-        return getattr(p, "modality", "text") or "text"
-
-    def _profile_dict(alias, p) -> dict:
-        raw = None
-        try:
-            raw = size_bytes(p.hf_path)
-        except Exception:
-            raw = None
-        return {
-            "alias": alias,
-            "hf_path": p.hf_path,
-            "size_bytes": int(raw) if isinstance(raw, int) and raw > 0 else None,
-            "tool_call_parser": p.tool_call_parser,
-            "reasoning_parser": p.reasoning_parser,
-            "is_hybrid": bool(getattr(p, "is_hybrid", False)),
-            "is_moe": bool(getattr(p, "is_moe", False)),
-            "supports_spec_decode": bool(getattr(p, "supports_spec_decode", False)),
-            "mtp_draft_model": getattr(p, "mtp_draft_model", None),
-            "mtp_speculative_tokens": getattr(p, "mtp_speculative_tokens", None),
-            "modality": _modality(p),
-            # Desktop consumes these as a launch-safety contract. Only
-            # curated aliases may opt into eager MLLM loading, and an
-            # explicit text-only pin always wins over name inference.
-            "is_builtin": alias in builtin_aliases,
-            "is_text_only": bool(getattr(p, "is_text_only", False)),
-        }
-
-    text, video, image = {}, {}, {}
-    for alias, p in all_profiles.items():
-        bucket = {"video-gen": video, "image-gen": image}.get(_modality(p), text)
-        bucket[alias] = p
-
-    payload = {
-        "text": [_profile_dict(a, text[a]) for a in sorted(text)],
-        "video": [_profile_dict(a, video[a]) for a in sorted(video)],
-        "image": [_profile_dict(a, image[a]) for a in sorted(image)],
-        "audio": [],
-    }
-    try:
-        from vllm_mlx.audio.registry import list_audio_aliases
-
-        payload["audio"] = [
-            {
-                "alias": e.alias,
-                "hf_id": e.hf_id,
-                "kind": e.type,
-                "family": e.family,
-                "modality": "audio",
-            }
-            for e in list_audio_aliases()
-        ]
-    except Exception:
-        payload["audio"] = []
-    return payload
 
 
 def models_command(args):
@@ -6210,18 +4172,6 @@ def models_command(args):
     """
     from vllm_mlx._version_check import print_staleness_warning_if_any
     from vllm_mlx.model_aliases import list_profiles
-    from vllm_mlx.model_sizes import format_size
-
-    # JSON mode emits ONLY the payload on stdout — no staleness banner, no
-    # table — so a caller can pipe it straight into a parser.
-    if getattr(args, "json", False):
-        import json as _json
-
-        if getattr(args, "cached", False):
-            print(_json.dumps(_cached_models_json_payload()))
-        else:
-            print(_json.dumps(_available_models_json_payload()))
-        return
 
     print_staleness_warning_if_any()
 
@@ -6229,36 +4179,7 @@ def models_command(args):
         _print_cached_models()
         return
 
-    all_profiles = list_profiles()
-    # Video-generation aliases are not chat models: they have no
-    # tokenizer and no ``stream_chat``, so ``/v1/chat/completions`` on one
-    # is an AttributeError, and ``serve`` exits 2 before binding a port
-    # when the video extras are absent. Listing them inline in the text
-    # table is how a GUI catalog consumer ends up offering a 64 GiB
-    # download that can never chat (#1603). Split them into their own
-    # tagged section, exactly as audio aliases already are, so a consumer
-    # can tell the two kinds apart without hardcoding alias names.
-    video_profiles = {
-        alias: p
-        for alias, p in all_profiles.items()
-        if getattr(p, "modality", "text") == "video-gen"
-    }
-    # Image-generation aliases (mflux FLUX / Qwen-Image) are likewise not chat
-    # models — ``/v1/chat/completions`` on one is unrouted. Split them into
-    # their own ``[image:gen]``-tagged section for the same catalog-integrity
-    # reason as video (#1603): a GUI consumer must be able to tell an image
-    # model from a chat model without hardcoding alias names, or it will offer
-    # a multi-GB image checkpoint as a chat model that dead-ends on first send.
-    image_profiles = {
-        alias: p
-        for alias, p in all_profiles.items()
-        if getattr(p, "modality", "text") == "image-gen"
-    }
-    profiles = {
-        a: p
-        for a, p in all_profiles.items()
-        if a not in video_profiles and a not in image_profiles
-    }
+    profiles = list_profiles()
     print()
     print(f"  Available models ({len(profiles)} aliases)")
 
@@ -6268,35 +4189,16 @@ def models_command(args):
     # floor — never shrink below it so short rows still feel padded.
     # Other widths sized to fit values currently in aliases.json:
     # tool 16 (qwen3_coder_xml + 1 pad), reasoning 12 (deepseek_r1 + 1),
-    # spec 10 ("✗ hybrid"), tier 11, dflash 7, ddtree 7, preset 8.
+    # spec 10 ("✗ hybrid"), tier 11, dflash 7, ddtree 7.
     alias_width = max(24, max((len(a) for a in profiles), default=0) + 2)
-    # Size ("438.3 GiB" is the widest current value) comes right after the
-    # alias so the "how big before I pull?" answer is the first thing a user
-    # sees next to the name (issue #1286). Values come from the checked-in
-    # model_sizes.json manifest — no per-invocation HuggingFace round-trip.
-    # Tools and Reasoning carry parser keys whose length is unbounded
-    # (``deepseek_r1_distill`` is 19 chars, wider than the old fixed 12).
-    # Size them to the data like the alias column so a long value never
-    # overflows and shifts every field to its right out of the header's
-    # columns (#1999). Preset is last, so its long ``MTP@…`` values can
-    # overrun harmlessly and stay unbounded.
-    tools_width = max(
-        16, max((len(p.tool_call_parser or "—") for p in profiles.values()), default=0)
-    )
-    reasoning_width = max(
-        12,
-        max((len(p.reasoning_parser or "—") for p in profiles.values()), default=0),
-    )
     cols = (
         ("Alias", alias_width),
-        ("Size", 10),
-        ("Tools", tools_width),
-        ("Reasoning", reasoning_width),
+        ("Tools", 16),
+        ("Reasoning", 12),
         ("Spec-Decode", 10),
         ("Suffix Tier", 11),
-        ("DFlash", 9),
-        ("DDTree", 9),
-        ("Preset", 8),
+        ("DFlash", 7),
+        ("DDTree", 7),
     )
     width = sum(w for _, w in cols) + len(cols) - 1
     sep = "  " + "─" * width
@@ -6305,17 +4207,11 @@ def models_command(args):
     print(header)
     print(sep)
 
-    from .spec_decode.capability import assess_method
-
     for alias in sorted(profiles.keys()):
         p = profiles[alias]
         tools = p.tool_call_parser or "—"
         reasoning = p.reasoning_parser or "—"
-        if p.mtp_draft_model:
-            spec = "✓ MTP"
-            tier = "n/a"
-            preset = f"MTP@{p.mtp_draft_model}@{p.mtp_speculative_tokens}"
-        elif p.is_hybrid:
+        if p.is_hybrid:
             # Hybrid models cannot use spec-decode or suffix-decode regardless
             # of the supports_spec_decode flag (mlx-lm BatchGenerator gate).
             spec = "✗ hybrid"
@@ -6323,35 +4219,20 @@ def models_command(args):
         else:
             spec = "✓" if p.supports_spec_decode else "✗"
             tier = p.suffix_decoding_tier
-            preset = "Suffix" if p.supports_spec_decode else "—"
-        if p.is_hybrid and not p.mtp_draft_model:
-            preset = "—"
-
         # DFlash column — eligible aliases show ✓, everything else "—" so
         # the visual scan immediately surfaces what supports it. We don't
         # re-run the eligibility gate here (which would also check that
         # mlx-vlm 0.5.0+ is installed) — that's a runtime concern; the
         # registry column is pure declarative state.
-        def _tier_mark(profile, method: str) -> str:
-            assessment = assess_method(profile, method)
-            if assessment.recommendation == "verified":
-                return "verified"
-            if assessment.recommendation == "incompatible":
-                return "✗"
-            return "exp"
-
-        dflash = _tier_mark(p, "dflash")
-        ddtree = _tier_mark(p, "ddtree")
-        size = format_size(p.hf_path)
+        dflash = "✓" if p.supports_dflash else "—"
+        ddtree = "✓" if p.supports_ddtree else "—"
         row = (
-            f"  {alias:<{alias_width}} {size:<10} {tools:<{tools_width}} "
-            f"{reasoning:<{reasoning_width}} "
-            f"{spec:<10} {tier:<11} {dflash:<7} {ddtree:<7} {preset:<8}"
+            f"  {alias:<{alias_width}} {tools:<16} {reasoning:<12} "
+            f"{spec:<10} {tier:<11} {dflash:<7} {ddtree:<7}"
         )
         print(row)
 
     print(sep)
-    print("  Spec tiers: verified = curated; exp = explicit opt-in; ✗ = incompatible")
 
     # R10-C1: audio alias section. Pre-R10 ``rapid-mlx models`` listed
     # zero audio aliases because they don't live in ``aliases.json``
@@ -6376,115 +4257,29 @@ def models_command(args):
         )
         print()
         print(f"  Audio models ({len(audio_entries)} aliases)")
+        audio_sep = "  " + "─" * width
+        print(audio_sep)
         audio_header = (
-            f"  {'Alias':<{audio_alias_width}} {'Size':<10} {'Kind':<10} "
+            f"  {'Alias':<{audio_alias_width}} {'Kind':<10} "
             f"{'Family':<12} {'HF id':<40}"
         )
-        # Size the rule to THIS table's header, not the text table's width —
-        # the text table's Tools/Reasoning columns are data-sized now (#1999),
-        # so reusing its width would stretch every secondary rule.
-        audio_sep = "  " + "─" * (len(audio_header) - 2)
-        print(audio_sep)
         print(audio_header)
         print(audio_sep)
         for entry in audio_entries:
             kind_tag = f"[audio:{entry.type}]"
             print(
-                f"  {entry.alias:<{audio_alias_width}} "
-                f"{format_size(entry.hf_id):<10} {kind_tag:<10} "
+                f"  {entry.alias:<{audio_alias_width}} {kind_tag:<10} "
                 f"{entry.family:<12} {entry.hf_id:<40}"
             )
         print(audio_sep)
 
-    # Video-generation aliases, in their own tagged section for the same
-    # reason audio has one: they are not chat models, and a catalog
-    # consumer must be able to tell that from the output rather than by
-    # hardcoding names (#1603). The ``[video:gen]`` Kind tag mirrors
-    # ``[audio:tts]`` / ``[audio:stt]``.
-    if video_profiles:
-        video_alias_width = max(
-            24, max((len(a) for a in video_profiles), default=0) + 2
-        )
-        print()
-        print(f"  Video models ({len(video_profiles)} aliases)")
-        video_header = (
-            f"  {'Alias':<{video_alias_width}} {'Size':<10} {'Kind':<11} {'HF id':<40}"
-        )
-        video_sep = "  " + "─" * (len(video_header) - 2)
-        print(video_sep)
-        print(video_header)
-        print(video_sep)
-        for alias in sorted(video_profiles):
-            p = video_profiles[alias]
-            print(
-                f"  {alias:<{video_alias_width}} "
-                f"{format_size(p.hf_path):<10} {'[video:gen]':<11} "
-                f"{p.hf_path:<40}"
-            )
-        print(video_sep)
-
-    # Image aliases carry an operation tag: text-to-image checkpoints use
-    # ``[image:gen]`` and instruction-edit checkpoints use ``[image:edit]``;
-    # FLUX.2 Klein accepts both request shapes and uses ``[image:both]``.
-    # Besides keeping both out of chat catalogs, this lets GUI consumers expose
-    # the right request shape without guessing capability from the alias.
-    if image_profiles:
-        image_alias_width = max(
-            24, max((len(a) for a in image_profiles), default=0) + 2
-        )
-        print()
-        print(f"  Image models ({len(image_profiles)} aliases)")
-        image_header = (
-            f"  {'Alias':<{image_alias_width}} {'Size':<10} {'Kind':<11} {'HF id':<40}"
-        )
-        image_sep = "  " + "─" * (len(image_header) - 2)
-        print(image_sep)
-        print(image_header)
-        print(image_sep)
-        for alias in sorted(image_profiles):
-            p = image_profiles[alias]
-            folded_path = p.hf_path.casefold().replace("_", "-")
-            if (
-                "flux2" in folded_path
-                or "flux.2" in folded_path
-                or "klein" in folded_path
-            ):
-                kind_tag = "[image:both]"
-            elif "qwen-image-edit" in folded_path:
-                kind_tag = "[image:edit]"
-            else:
-                kind_tag = "[image:gen]"
-            print(
-                f"  {alias:<{image_alias_width}} "
-                f"{format_size(p.hf_path):<10} {kind_tag:<12} "
-                f"{p.hf_path:<40}"
-            )
-        print(image_sep)
-
     print()
-    print(
-        "  Size is an approximate download footprint (weight+tokenizer); "
-        "“—” = unknown. The exact size is confirmed at pull time."
-    )
     print("  Tip: `rapid-mlx info <alias>` for the full per-model profile")
     print("       `rapid-mlx pull <alias>` to download")
     print("       `rapid-mlx chat <alias>` for an interactive REPL")
     print("       `rapid-mlx serve <alias>` for an OpenAI-compatible server")
     if audio_entries:
         print("       `rapid-mlx serve kokoro|whisper-large-v3|parakeet` for audio")
-    # User mappings are rendered explicitly so support output never makes a
-    # private nickname look like an immutable catalog alias.
-    from vllm_mlx.model_aliases import list_builtin_aliases, user_alias_reserved_names
-    from vllm_mlx.user_aliases import validated_user_aliases
-
-    user_aliases = validated_user_aliases(
-        list_builtin_aliases(), user_alias_reserved_names()
-    )
-    if user_aliases:
-        print()
-        print(f"  User aliases ({len(user_aliases)})")
-        for name, target in sorted(user_aliases.items()):
-            print(f"  {name} -> {target}")
     print()
 
 
@@ -6532,246 +4327,13 @@ def _snapshot_size_bytes(path) -> int:
     return total
 
 
-def _external_tree_size_bytes(path: str) -> int:
-    """Logical external-tree bytes, following shared files only once."""
-    total = 0
-    seen: set[tuple[int, int]] = set()
-
-    def inaccessible(error: OSError) -> None:
-        raise error
-
-    for current, _directories, files in os.walk(
-        path, followlinks=False, onerror=inaccessible
-    ):
-        for name in files:
-            stat = os.stat(os.path.join(current, name), follow_symlinks=True)
-            identity = (stat.st_dev, stat.st_ino)
-            if identity in seen:
-                continue
-            seen.add(identity)
-            total += stat.st_size
-    return total
-
-
-def _narrow_to_subfolder(repo_id: str, snapshot_dir):
-    """Narrow a snapshot root to the catalog subfolder a filtered pull serves.
-
-    A repo that ships one folder per quantization holds far more on disk than
-    any single alias needs; sizing or fingerprinting the ROOT would include
-    sibling quant folders left by earlier pulls. Returns the subfolder path
-    when ``repo_id`` is a catalog alias with one, else the root unchanged.
-    Shared by the transfer account and the pull summary so both key on the
-    same directory.
-    """
-    import os as _os
-
-    from vllm_mlx.model_aliases import resolve_subfolder
-
-    _sub = resolve_subfolder(repo_id)
-    if _sub:
-        _candidate = _os.path.join(str(snapshot_dir), _sub)
-        if _os.path.isdir(_candidate):
-            return _candidate
-    return snapshot_dir
-
-
-def _hf_cache_root(repo_id: str):
-    """HF cache ``models--<id>`` dir for ``repo_id``, or None.
-
-    Pure path computation from the hub cache (no network). Handles BOTH
-    ``owner/repo`` and single-component repo ids (Codex #2392 #2): ``owner/repo``
-    maps to ``models--owner--repo``; a bare ``repo`` (no ``/``) maps to
-    ``models--repo`` — HF's real layout. Prefers HF's own ``repo_name_to_id``
-    when the installed version exposes it, else reconstructs locally.
-    """
-    from pathlib import Path
-
-    try:
-        from huggingface_hub.constants import HF_HUB_CACHE
-    except Exception:
-        return None
-    try:
-        from huggingface_hub.utils import repo_name_to_id  # type: ignore[attr-defined]
-
-        _cache_id = repo_name_to_id(repo_id)
-    except Exception:
-        _cache_id = repo_id.replace("/", "--")
-    return Path(HF_HUB_CACHE) / f"models--{_cache_id}"
-
-
-def _blob_identifier(repo_root) -> tuple[tuple[str, int, int], ...]:
-    """Sorted ``(name, size, mtime_ns)`` for every real blob under ``blobs/``.
-
-    The stable transfer signal for the pull account (Codex #2392): a NEW or
-    MODIFIED blob is the only thing that means bytes crossed the wire. A warm
-    pull that merely re-links snapshot symlinks to already-present blobs
-    leaves ``blobs/`` untouched (identical fingerprint => cached); a genuine
-    fetch creates a new blob (changed); a repair of a corrupt/truncated blob
-    changes its size/mtime (changed). This is robust to ``main`` moving to a
-    snapshot assembled entirely from blobs already present locally — which
-    transfers NOTHING and must be reported cached, whereas comparing the
-    snapshot TREE (changed paths) would falsely report a download (Codex #2392).
-
-    ``.incomplete*`` scratch files are excluded — HF prunes/creates them as
-    churn that has nothing to do with this pull's outcome. ``repo_root`` may
-    be None (no cache entry yet) -> empty fingerprint.
-    """
-    import os as _os
-
-    if not repo_root:
-        return ()
-    blob_dir = repo_root / "blobs"
-    if not blob_dir.is_dir():
-        return ()
-    rows: list[tuple[str, int, int]] = []
-    try:
-        names = _os.listdir(blob_dir)
-    except OSError:
-        return ()
-    for name in names:
-        if name.startswith(".incomplete"):
-            continue
-        p = blob_dir / name
-        try:
-            if p.is_file():
-                st = p.stat()
-                rows.append((name, st.st_size, st.st_mtime_ns))
-        except OSError:
-            continue
-    return tuple(sorted(rows))
-
-
-def _print_pull_summary(
-    repo_id: str,
-    snapshot_dir,
-    elapsed: float,
-    *,
-    was_cached: bool | None = None,
-) -> None:
-    """Emit the one-line ``Downloaded ... — <size> in <duration>`` summary.
-
-    ``was_cached`` is the downloader's authoritative "nothing was transferred
-    this pull" verdict (issue #2349):
-    * ``True``  — the mirror/HF transfer account proves zero bytes were
-      fetched -> "Already cached ... verified (nothing to download)".
-    * ``False`` — the downloader reports it fetched bytes -> "Downloaded".
-    * ``None``  — unknown (e.g. the HF-fallback's downloader could not prove
-      either way) -> "Downloaded", never a false cache claim.
-    For the HF-fallback path the account is the on-disk snapshot file
-    inventory before vs after the pull (a stable seam, Codex #2392) — never
-    huggingface_hub's tqdm progress internals. A moved ``main`` that fetches
-    new blobs changes the inventory and reports a real download.
-    """
-    # A filtered pull fetched one folder, but the snapshot root may also
-    # hold quant folders left by earlier pulls of a sibling alias. Sizing
-    # the root would report those as part of THIS download.
-    snapshot_dir = _narrow_to_subfolder(repo_id, snapshot_dir)
+def _print_pull_summary(repo_id: str, snapshot_dir, elapsed: float) -> None:
+    """Emit the one-line ``Downloaded ... — <size> in <duration>`` summary."""
     size = _snapshot_size_bytes(snapshot_dir)
-    # "Already cached" only on a proven no-transfer (``was_cached is True``);
-    # ``None`` (unknown) falls through to "Downloaded" rather than a false
-    # cache claim.
-    if was_cached is True:
-        print(
-            f"  Already cached {repo_id} — {_format_bytes(size)} verified "
-            f"(nothing to download)"
-        )
-    else:
-        print(
-            f"  Downloaded {repo_id} — {_format_bytes(size)} in "
-            f"{_format_pull_duration(elapsed)}"
-        )
-
-    # Activation funnel (docs/telemetry-activation.md): a successful pull is
-    # the ``model_pull`` milestone (an activation, NOT inference-engaged).
-    # This helper is only reached on the two success exits of ``pull_command``,
-    # so it is the single "pull succeeded" chokepoint. Fired once per install,
-    # consent-gated + ``@_safe``, so it is a no-op when telemetry is off and
-    # can never affect the pull.
-    from vllm_mlx.telemetry import emit as _telemetry_emit
-    from vllm_mlx.telemetry.activation_spec import ACTIVATION_MODEL_PULL, SURFACE_CLI
-
-    _telemetry_emit.activation(
-        activation_kind=ACTIVATION_MODEL_PULL, surface=SURFACE_CLI
+    print(
+        f"  Downloaded {repo_id} — {_format_bytes(size)} in "
+        f"{_format_pull_duration(elapsed)}"
     )
-
-
-def _escape_glob_literal(name: str) -> str:
-    """Make ``name`` match literally in a fnmatch ``allow_patterns`` string.
-
-    ``snapshot_download``'s ``allow_patterns`` are fnmatch-style globs, so a
-    folder whose name happens to contain a glob metacharacter (``[``, ``]``,
-    ``*``, ``?``) would otherwise broaden the match to other folders. Wrapping
-    each metacharacter in a one-character character class (``[[]`` matches a
-    literal ``[``) pins the pattern to exactly that folder. Real quant names
-    (``4bit``, ``mxfp4``) never hit this, but the selector claims to handle
-    arbitrary multi-variant repos, so it must not corrupt their folder names.
-    """
-    out: list[str] = []
-    for ch in name:
-        out.append(f"[{ch}]" if ch in "[]*?" else ch)
-    return "".join(out)
-
-
-def _resolve_variant_allow_patterns(
-    repo_id: str, bits: str | None, fmt: str | None
-) -> list[str] | None:
-    """Map ``--bits``/``--format`` to ``snapshot_download`` patterns.
-
-    A multi-variant repo ships every quantization side by side as TOP-LEVEL
-    folders (``LiquidAI/LFM2.5-2.6B-MLX`` holds ``4bit/ 5bit/ 6bit/ 8bit/
-    bf16/ mxfp4/ mxfp8/ nvfp4/``). ``--bits N`` or ``--format F`` selects the
-    ``<N>bit`` / ``<F>`` folder so a constrained Mac fetches only that
-    variant instead of all of them (~20 GB in the LFM case).
-
-    Returns ``[f"{folder}/*"]`` for the requested variant, or ``None`` when no
-    selector was given (caller keeps the existing catalog-driven narrowing).
-    Raises ``VariantNotFoundError`` with the available folders when the
-    requested variant does not exist — so we fail clearly and cheaply (a file
-    listing, not a download) before touching any weights. The enumeration uses
-    the same top-level ``list_repo_tree`` read the mirror/catalog already rely
-    on; only folder names are inspected, never file bytes.
-
-    ``--bits`` and ``--format`` select the SAME dimension (a single variant
-    folder), so the CLI exposes them as a mutually exclusive group; this helper
-    rejects both being set as a defensive guard for programmatic callers.
-    """
-    if bits is None and fmt is None:
-        return None
-    if bits and fmt:
-        raise ValueError("--bits and --format are mutually exclusive; pick one")
-    # An explicit-but-empty selector (e.g. ``--format ""``) is a user error, not
-    # "no selector" — reject it instead of silently doing an unrestricted pull.
-    if bits == "" or fmt == "":
-        raise ValueError(
-            "--bits/--format was supplied but is empty; pass a value or drop the flag"
-        )
-    from huggingface_hub import HfApi, RepoFolder
-    from huggingface_hub.errors import RepositoryNotFoundError
-
-    # At this point exactly one of bits/fmt is a truthy non-empty value (the
-    # None/empty/both cases all returned or raised above), so ``requested`` is
-    # a real folder name string.
-    requested = f"{bits}bit" if bits else (fmt or "")
-    try:
-        tree = list(HfApi().list_repo_tree(repo_id, recursive=False))
-    except RepositoryNotFoundError:
-        raise
-    folders = sorted(e.path for e in tree if isinstance(e, RepoFolder))
-    if requested not in folders:
-        raise VariantNotFoundError(repo_id, requested, available=folders)
-    # The folder is validated to exist literally; escape glob metacharacters so
-    # a weird folder name can't broaden the match to other siblings.
-    return [f"{_escape_glob_literal(requested)}/*"]
-
-
-class VariantNotFoundError(Exception):
-    """The user asked for a variant a multi-variant repo does not ship."""
-
-    def __init__(self, repo_id: str, requested: str, available: list[str]):
-        self.repo_id = repo_id
-        self.requested = requested
-        self.available = available
-        super().__init__(f"no '{requested}' variant in {repo_id}")
 
 
 def pull_command(args):
@@ -6805,70 +4367,10 @@ def pull_command(args):
 
     t0 = time.monotonic()
 
-    # #2145: resolve an explicit ``--bits``/``--format`` variant up front via a
-    # cheap file listing (no weight download). A requested variant that the
-    # repo does not ship fails here with the available folders listed, before
-    # any weights are touched.
-    _bits = getattr(args, "bits", None)
-    _fmt = getattr(args, "format", None)
-    try:
-        variant_allow = _resolve_variant_allow_patterns(repo_id, _bits, _fmt)
-    except ValueError as e:
-        print(f"\n  Error: {e}")
-        sys.exit(1)
-    except VariantNotFoundError as e:
-        shown = getattr(args, "_original_alias", repo_id)
-        print(f"\n  Error: '{shown}' has no '{e.requested}' variant.")
-        if e.available:
-            print("  Available variant folder(s): " + ", ".join(e.available) + ".")
-        else:
-            print(
-                "  The repo exposes no variant folders — it is a single-variant repo."
-            )
-        print(
-            "  Pick one with --bits <N> or --format <name>, or pull the repo without a selector."
-        )
-        sys.exit(1)
-
-    # The pull summary says "already cached / nothing to download" only from
-    # the DOWNLOADER's own transfer account (mirror/HF bytes fetched), never
-    # from a filesystem guess. ``_was_cached`` is threaded to the summary.
-    _was_cached: bool | None = None
-    _mirror_out: dict = {}
-
-    # Reclaim scratch files stranded by earlier interrupted pulls of THIS repo
-    # before adding more. huggingface_hub gives each attempt a uniquely-named
-    # ``.incomplete`` blob and removes it while unwinding, which a killed
-    # process never gets to do — so a cancel, quit or crash leaves one behind
-    # every time and nothing else ever collects them. Best-effort and
-    # age-gated; see the helper for why it cannot disturb a live download.
-    try:
-        from vllm_mlx._download_gate import _format_size, reap_orphan_incomplete_blobs
-
-        _reaped, _bytes = reap_orphan_incomplete_blobs(repo_id)
-        if _reaped:
-            print(
-                f"  Cleaned up {_reaped} abandoned download file(s) "
-                f"from earlier interrupted pulls ({_format_size(_bytes)})."
-            )
-    except Exception:
-        pass
-
     # R2-first / HuggingFace-fallback per file. Default mirror is
     # ``https://models.rapidmlx.com``; set ``RAPID_MLX_MODEL_MIRROR=""``
     # to force HF only. The function prints its own progress + summary.
-    # #2145: when the user explicitly selected a variant (--bits/--format), the
-    # mirror prefetch has no narrow-to-variant mode yet (Vector's #2279 adds
-    # allow_patterns there, unlanded) — it would pull the WHOLE (or catalog
-    # subfolder) repo and defeat the selection. So a requested variant bypasses
-    # the mirror and goes straight to the narrowed HF snapshot_download below.
-    # Revisit once #2279 lands allow_patterns in the mirror path.
-    if variant_allow is not None:
-        print(
-            "  R2 mirror skipped: a --bits/--format variant was requested "
-            "(the mirror cannot narrow to one variant yet)."
-        )
-    if variant_allow is None and _try_mirror_prefetch(repo_id, out=_mirror_out):
+    if _try_mirror_prefetch(repo_id):
         from pathlib import Path
 
         try:
@@ -6886,106 +4388,16 @@ def pull_command(args):
         except OSError:
             snapshot_dir = repo_root
             print(f"  Cached at: {repo_root}")
-        # ``network_fetch`` is the mirror's authoritative "any bytes fetched
-        # this pull" verdict (covers a fetched zero-byte file, codex #4).
-        _was_cached = not _mirror_out.get("network_fetch", True)
-        _print_pull_summary(
-            repo_id,
-            snapshot_dir,
-            time.monotonic() - t0,
-            was_cached=_was_cached,
-        )
+        _print_pull_summary(repo_id, snapshot_dir, time.monotonic() - t0)
         return
     # Mirror returned False — fall through to plain snapshot_download.
     # Either the catalog was unreachable, the alias isn't catalog-listed,
     # or one or more files failed both R2 and HF in the per-file pool.
     # snapshot_download will retry from HF with its own (more robust)
     # error reporting.
-    # Say plainly that this path does not resume. The mirror completes a
-    # partial ``.part`` with a ranged request, so an interrupted mirror pull
-    # picks up where it left off; huggingface_hub gives each attempt its own
-    # scratch file and never reuses one, so an interrupted HF pull starts the
-    # affected files over from zero. Silently switching between "resumes" and
-    # "restarts" is what makes a flaky connection read as "the download is
-    # stuck" — the bytes really do go back to the beginning each time.
     print(f"\n  Pulling {repo_id} from HuggingFace ...")
-    print("  Note: this path does not resume — interrupting it restarts the")
-    print("  files still in flight from the beginning.")
     try:
-        from vllm_mlx.model_aliases import resolve_subfolder
-
-        # A repo that ships one folder per quantization holds many times
-        # more than any one alias needs — unfiltered, this fetches all
-        # eight LFM2.5-2.6B checkpoints (~20 GB) to serve 1.6 GB of them.
-        #
-        # The narrowing applies even when the operator typed the bare repo
-        # id rather than the alias, because every other consumer already
-        # keys on the repo id and reaches inside: the download gate sizes
-        # the subfolder, ``is_repo_cached`` probes the subfolder, and the
-        # loader opens the subfolder. Pulling the whole repo here would
-        # make the gate's "1.5 GiB" quote a lie and leave seven
-        # checkpoints on disk that nothing can serve. It is announced
-        # rather than silent so ``pull <repo-id>`` never quietly does
-        # something narrower than it was asked.
-        # An explicit --bits/--format selection (variant_allow) always wins over
-        # the catalog-driven subfolder narrowing; otherwise fall back to the
-        # catalog subfolder (one checkpoint per quantization).
-        if variant_allow is not None:
-            _allow = variant_allow
-            # Literal folder name the user asked for (e.g. "4bit"). Derived
-            # from the raw selectors, NOT from the (glob-escaped) pattern, so
-            # user-facing messages and catalog comparison show the real name
-            # even when it contains glob metacharacters.
-            _variant_name = f"{_bits}bit" if _bits else (_fmt or "")
-            # The explicit --bits/--format selection wins over any catalog
-            # alias narrowing (resolve_subfolder); say so so the override is
-            # visible rather than silent.
-            _alias_subfolder = resolve_subfolder(repo_id)
-            if _alias_subfolder and _alias_subfolder != _variant_name:
-                print(
-                    f"  User --bits/--format '{_variant_name}' overrides the "
-                    f"catalog's '{_alias_subfolder}/' alias narrowing."
-                )
-            print(
-                f"  Fetching only the {_variant_name}/ variant "
-                f"(selected with --bits/--format)."
-            )
-        else:
-            _subfolder = resolve_subfolder(repo_id)
-            if _subfolder:
-                print(
-                    f"  This repo ships one checkpoint per quantization; "
-                    f"fetching only {_subfolder}/ (the folder rapid-mlx serves)."
-                )
-            _allow = [f"{_subfolder}/*"] if _subfolder else None
-        # HF-fallback runs only after a mirror miss — but a cached HF no-op is
-        # still possible and must be labelled "Already cached", so account the
-        # TRANSFER from the BLOB store (Codex #2392), never huggingface_hub's
-        # tqdm progress internals and never the snapshot tree: a NEW/MODIFIED
-        # blob is the only thing meaning bytes crossed the wire. Capture the
-        # repo's ``blobs/`` inventory BEFORE the pull then AFTER. Identical =>
-        # zero bytes crossed this pull (cache hit) — even if ``main`` moved to
-        # a snapshot assembled from blobs already present locally, or a warm
-        # re-link recreated snapshot symlinks; any changed blob (new file, or
-        # a repaired corrupt/truncated blob whose size/mtime changed) => a real
-        # download. ``_hf_cache_root`` resolves the cache entry (no network).
-        # The mirror may have ALREADY fetched some blobs before it returned
-        # False (a partial/failed attempt). Those bytes must still count: honor
-        # whatever the mirror reported on ANY exit path (Codex #2353). The R5
-        # per-file aggregation sets ``_mirror_out["network_fetch"]`` on the
-        # mirror's success AND partial-miss returns, so a partial mirror
-        # transfer forces "Downloaded" even when the snapshot_download that
-        # follows is a no-op.
-        _mirror_fetched = _mirror_out.get("network_fetch", False)
-        _cache_root = _hf_cache_root(repo_id)
-        _before = _blob_identifier(_cache_root)
-        path = (
-            snapshot_download(repo_id, allow_patterns=_allow)
-            if _allow
-            else snapshot_download(repo_id)
-        )
-        _after = _blob_identifier(_cache_root)
-        _was_cached = (_before == _after and _before != ()) and not _mirror_fetched
+        path = snapshot_download(repo_id)
     except HFValidationError:
         # Malformed HF repo id (e.g. ``foo/bar/baz``) — surface the same
         # friendly "unknown model" hint the alias path uses instead of a
@@ -7012,12 +4424,7 @@ def pull_command(args):
             sys.exit(1)
         raise
     print(f"  Cached at: {path}")
-    _print_pull_summary(
-        repo_id,
-        path,
-        time.monotonic() - t0,
-        was_cached=_was_cached,
-    )
+    _print_pull_summary(repo_id, path, time.monotonic() - t0)
 
 
 def rm_command(args):
@@ -7064,57 +4471,6 @@ def rm_command(args):
     print(f"Freed {size_str}")
 
 
-def alias_command(args) -> None:
-    """Create, remove, or list user-owned model aliases."""
-    from vllm_mlx.model_aliases import list_builtin_aliases, user_alias_reserved_names
-    from vllm_mlx.user_aliases import (
-        UserAliasError,
-        remove_user_alias,
-        set_user_alias,
-        validated_user_aliases,
-    )
-
-    builtins = list_builtin_aliases()
-    reserved = user_alias_reserved_names()
-    try:
-        if args.alias_action == "set":
-            set_user_alias(args.name, args.target, builtins, reserved)
-            print(f"  User alias: {args.name} -> {args.target}")
-        elif args.alias_action == "remove":
-            if not remove_user_alias(args.name, builtins, reserved):
-                print(f"  User alias {args.name!r} does not exist.", file=sys.stderr)
-                raise SystemExit(1)
-            print(
-                f"  Removed user alias {args.name!r}; cached weights were not changed."
-            )
-        else:
-            aliases = validated_user_aliases(builtins, reserved)
-            if not aliases:
-                print("  No user aliases configured.")
-            else:
-                for name, target in sorted(aliases.items()):
-                    print(f"  {name} -> {target}")
-    except UserAliasError as exc:
-        print(f"\n  Error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from None
-
-
-def _elide_front(text: str, width: int) -> str:
-    """Trim ``text`` to at most ``width`` chars, keeping the TAIL.
-
-    For a served model that is a filesystem path, the tail (the model name) is
-    the distinctive part, so the head is what gets replaced by a leading ``…``.
-    The result never exceeds ``width`` (widths <= 1 leave no room for the ``…``).
-    """
-    if len(text) <= width:
-        return text
-    if width <= 0:
-        return ""
-    if width == 1:
-        return text[-1:]
-    return "…" + text[-(width - 1) :]
-
-
 def ps_command(_args):
     """List running rapid-mlx servers (process scan)."""
     import time
@@ -7157,14 +4513,15 @@ def ps_command(_args):
             "--log-level",
             "--mcp-config",
             "--cors-origins",
-            "--trusted-hosts",
+            "--cloud-model",
+            "--cloud-api-base",
+            "--cloud-api-key",
             "--served-model-name",
             "--max-tokens",
             "--gpu-memory-utilization",
         }
         model = "(unknown)"
         port = "8000"  # serve's default
-        served = None  # --served-model-name value, if any (issue #2353)
         try:
             i = cmd.index("serve") + 1
             # Pre-PR this loop ``break``ed on the first positional, so a
@@ -7180,14 +4537,10 @@ def ps_command(_args):
                         key, val = tok.split("=", 1)
                         if key == "--port":
                             port = val
-                        elif key == "--served-model-name":
-                            served = val
                         i += 1
                     elif tok in VALUE_FLAGS:
                         if tok == "--port" and i + 1 < len(cmd):
                             port = cmd[i + 1]
-                        elif tok == "--served-model-name" and i + 1 < len(cmd):
-                            served = cmd[i + 1]
                         i += 2
                     else:
                         i += 1
@@ -7198,12 +4551,6 @@ def ps_command(_args):
                     i += 1
         except ValueError:
             pass
-
-        # #2353: a user sets --served-model-name to choose the API model
-        # identity; the process surface should lead with that identity and
-        # may show the requested alias/checkpoint in parentheses after it.
-        if served and served != model:
-            model = f"{served} ({model})"
 
         uptime_s = max(0, int(time.time() - proc.info["create_time"]))
         h, m = uptime_s // 3600, (uptime_s % 3600) // 60
@@ -7217,14 +4564,9 @@ def ps_command(_args):
     print()
     print(f"  {'PID':<8}{'PORT':<8}{'MODEL':<40}{'UPTIME':<10}")
     print(f"  {'-' * 66}")
-    # Serving a local path (not an alias) is the normal case for a converted
-    # model, and those paths routinely exceed the 40-char column — the old
-    # code let them run straight into UPTIME with no gap (#1999). Elide from
-    # the FRONT so the distinctive tail (the model name) survives, capped at 38
-    # so the ``<40`` pad always leaves at least two spaces before UPTIME.
     # Sort numerically by port — string sort would put "10000" before "8000".
     for pid, port, model, uptime in sorted(rows, key=lambda r: int(r[1])):
-        print(f"  {pid:<8}{port:<8}{_elide_front(model, 38):<40}{uptime:<10}")
+        print(f"  {pid:<8}{port:<8}{model:<40}{uptime:<10}")
     print()
 
 
@@ -7235,7 +4577,6 @@ def _spawn_chat_server(
     *,
     register_in: list | None = None,
     log_handle=None,
-    disable_prefix_cache: bool = False,
 ) -> tuple[object, str]:
     """Spawn a `serve` subprocess on an ephemeral port for chat REPL use.
 
@@ -7288,8 +4629,6 @@ def _spawn_chat_server(
     ]
     if served_name and served_name != model:
         cmd.extend(["--served-model-name", served_name])
-    if disable_prefix_cache:
-        cmd.append("--disable-prefix-cache")
     log = open(log_path, "w")  # noqa: SIM115 — kept open for proc lifetime
     # Tell the child main() that the parent already gated (or that this is
     # an internal spawn, where prompting would deadlock anyway because the
@@ -7560,79 +4899,11 @@ def _has_short_pattern_dominating_suffix(
     return period < n and period <= max_period
 
 
-def _accumulate_tool_call_deltas(
-    parts: dict[int, dict],
-    deltas: list,
-) -> None:
-    """Merge one chunk's ``delta.tool_calls`` into an index-keyed accumulator.
-
-    Streaming tool calls arrive split across chunks: the first carries ``id``
-    and ``function.name``, later ones append ``function.arguments`` fragments
-    that are only valid JSON once concatenated. ``index`` — not ``id``, which
-    later fragments omit — is the field that ties the fragments together, so
-    it is the accumulator key.
-
-    A server that streams several calls interleaves their indices, which is
-    why fragments are appended per index rather than to a single buffer.
-    """
-
-    import json
-
-    for delta in deltas:
-        if not isinstance(delta, dict):
-            continue
-        # Fall back to positional order for servers that omit ``index`` when
-        # only one call is in flight.
-        index = delta.get("index")
-        if not isinstance(index, int):
-            index = 0
-        part = parts.setdefault(index, {"id": None, "name": None, "arguments": ""})
-
-        if delta.get("id"):
-            part["id"] = str(delta["id"])
-        function = delta.get("function")
-        if not isinstance(function, dict):
-            continue
-        if function.get("name"):
-            part["name"] = str(function["name"])
-        arguments = function.get("arguments")
-        if isinstance(arguments, str):
-            part["arguments"] += arguments
-        elif arguments is not None:
-            # Some servers send the whole object once instead of fragments.
-            part["arguments"] = json.dumps(arguments, ensure_ascii=False)
-
-
-def _finalize_tool_calls(parts: dict[int, dict]) -> list[dict]:
-    """Render the accumulator into OpenAI-shape tool calls, in index order."""
-
-    finalized = []
-    for position, index in enumerate(sorted(parts)):
-        part = parts[index]
-        if not part["name"]:
-            # No function name ever arrived — there is nothing to dispatch,
-            # and forwarding it would only produce an "unknown tool" round
-            # trip.
-            continue
-        finalized.append(
-            {
-                "id": part["id"] or f"call_{position}",
-                "type": "function",
-                "function": {
-                    "name": part["name"],
-                    "arguments": part["arguments"] or "{}",
-                },
-            }
-        )
-    return finalized
-
-
 def _stream_chat_response(
     base_url: str,
     payload: dict,
     timeout_s: int,
     metrics: dict | None = None,
-    tool_calls: list | None = None,
 ) -> str:
     """POST /v1/chat/completions with stream=True and print tokens as they
     arrive. Returns the full assistant content (concatenated content deltas).
@@ -7642,30 +4913,160 @@ def _stream_chat_response(
     string — chat history stores only the final answer, matching the
     OpenAI-compat split between ``content`` and ``reasoning_content``.
 
-    Interactive terminals show a one-line incremental preview, then replace it
-    with one correct Rich Markdown render containing structured headings,
-    lists, links, tables, and code. Pipes, CI, dumb terminals, and
-    ``NO_COLOR`` retain byte-for-byte plain streaming.
-
-    When *tool_calls* is a list, streamed ``delta.tool_calls`` fragments are
-    accumulated and the assembled calls are appended to it. This is what lets
-    the MCP agent loop stream: the tool round is no longer a reason to fall
-    back to a blocking request.
+    Plain streaming: tokens land directly in the user's terminal as they
+    arrive. We deliberately do NOT use ``rich.Live`` + ``Markdown`` here:
+    Live re-renders the panel on every refresh and, when the console's
+    cursor-overwrite path is unreliable (recordings, some terminal
+    multiplexers), each refresh appends rather than overwrites — turning
+    a 200-token response into a wall of repeated text. Live markdown
+    rendering deserves a separate, more careful effort with explicit
+    fallback detection; for now correctness wins over formatting.
     """
     import json
 
     import requests
 
-    from .chat_render import StreamingMarkdownRenderer, supports_rich_output
-
     DIM = "\x1b[2m"
+    BOLD = "\x1b[1m"
     RESET = "\x1b[0m"
     MAGENTA = "\x1b[35m"
-    is_tty = supports_rich_output(sys.stdout)
+    CYAN = "\x1b[36m"
+    is_tty = sys.stdout.isatty() and "NO_COLOR" not in os.environ
     in_reasoning = False
     full = ""
-    full_reasoning = ""
-    tool_call_parts: dict[int, dict] = {}
+
+    # ----- Streaming markdown colorer ------------------------------------
+    # Body text streams in the terminal's default color (Claude-Code-style
+    # — accents only on chrome). Inline coloring handles the markers users
+    # see most often: ``\`code\``` (cyan), ``\`\`\`fence\`\`\``` (dim cyan
+    # block), ``**bold**`` (ANSI bold), and ATX headers (``#`` … ``####``)
+    # at line start. Lists / italic stay raw so the parser stays small.
+    HEADING_STYLE = {
+        1: BOLD + CYAN,  # `# h1`     — most prominent
+        2: BOLD + MAGENTA,  # `## h2`    — secondary
+        3: BOLD,  # `### h3`   — bold only
+        4: CYAN,  # `#### h4`  — cyan
+        5: MAGENTA,  # `##### h5` — magenta
+        6: DIM,  # `###### h6`— dim
+    }
+    _state = {
+        "in_fence": False,  # inside a ``` block
+        "in_inline_code": False,  # inside a `code` span
+        "in_bold": False,  # inside **bold**
+        "in_heading": False,  # inside an ATX heading line
+        "at_line_start": True,  # cursor is at start of a logical line
+        "pending": "",  # buffered chars awaiting lookahead
+    }
+
+    def _emit_with_inline_md(piece: str) -> None:
+        if not is_tty:
+            sys.stdout.write(piece)
+            sys.stdout.flush()
+            return
+        text = _state["pending"] + piece
+        _state["pending"] = ""
+        out: list[str] = []
+        i, n = 0, len(text)
+        while i < n:
+            c = text[i]
+            # Newline closes any line-scoped span (heading) and resets the
+            # line-start anchor so the next `#`/`*`/etc. is interpreted in
+            # the right context.
+            if c == "\n":
+                if _state["in_heading"]:
+                    out.append(RESET)
+                    _state["in_heading"] = False
+                out.append("\n")
+                _state["at_line_start"] = True
+                i += 1
+                continue
+            # ATX heading: `#`..`######` followed by space at line start.
+            # We skip this inside fences (a `#` at line start there is
+            # almost always a comment, not a heading).
+            if _state["at_line_start"] and c == "#" and not _state["in_fence"]:
+                # Count consecutive `#` (1..6).
+                j = i
+                while j < n and j - i < 6 and text[j] == "#":
+                    j += 1
+                # Need to see one more char after the hashes to decide
+                # heading vs literal "###foo" — buffer if we don't have it.
+                if j == n:
+                    _state["pending"] = text[i:]
+                    break
+                hashes = j - i
+                if 1 <= hashes <= 6 and text[j] == " ":
+                    style = HEADING_STYLE.get(hashes, BOLD)
+                    out.append(style)
+                    out.append(text[i : j + 1])  # emit "## "
+                    _state["in_heading"] = True
+                    _state["at_line_start"] = False
+                    i = j + 1
+                    continue
+                # Not a heading — fall through to literal emission below.
+            if c == "`":
+                # Need 2 chars of lookahead to disambiguate ``` vs `.
+                if i + 2 >= n:
+                    _state["pending"] = text[i:]
+                    break
+                if text[i : i + 3] == "```":
+                    if _state["in_fence"]:
+                        out.append("```" + RESET)
+                        _state["in_fence"] = False
+                    else:
+                        out.append(DIM + CYAN + "```")
+                        _state["in_fence"] = True
+                    _state["at_line_start"] = False
+                    i += 3
+                    continue
+                # Single backtick.
+                if _state["in_fence"]:
+                    out.append("`")
+                elif _state["in_inline_code"]:
+                    out.append("`" + RESET)
+                    _state["in_inline_code"] = False
+                else:
+                    out.append(CYAN + "`")
+                    _state["in_inline_code"] = True
+                _state["at_line_start"] = False
+                i += 1
+                continue
+            if c == "*" and not _state["in_fence"] and not _state["in_inline_code"]:
+                if i + 1 >= n:
+                    _state["pending"] = text[i:]
+                    break
+                if text[i : i + 2] == "**":
+                    if _state["in_bold"]:
+                        out.append("**" + RESET)
+                        _state["in_bold"] = False
+                    else:
+                        out.append(BOLD + "**")
+                        _state["in_bold"] = True
+                    _state["at_line_start"] = False
+                    i += 2
+                    continue
+            out.append(c)
+            # Whitespace (other than newline, handled above) keeps the
+            # line-start anchor true so leading-indent headings still
+            # parse — e.g., a list item's child paragraph is rare here.
+            if c not in " \t":
+                _state["at_line_start"] = False
+            i += 1
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+    def _close_open_md_spans() -> None:
+        if is_tty and (
+            _state["in_fence"]
+            or _state["in_inline_code"]
+            or _state["in_bold"]
+            or _state["in_heading"]
+        ):
+            sys.stdout.write(RESET)
+            sys.stdout.flush()
+        if _state["pending"]:
+            sys.stdout.write(_state["pending"])
+            sys.stdout.flush()
+            _state["pending"] = ""
 
     # ----- Repetition guard ----------------------------------------------
     # Models occasionally degenerate into the same token repeated until
@@ -7690,15 +5091,12 @@ def _stream_chat_response(
     repeat_run = 0
     repetition_aborted = False
 
-    with (
-        requests.post(
-            f"{base_url}/v1/chat/completions",
-            json=payload,
-            stream=True,
-            timeout=timeout_s,
-        ) as resp,
-        StreamingMarkdownRenderer() as renderer,
-    ):
+    with requests.post(
+        f"{base_url}/v1/chat/completions",
+        json=payload,
+        stream=True,
+        timeout=timeout_s,
+    ) as resp:
         if resp.status_code != 200:
             # With stream=True the body may still be partial / mid-chunk when
             # the server closed the socket; read defensively so we surface a
@@ -7739,12 +5137,7 @@ def _stream_chat_response(
                     metrics["finish_reason"] = fr
             reasoning = delta.get("reasoning_content")
             piece = delta.get("content")
-            if tool_calls is not None:
-                streamed_calls = delta.get("tool_calls")
-                if isinstance(streamed_calls, list):
-                    _accumulate_tool_call_deltas(tool_call_parts, streamed_calls)
             if reasoning:
-                full_reasoning += reasoning
                 if not in_reasoning:
                     if is_tty:
                         sys.stdout.write(f"{MAGENTA}[thinking]{RESET} {DIM}")
@@ -7755,7 +5148,7 @@ def _stream_chat_response(
                 sys.stdout.flush()
             if piece:
                 if in_reasoning:
-                    sys.stdout.write(f"{RESET}\n" if is_tty else "\n")
+                    sys.stdout.write(f"{RESET}\n  " if is_tty else "\n")
                     in_reasoning = False
                 # Detect repetition BEFORE emitting. If a single coalesced
                 # delta contains the cutoff inside it (server batched many
@@ -7800,10 +5193,10 @@ def _stream_chat_response(
                         seen += 1
                     prefix = piece[:pos]
                     if prefix:
-                        renderer.write(prefix)
+                        _emit_with_inline_md(prefix)
                         full += prefix
                 else:
-                    renderer.write(piece)
+                    _emit_with_inline_md(piece)
                     full += piece
                 # Char-level guard: catches no-whitespace degenerate
                 # output like ``"BarleyBarleyBarley..."`` that the
@@ -7824,13 +5217,10 @@ def _stream_chat_response(
                     repetition_aborted = True
                 if repetition_aborted:
                     break
+    _close_open_md_spans()
     if in_reasoning and is_tty:
         sys.stdout.write(RESET)
         sys.stdout.flush()
-    if tool_calls is not None:
-        tool_calls.extend(_finalize_tool_calls(tool_call_parts))
-    if metrics is not None and full_reasoning:
-        metrics["reasoning_content"] = full_reasoning
     if repetition_aborted:
         msg = (
             f"\n\n  {DIM}(response cut: model began repeating itself — "
@@ -7841,163 +5231,6 @@ def _stream_chat_response(
         sys.stdout.write(msg)
         sys.stdout.flush()
     return full
-
-
-def _complete_chat_with_mcp(
-    base_url: str,
-    payload: dict,
-    mcp_runtime,
-    timeout_s: int,
-    *,
-    max_rounds: int = 8,
-    on_tool_event=None,
-) -> tuple[str, dict]:
-    """Run the chat agent loop with MCP tools, streaming every round.
-
-    vLLM and SGLang use the same loop shape: expose MCP tools as ordinary
-    function tools, append the assistant tool call and matching tool output,
-    then ask the model again.  MCP transport and execution stay inside the
-    chat runtime; the inference server only sees standard Chat Completions
-    messages.
-
-    Every round streams, including the ones that end in a tool call. The
-    blocking variant this replaced left the screen empty for the whole
-    multi-round turn, which on a local model is the slowest part of the
-    session and the part the user most needs feedback during.
-    """
-    import json
-
-    messages = payload["messages"]
-    request_payload = {
-        **payload,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "tools": mcp_runtime.tools,
-        "tool_choice": "auto",
-    }
-    total_usage: dict[str, int | float] = {}
-
-    for round_index in range(max_rounds + 1):
-        round_metrics: dict = {}
-        streamed_calls: list[dict] = []
-        content = _stream_chat_response(
-            base_url,
-            request_payload,
-            timeout_s=timeout_s,
-            metrics=round_metrics,
-            tool_calls=streamed_calls,
-        )
-
-        for name in ("prompt_tokens", "completion_tokens"):
-            value = round_metrics.get(name)
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                total_usage[name] = total_usage.get(name, 0) + value
-
-        if not streamed_calls:
-            metrics = dict(total_usage)
-            metrics["finish_reason"] = round_metrics.get("finish_reason")
-            return content, metrics
-        if round_index == max_rounds:
-            # Budget exhausted. The tool results already in ``messages`` are
-            # real work — the model read files, ran commands — so raising here
-            # would send the caller down ``_recover_failed_chat_turn`` and
-            # delete all of it. Return instead, with the partial content the
-            # model did produce and a finish_reason the caller can report.
-            # The assistant message requesting this round's calls is
-            # deliberately not appended: unanswered ``tool_calls`` in history
-            # make the next request malformed.
-            metrics = dict(total_usage)
-            metrics["finish_reason"] = "tool_call_limit"
-            metrics["tool_rounds_exhausted"] = max_rounds
-            return content, metrics
-
-        normalized_calls = []
-        for position, tool_call in enumerate(streamed_calls):
-            function = tool_call["function"]
-            normalized_calls.append(
-                {
-                    "id": str(tool_call.get("id") or f"call_{round_index}_{position}"),
-                    "type": "function",
-                    "function": {
-                        "name": str(function.get("name") or ""),
-                        "arguments": function.get("arguments") or "{}",
-                    },
-                }
-            )
-
-        assistant_message = {
-            "role": "assistant",
-            "content": content or None,
-            "tool_calls": normalized_calls,
-        }
-        if round_metrics.get("reasoning_content"):
-            assistant_message["reasoning_content"] = round_metrics["reasoning_content"]
-        messages.append(assistant_message)
-        completed_messages = {}
-
-        def _handle_tool_event(event, completed=completed_messages):
-            if event.phase == "finish" and event.message is not None:
-                completed[event.call_id] = event.message
-            if on_tool_event is not None:
-                on_tool_event(event)
-
-        try:
-            messages.extend(
-                mcp_runtime.execute_tool_calls(
-                    normalized_calls,
-                    on_event=_handle_tool_event,
-                )
-            )
-        except BaseException:
-            for pending_call in normalized_calls:
-                messages.append(
-                    completed_messages.get(pending_call["id"])
-                    or {
-                        "role": "tool",
-                        "tool_call_id": pending_call["id"],
-                        "content": json.dumps(
-                            {"error": "Tool execution interrupted"},
-                            ensure_ascii=False,
-                        ),
-                    }
-                )
-            raise
-
-    # Unreachable: the ``round_index == max_rounds`` branch returns on the
-    # final iteration. Kept so the function has no implicit ``None`` return.
-    raise AssertionError("MCP tool loop exited without a result")
-
-
-def _recover_failed_chat_turn(messages: list[dict], turn_start: int) -> None:
-    """Keep completed tool side effects in history; otherwise roll back."""
-
-    import json
-
-    tool_succeeded = False
-    for message in messages[turn_start + 1 :]:
-        if message.get("role") != "tool":
-            continue
-        try:
-            result = json.loads(message.get("content") or "")
-        except (TypeError, ValueError):
-            continue
-        if (
-            isinstance(result, dict)
-            and "error" not in result
-            and result.get("isError") is not True
-        ):
-            tool_succeeded = True
-            break
-
-    if tool_succeeded:
-        messages.append(
-            {
-                "role": "assistant",
-                "content": "Tool execution completed, but the follow-up response failed.",
-            }
-        )
-    else:
-        del messages[turn_start:]
 
 
 def chat_command(args):
@@ -8013,20 +5246,18 @@ def chat_command(args):
     import subprocess
 
     from vllm_mlx._tempfile_safe import managed_tempfile_path
-    from vllm_mlx.chat_render import supports_rich_output, terminal_safe_text
 
     base_url: str
     proc = None
     log_path: str | None = None
-    mcp_runtime = None
     # Tracks every spawned server (initial + every /model candidate) so
     # the SIGTERM/atexit cleanup tears down in-flight candidates too —
     # not just the bound ``proc``. A SIGTERM landing while a /model
     # swap is mid-spawn would otherwise orphan the candidate server.
     _active_procs: list[subprocess.Popen] = []
 
-    # ANSI palette only when the output supports interactive formatting.
-    _is_tty = supports_rich_output(sys.stdout)
+    # TTY-gated ANSI palette for the chat UI. NO_COLOR is honoured.
+    _is_tty = sys.stdout.isatty() and "NO_COLOR" not in os.environ
     BOLD = "\x1b[1m" if _is_tty else ""
     DIM = "\x1b[2m" if _is_tty else ""
     GREEN = "\x1b[32m" if _is_tty else ""
@@ -8034,12 +5265,6 @@ def chat_command(args):
     YELLOW = "\x1b[33m" if _is_tty else ""
     RED = "\x1b[31m" if _is_tty else ""
     RESET = "\x1b[0m" if _is_tty else ""
-
-    # P0-3 (first-run guide): did the user see real value this session — i.e.
-    # at least one completed, non-empty response? Gates the one-time agent-
-    # connect tip printed on exit, so a load-then-immediate-/exit run neither
-    # nags the user nor burns the one-time marker.
-    _generated_any = False
 
     def _teardown_proc(p) -> None:
         """Terminate a spawned chat server and free its log file.
@@ -8143,18 +5368,8 @@ def chat_command(args):
         except (ValueError, OSError):
             pass
         try:
-            mcp_close_error = None
-            if mcp_runtime is not None:
-                try:
-                    mcp_runtime.close()
-                except Exception as exc:
-                    mcp_close_error = exc
             for p in list(_active_procs):
                 _teardown_proc(p)
-            if mcp_close_error is not None:
-                raise RuntimeError(
-                    f"Failed to close MCP runtime: {mcp_close_error}"
-                ) from mcp_close_error
             _cleanup_state["done"] = True
         finally:
             # Best-effort restore so post-cleanup signals route normally.
@@ -8200,8 +5415,6 @@ def chat_command(args):
     except (ValueError, OSError):
         pass
     atexit.register(_cleanup)
-
-    attached_to_existing = bool(args.base_url or args.port is not None)
 
     if args.base_url:
         base_url = args.base_url.rstrip("/")
@@ -8256,18 +5469,12 @@ def chat_command(args):
             # If main() resolved an alias, expose the alias as the API model name
             # so the chat request body matches what the user typed.
             original = getattr(args, "_original_alias", None)
-            privacy_kwargs = (
-                {"disable_prefix_cache": True}
-                if getattr(args, "disable_prefix_cache", False)
-                else {}
-            )
             proc, base_url = _spawn_chat_server(
                 args.model,
                 log_path,
                 served_name=original,
                 register_in=_active_procs,
                 log_handle=_log_handle,
-                **privacy_kwargs,
             )
 
         try:
@@ -8276,37 +5483,6 @@ def chat_command(args):
             print(f"\n  {RED}Failed to start server:{RESET} {e}")
             sys.exit(1)
         print(f"  {GREEN}✓ Ready.{RESET}\n")
-
-    # When attaching without an explicit model, trust the server's advertised
-    # model instead of the client's independently configured starter alias.
-    # The latter commonly differs from a manually started server and turns the
-    # very first request into an avoidable 404. Direct callers predating this
-    # marker are treated as explicit to preserve their existing behavior.
-    if attached_to_existing and not getattr(args, "_model_was_explicit", True):
-        try:
-            import requests
-
-            response = requests.get(f"{base_url}/v1/models", timeout=2)
-            response.raise_for_status()
-            payload = response.json()
-            models = payload.get("data", []) if isinstance(payload, dict) else []
-            discovered = next(
-                (
-                    item.get("id")
-                    for item in models
-                    if isinstance(item, dict)
-                    and isinstance(item.get("id"), str)
-                    and item["id"].strip()
-                ),
-                None,
-            )
-        except (requests.RequestException, ValueError, TypeError):
-            discovered = None
-        if discovered:
-            args.model = discovered
-            if hasattr(args, "_original_alias"):
-                delattr(args, "_original_alias")
-            print(f"  Connected model: {discovered} (discovered from server)")
 
     from vllm_mlx._version_check import print_staleness_warning_if_any
 
@@ -8333,13 +5509,22 @@ def chat_command(args):
         f"{DIM}type {RESET}{BOLD}/help{RESET}{DIM} for commands, "
         f"Ctrl-D to exit.{RESET}"
     )
-    # A single blank line before the prompt keeps the layout consistent.
-    # The "connect your agent" nudge that used to live here (a start-of-chat
-    # agents/codex banner) moved to a one-time tip printed after the user's
-    # FIRST successful chat exit — see the P0-3 block at the end of this
-    # function and ``vllm_mlx/first_run.py``. Nudging once, after value has
-    # landed, beats nudging on every cold start.
-    print()
+    # First-launch-only banner for the agents/codex tip. The marker-file
+    # gate keeps the tip from re-appearing on every chat launch (persona-3
+    # finding: irritating by launch #50). Marker logic is skipped entirely
+    # when stdout is not a TTY or NO_COLOR is set — pipe/CI runs shouldn't
+    # pollute the user's config dir, and the banner is fluff there anyway.
+    _is_pipe_or_no_color = (not sys.stdout.isatty()) or ("NO_COLOR" in os.environ)
+    if not _is_pipe_or_no_color and not _has_seen_tip("chat_intro_codex"):
+        print(
+            f"  {DIM}For a Claude Code-like TUI: `rapid-mlx agents codex --setup`, "
+            f"then run `codex` in any project.{RESET}\n"
+        )
+        _mark_tip_seen("chat_intro_codex")
+    else:
+        # Maintain the existing blank-line spacing the banner used to
+        # provide — keeps the prompt layout consistent across runs.
+        print()
 
     served_name = getattr(args, "_original_alias", args.model)
     messages: list[dict] = []
@@ -8519,29 +5704,15 @@ def chat_command(args):
             if not _auto_yes and _interactive:
                 from vllm_mlx._download_gate import (
                     confirm_or_abort,
-                    estimate_download_size_bytes,
+                    estimate_repo_size_bytes,
                     is_repo_cached,
                 )
 
                 if not is_repo_cached(resolved):
-                    # Offline + uncached (/model swap): refuse BEFORE the size
-                    # estimate + confirm, so the user sees the one actionable
-                    # offline reason instead of an "About to download" notice
-                    # or a confirm they can cancel without learning why
-                    # (#2357). Mirrors the main() serve gate; the Wan dir
-                    # override exemption is likewise scoped to video-gen.
-                    # Only print + return (stay in the REPL), not sys.exit —
-                    # a failed /model must never kill the chat session.
-                    if (
-                        _offline_hub_mode_active()
-                        and _cache_runnability(resolved) is False
-                    ):
-                        print(_offline_uncached_error(resolved), file=sys.stderr)
-                        return
                     try:
                         confirm_or_abort(
                             resolved,
-                            estimate_download_size_bytes(resolved),
+                            estimate_repo_size_bytes(resolved),
                         )
                     except SystemExit:
                         # User said no — keep the current server up.
@@ -8551,21 +5722,16 @@ def chat_command(args):
                         )
                         return
 
-        # 1. Pre-download the new model (this also runs the disk-space gate
-        #    and the offline+uncached refusal). The current server keeps
-        #    running while we do this so a download failure leaves the user
-        #    where they were.
+        # 1. Pre-download the new model (this also runs the disk-space
+        #    gate). The current server keeps running while we do this so
+        #    a download failure leaves the user where they were.
         try:
             _ensure_model_downloaded(resolved)
         except SystemExit:
-            # A fatal pre-download condition aborted via sys.exit(1) — disk
-            # gate, offline+uncached, or resolve timeout. Each path printed
-            # its own specific reason to stderr, so this summary deliberately
-            # does NOT re-attribute it as the disk gate (#2357). Old server
-            # is untouched.
+            # Disk gate aborted via sys.exit(1); old server is untouched.
             print(
                 f"  {RED}Model switch aborted{RESET} "
-                f"{DIM}(reason above); previous server still running.{RESET}\n"
+                f"{DIM}(disk gate); previous server still running.{RESET}\n"
             )
             return
         except RuntimeError as exc:
@@ -8597,18 +5763,12 @@ def chat_command(args):
             # readiness wait, before any further Python statement runs in
             # this scope. A SIGTERM/Ctrl-C during the (possibly multi-second)
             # load tears the child down via the cleanup walk.
-            privacy_kwargs = (
-                {"disable_prefix_cache": True}
-                if getattr(args, "disable_prefix_cache", False)
-                else {}
-            )
             new_proc, new_base_url = _spawn_chat_server(
                 resolved,
                 new_log_path,
                 served_name=new_alias,
                 register_in=_active_procs,
                 log_handle=_new_log_handle,
-                **privacy_kwargs,
             )
         try:
             _wait_for_chat_server(new_base_url, new_proc, timeout_s=args.ready_timeout)
@@ -8638,241 +5798,143 @@ def chat_command(args):
             f"{DIM}(history cleared){RESET}\n"
         )
 
-    try:
-        if getattr(args, "mcp_config", None):
-            from vllm_mlx.chat_mcp import ChatMCPRuntime
-
-            try:
-                mcp_runtime = ChatMCPRuntime(args.mcp_config)
-            except (ImportError, OSError, RuntimeError, ValueError) as exc:
-                print(f"\n  {RED}Failed to start MCP:{RESET} {exc}")
-                _cleanup()
-                sys.exit(1)
-            ready_line = (
-                f"  {GREEN}✓ MCP ready:{RESET} "
-                f"{len(mcp_runtime.tools)} tool(s) from "
-                f"{mcp_runtime.server_count} server(s)."
-            )
-            if mcp_runtime.server_log_path:
-                ready_line += (
-                    f"\n  {DIM}server logs → {mcp_runtime.server_log_path}{RESET}"
-                )
-            print(ready_line)
-            for server_name, error in sorted(mcp_runtime.connection_errors.items()):
-                print(f"  {YELLOW}MCP server {server_name} unavailable:{RESET} {error}")
-
-        while True:
-            try:
-                line = input(prompt).rstrip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
+    while True:
+        try:
+            line = input(prompt).rstrip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            continue
+        # Heredoc-pasted content must NEVER be dispatched as a slash
+        # command — a markdown doc whose first line starts with `/path`
+        # or whose content includes `/save` would otherwise be silently
+        # eaten by the slash dispatcher. Track the source so we know.
+        is_heredoc = False
+        if line == '"""':
+            line = _read_multiline()
             if not line:
                 continue
-            # Heredoc-pasted content must NEVER be dispatched as a slash
-            # command — a markdown doc whose first line starts with `/path`
-            # or whose content includes `/save` would otherwise be silently
-            # eaten by the slash dispatcher. Track the source so we know.
-            is_heredoc = False
-            if line == '"""':
-                line = _read_multiline()
-                if not line:
-                    continue
-                is_heredoc = True
-            if not is_heredoc:
-                # Parse the leading word as the command and dispatch on
-                # *exact* match. ``startswith("/save")`` would otherwise treat
-                # ``/savefoo`` as ``/save`` (with arg ``foo``), silently
-                # writing a file from a typo. Same for ``/modelfoo``.
-                # ``str.split(maxsplit=1)`` (no separator arg) splits on any
-                # whitespace, so ``/save\tpath.md`` works the same as
-                # ``/save path.md``.
-                parts = line.split(maxsplit=1)
-                cmd = parts[0] if parts else ""
-                rest = parts[1].strip() if len(parts) > 1 else ""
-                # ``/bye`` is an Ollama-muscle-memory alias for ``/exit`` /
-                # ``/quit``. ``/?`` mirrors ``/help`` and was already
-                # supported; both alias sets are advertised in ``/help``.
-                if cmd in ("exit", "quit", "/exit", "/quit", "/bye"):
-                    break
-                if cmd in ("/help", "/?"):
-                    _print_help()
-                    continue
-                if cmd in ("/reset", "/clear"):
-                    messages = (
-                        [{"role": "system", "content": args.system}]
-                        if args.system
-                        else []
-                    )
-                    print(f"  {DIM}(history cleared){RESET}\n")
-                    continue
-                if cmd == "/save":
-                    if not rest:
-                        print(f"  {YELLOW}Usage: /save <path>{RESET}\n")
-                    else:
-                        _save_conversation(rest)
-                    continue
-                if cmd == "/model":
-                    if not rest:
-                        print(
-                            f"  {YELLOW}Usage: /model <alias>{RESET}  "
-                            f"{DIM}(see `rapid-mlx models`){RESET}\n"
-                        )
-                    else:
-                        _switch_model(rest)
-                    continue
-                if cmd.startswith("/"):
+            is_heredoc = True
+        if not is_heredoc:
+            # Parse the leading word as the command and dispatch on
+            # *exact* match. ``startswith("/save")`` would otherwise treat
+            # ``/savefoo`` as ``/save`` (with arg ``foo``), silently
+            # writing a file from a typo. Same for ``/modelfoo``.
+            # ``str.split(maxsplit=1)`` (no separator arg) splits on any
+            # whitespace, so ``/save\tpath.md`` works the same as
+            # ``/save path.md``.
+            parts = line.split(maxsplit=1)
+            cmd = parts[0] if parts else ""
+            rest = parts[1].strip() if len(parts) > 1 else ""
+            # ``/bye`` is an Ollama-muscle-memory alias for ``/exit`` /
+            # ``/quit``. ``/?`` mirrors ``/help`` and was already
+            # supported; both alias sets are advertised in ``/help``.
+            if cmd in ("exit", "quit", "/exit", "/quit", "/bye"):
+                break
+            if cmd in ("/help", "/?"):
+                _print_help()
+                continue
+            if cmd in ("/reset", "/clear"):
+                messages = (
+                    [{"role": "system", "content": args.system}] if args.system else []
+                )
+                print(f"  {DIM}(history cleared){RESET}\n")
+                continue
+            if cmd == "/save":
+                if not rest:
+                    print(f"  {YELLOW}Usage: /save <path>{RESET}\n")
+                else:
+                    _save_conversation(rest)
+                continue
+            if cmd == "/model":
+                if not rest:
                     print(
-                        f"  {YELLOW}Unknown command: {cmd}{RESET}  "
-                        f"{DIM}(type /help){RESET}\n"
-                    )
-                    continue
-
-            turn_start = len(messages)
-            messages.append({"role": "user", "content": line})
-            payload = {
-                "model": served_name,
-                "messages": messages,
-                "max_tokens": args.max_tokens,
-                "temperature": args.temperature,
-                "stream": True,
-                "stream_options": {"include_usage": True},
-                **extra,
-            }
-            # Claude-Code-style turn marker: a colored bullet introduces the
-            # assistant's response so the user can visually scan turn
-            # boundaries when scrolling back through long conversations.
-            sys.stdout.write(f"\n  {CYAN}●{RESET}\n")
-            sys.stdout.flush()
-            metrics: dict = {}
-            start_t = time.monotonic()
-            try:
-                if mcp_runtime is None:
-                    assistant = _stream_chat_response(
-                        base_url,
-                        payload,
-                        timeout_s=args.response_timeout,
-                        metrics=metrics,
+                        f"  {YELLOW}Usage: /model <alias>{RESET}  "
+                        f"{DIM}(see `rapid-mlx models`){RESET}\n"
                     )
                 else:
-
-                    def _show_mcp_tool_event(event) -> None:
-                        display_name = terminal_safe_text(event.name).replace(
-                            "__", ".", 1
-                        )
-                        if event.phase == "start":
-                            text = f"{DIM}using {display_name}…{RESET}"
-                        else:
-                            elapsed = event.elapsed_seconds or 0
-                            if event.is_error:
-                                text = f"{RED}✗ {display_name} ({elapsed:.2f}s){RESET}"
-                            else:
-                                text = (
-                                    f"{GREEN}✓ {display_name} ({elapsed:.2f}s){RESET}"
-                                )
-                        sys.stdout.write(f"  {text}\n")
-                        sys.stdout.flush()
-
-                    assistant, metrics = _complete_chat_with_mcp(
-                        base_url,
-                        payload,
-                        mcp_runtime,
-                        timeout_s=args.response_timeout,
-                        max_rounds=getattr(args, "mcp_max_rounds", 8),
-                        on_tool_event=_show_mcp_tool_event,
-                    )
-                    # No re-render here: every round streamed its own tokens
-                    # (reasoning included) through the same renderer the
-                    # non-MCP path uses, so rendering again would print the
-                    # final answer twice.
-            except KeyboardInterrupt:
-                print(f"\n  {YELLOW}(response interrupted){RESET}\n")
-                _recover_failed_chat_turn(messages, turn_start)
+                    _switch_model(rest)
                 continue
-            except RuntimeError as e:
-                print(f"\n  {RED}{e}{RESET}\n")
-                _recover_failed_chat_turn(messages, turn_start)
+            if cmd.startswith("/"):
+                print(
+                    f"  {YELLOW}Unknown command: {cmd}{RESET}  "
+                    f"{DIM}(type /help){RESET}\n"
+                )
                 continue
-            except requests.RequestException as e:
-                # Connection refused, timeout, dropped midstream — keep the REPL
-                # alive and roll back the failed user turn so the next request
-                # doesn't carry a dangling user role with no assistant reply.
-                print(f"\n  {RED}Request failed:{RESET} {e}\n")
-                _recover_failed_chat_turn(messages, turn_start)
-                continue
-            elapsed = time.monotonic() - start_t
-            # Speed line: prefer server-reported usage, fall back to a rough
-            # 4-chars-per-token estimate when the server doesn't ship usage
-            # in the stream.
-            tokens = metrics.get("completion_tokens")
-            if not tokens:
-                tokens = max(1, len(assistant) // 4)
-                tokens_label = f"~{tokens}"
-            else:
-                tokens_label = str(tokens)
-            if assistant and elapsed > 0:
-                tps = tokens / elapsed
-                print(
-                    f"\n  {DIM}{tokens_label} tok · {elapsed:.1f}s · "
-                    f"{tps:.0f} tok/s{RESET}\n"
-                )
-            else:
-                print()
-            # Length-cut + empty-content warning. When the server stops
-            # because ``finish_reason == "length"`` AND no visible content
-            # was streamed (only reasoning), the user otherwise sees an
-            # empty bullet and has no signal that the budget was the
-            # problem. This is the round-1 ``--think`` regression: 2048-
-            # token budget filled by reasoning on small models, zero answer.
-            if metrics.get("finish_reason") == "length" and not assistant:
-                print(
-                    f"  {YELLOW}(reasoning consumed the full --max-tokens "
-                    f"budget; bump --max-tokens for a final answer){RESET}\n"
-                )
-            # The turn stopped because the tool budget ran out, not because the
-            # model was done. Say so — the tool results are kept in history, so
-            # the user can simply ask it to continue.
-            if metrics.get("finish_reason") == "tool_call_limit":
-                exhausted = metrics.get("tool_rounds_exhausted")
-                print(
-                    f"  {YELLOW}(stopped after {exhausted} tool rounds; "
-                    f"tool results are kept — ask it to continue, or raise "
-                    f"--mcp-max-rounds){RESET}\n"
-                )
-            if assistant:
-                messages.append({"role": "assistant", "content": assistant})
-                # A non-empty response reached the user → the session
-                # delivered value. Arms the one-time exit tip (P0-3).
-                _generated_any = True
-            else:
-                _recover_failed_chat_turn(messages, turn_start)
-    finally:
-        # Do not defer MCP shutdown to ``atexit``. The official SDK owns helper
-        # threads for stdio sessions, and Python waits for non-daemon threads
-        # before running atexit callbacks. Closing here avoids that shutdown
-        # ordering deadlock and also tears down a spawned model server promptly.
-        _cleanup()
 
-    # P0-3 (first-run guide): after the user's FIRST session that actually
-    # produced a response, print a one-line nudge to connect their coding
-    # agent — the highest-retention next step, offered only once value has
-    # landed. Fires at most once per machine (a marker under ~/.rapid-mlx/),
-    # interactive terminals only, and never on a crash (an uncaught exception
-    # propagates through ``finally`` before reaching here). Fail-silent.
-    if _generated_any and _is_tty:
+        messages.append({"role": "user", "content": line})
+        payload = {
+            "model": served_name,
+            "messages": messages,
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            **extra,
+        }
+        # Claude-Code-style turn marker: a colored bullet introduces the
+        # assistant's response so the user can visually scan turn
+        # boundaries when scrolling back through long conversations.
+        sys.stdout.write(f"\n  {CYAN}●{RESET} ")
+        sys.stdout.flush()
+        metrics: dict = {}
+        start_t = time.monotonic()
         try:
-            from vllm_mlx.first_run import chat_agent_tip_text, claim_chat_agent_tip
-
-            # Build the tip text (which runs agent detection) BEFORE claiming
-            # the marker, so a detection error can't burn the one-time chance
-            # without ever showing the tip. The atomic claim is last, so only
-            # the process that wins the exclusive-create prints — concurrent
-            # first sessions can't both show it.
-            _tip = chat_agent_tip_text()
-            if claim_chat_agent_tip():
-                print(f"\n  {DIM}{_tip}{RESET}")
-        except Exception:
-            pass
+            assistant = _stream_chat_response(
+                base_url,
+                payload,
+                timeout_s=args.response_timeout,
+                metrics=metrics,
+            )
+        except KeyboardInterrupt:
+            print(f"\n  {YELLOW}(response interrupted){RESET}\n")
+            messages.pop()
+            continue
+        except RuntimeError as e:
+            print(f"\n  {RED}{e}{RESET}\n")
+            messages.pop()
+            continue
+        except requests.RequestException as e:
+            # Connection refused, timeout, dropped midstream — keep the REPL
+            # alive and roll back the failed user turn so the next request
+            # doesn't carry a dangling user role with no assistant reply.
+            print(f"\n  {RED}Request failed:{RESET} {e}\n")
+            messages.pop()
+            continue
+        elapsed = time.monotonic() - start_t
+        # Speed line: prefer server-reported usage, fall back to a rough
+        # 4-chars-per-token estimate when the server doesn't ship usage
+        # in the stream.
+        tokens = metrics.get("completion_tokens")
+        if not tokens:
+            tokens = max(1, len(assistant) // 4)
+            tokens_label = f"~{tokens}"
+        else:
+            tokens_label = str(tokens)
+        if assistant and elapsed > 0:
+            tps = tokens / elapsed
+            print(
+                f"\n  {DIM}{tokens_label} tok · {elapsed:.1f}s · "
+                f"{tps:.0f} tok/s{RESET}\n"
+            )
+        else:
+            print()
+        # Length-cut + empty-content warning. When the server stops
+        # because ``finish_reason == "length"`` AND no visible content
+        # was streamed (only reasoning), the user otherwise sees an
+        # empty bullet and has no signal that the budget was the
+        # problem. This is the round-1 ``--think`` regression: 2048-
+        # token budget filled by reasoning on small models, zero answer.
+        if metrics.get("finish_reason") == "length" and not assistant:
+            print(
+                f"  {YELLOW}(reasoning consumed the full --max-tokens "
+                f"budget; bump --max-tokens for a final answer){RESET}\n"
+            )
+        if assistant:
+            messages.append({"role": "assistant", "content": assistant})
+        else:
+            messages.pop()
 
 
 def info_command(args):
@@ -8907,22 +5969,6 @@ def info_command(args):
     print(format_profile_table(name, cfg))
     print()
 
-    # Download footprint (issue #1286). Manifest-first so known aliases print
-    # instantly and offline. Fall back to a live 5s-capped HF probe ONLY for a
-    # raw hf_path the registry doesn't carry — a manifest entry that is present
-    # but null means "already known to be unresolvable", so we must NOT re-probe
-    # it live (that would reintroduce the network wait the manifest exists to
-    # avoid). ``~`` marks the value as an estimate.
-    from vllm_mlx._download_gate import _format_size, estimate_repo_size_bytes
-    from vllm_mlx.model_sizes import is_listed, size_bytes
-
-    dl_size = size_bytes(name)
-    if dl_size is None and not is_listed(name):
-        dl_size = estimate_repo_size_bytes(name)
-    if dl_size is not None:
-        print(f"  Download size: ~{_format_size(dl_size)}")
-        print()
-
     # DFlash eligibility — render the report so users can see which
     # gates pass/fail without consulting the docs. Skipped for unknown
     # models since AliasProfile is alias-keyed.
@@ -8940,15 +5986,16 @@ def _print_dflash_status(alias: str, profile) -> None:
     """Render a 3-row DFlash status block for ``rapid-mlx info <alias>``.
 
     Shows each gate (declared support / not MoE / not 4-bit / drafter
-    present) so a user who tried DFlash and got a vague error can see
-    exactly which gate they're tripping.
+    present) so a user who tried ``--enable-dflash`` and got a vague
+    error can see exactly which gate they're tripping.
     """
-    from vllm_mlx.spec_decode.capability import assess_method
     from vllm_mlx.speculative.dflash.eligibility import (
         _looks_like_4bit,
         have_runtime,
+        report,
     )
 
+    r = report(profile, alias=alias)
     inner = 60
     sep = "─" * inner
 
@@ -8986,21 +6033,8 @@ def _print_dflash_status(alias: str, profile) -> None:
         ),
     ]
 
-    shared = assess_method(profile, "dflash")
-    capable = shared.recommendation != "incompatible"
-    verified = shared.recommendation == "verified"
-    runtime_available = have_runtime()
-    eligible = verified and runtime_available
-    if not capable:
-        summary = "✗ incompatible"
-    elif verified and runtime_available:
-        summary = "✓ recommended / verified"
-    elif verified:
-        summary = "⚠ verified pair; runtime unavailable"
-    elif not runtime_available:
-        summary = "⚠ experimental; runtime unavailable"
-    else:
-        summary = "⚠ experimental (explicit drafter required)"
+    eligible = not r.reasons and have_runtime()
+    summary = "✓ eligible" if eligible else "✗ ineligible"
 
     top = "┌" + "─" * (inner + 2) + "┐"
     bot = "└" + "─" * (inner + 2) + "┘"
@@ -9017,22 +6051,14 @@ def _print_dflash_status(alias: str, profile) -> None:
             """--speculative-config '{"method":"dflash"}'"""
         )
         print()
-    elif capable:
-        print(
-            f"  Experimental opt-in: rapid-mlx serve {alias} "
-            "--speculative-config "
-            '\'{"method":"dflash","model":"<drafter>"}\''
-        )
-        print("  Performance and output quality are not Rapid-MLX recommendations.")
-        print()
 
 
 def _print_ddtree_status(alias: str, profile) -> None:
     """Render DDTree status for ``rapid-mlx info <alias>``."""
-    from vllm_mlx.spec_decode.capability import assess_method
-    from vllm_mlx.speculative.ddtree.eligibility import have_runtime
+    from vllm_mlx.speculative.ddtree.eligibility import have_runtime, report
     from vllm_mlx.speculative.dflash.eligibility import _looks_like_4bit
 
+    r = report(profile, alias=alias)
     inner = 60
     sep = "─" * inner
 
@@ -9090,21 +6116,8 @@ def _print_ddtree_status(alias: str, profile) -> None:
         ),
     ]
 
-    shared = assess_method(profile, "ddtree")
-    capable = shared.recommendation != "incompatible"
-    verified = shared.recommendation == "verified"
-    runtime_available = have_runtime()
-    eligible = verified and runtime_available
-    if not capable:
-        summary = "✗ incompatible"
-    elif verified and runtime_available:
-        summary = "✓ recommended / verified"
-    elif verified:
-        summary = "⚠ verified pair; runtime unavailable"
-    elif not runtime_available:
-        summary = "⚠ experimental; runtime unavailable"
-    else:
-        summary = "⚠ experimental (explicit metadata required)"
+    eligible = not r.reasons and have_runtime()
+    summary = "✓ eligible" if eligible else "✗ ineligible"
     top = "┌" + "─" * (inner + 2) + "┐"
     bot = "└" + "─" * (inner + 2) + "┘"
     body = [top, _row(f"DDTree eligibility: {summary}"), _row(sep)]
@@ -9119,15 +6132,6 @@ def _print_ddtree_status(alias: str, profile) -> None:
             """--speculative-config '{"method":"ddtree"}'"""
         )
         print()
-    elif capable:
-        print(
-            f"  Experimental opt-in: rapid-mlx serve {alias} "
-            "--speculative-config "
-            '\'{"method":"ddtree","model":"<drafter>",'
-            '"num_speculative_tokens":16,"tree_budget":24}\''
-        )
-        print("  Performance and output quality are not Rapid-MLX recommendations.")
-        print()
 
 
 def agents_command(args):
@@ -9141,23 +6145,11 @@ def agents_command(args):
     # No agent specified → list all profiles
     if not agent_name:
         profiles = list_profiles()
-        # Size the name column to the widest alias so a name that meets or
-        # exceeds the old hardcoded 15 (e.g. "deepseek-harness", 16 chars)
-        # can't eat its own separator space and shift every later column
-        # right on that one row. Floor at 15 so short rosters keep the
-        # familiar layout.
-        name_w = max(15, max((len(p.name) for p in profiles), default=15))
         print()
         print("  Supported AI Agents")
-        print(
-            f"  {'name':<{name_w}} {'client':<20} {'GitHub':>6}  "
-            f"{'tools':<5}  recommended models"
-        )
-        # Grow the divider in step with the name column so it doesn't fall
-        # short of the header once a long alias widens the table.
-        print("  " + "─" * (78 + name_w - 15))
+        print("  " + "─" * 56)
         for p in profiles:
-            tools = "FC" if p.needs_function_calling else "—"
+            fc = "FC" if p.needs_function_calling else "  "
             stars = f"{p.stars // 1000}K" if p.stars and p.stars >= 1000 else ""
             if p.recommended_models:
                 shown = p.recommended_models[:3]
@@ -9166,26 +6158,9 @@ def agents_command(args):
                     models += f" +{len(p.recommended_models) - 3}"
             else:
                 models = ""
-            print(
-                f"  {p.name:<{name_w}} {p.display_name:<20} "
-                f"{stars:>6}  {tools:<5}  {models}"
-            )
-        print("  FC = function calling")
+            print(f"  {p.name:<15} {p.display_name:<20} {stars:>5}  [{fc}]  {models}")
         print()
-        # Frameworks (langchain, pydanticai, smolagents) are libraries
-        # you build agents with, not agents themselves — count them
-        # separately so "N agents" stays honest (#2082).
-        framework_count = sum(1 for p in profiles if p.kind == "framework")
-        agent_count = len(profiles) - framework_count
-        agents_label = "agent" if agent_count == 1 else "agents"
-        frameworks_label = "framework" if framework_count == 1 else "frameworks"
-        if framework_count:
-            print(
-                f"  {agent_count} {agents_label} + "
-                f"{framework_count} {frameworks_label} supported"
-            )
-        else:
-            print(f"  {agent_count} {agents_label} supported")
+        print(f"  {len(profiles)} agents supported")
         print("  Usage: rapid-mlx agents <name>          Show setup guide")
         print("         rapid-mlx agents <name> --setup   Auto-configure")
         print("         rapid-mlx agents <name> --test    Run integration tests")
@@ -9221,249 +6196,33 @@ def agents_command(args):
 
     # --setup: auto-configure agent
     if args.setup:
-        from vllm_mlx.agents.adapter import (
-            _detect_running_model,
-            fetch_context_window,
-        )
-
-        # Detect model + context window from running server.
-        # Only query the server when the profile template uses
-        # {context_length} — avoids a 2-second timeout regression
-        # for profiles that don't need it.
+        # Detect model from running server
         model_id = args.model or "default"
-        context_length = None
-        cfg = profile.get_config_for_version(args.agent_version)
-        needs_ctx = cfg.template and "{context_length}" in cfg.template
-
         if model_id == "default":
-            detected_model, detected_ctx = _detect_running_model(base_url)
-            if detected_model:
-                model_id = detected_model
-            if needs_ctx:
-                context_length = detected_ctx
-        elif needs_ctx:
-            # User specified model — look up *that* model's context window
-            context_length = fetch_context_window(base_url, model_id)
-
-        # Claude Code, Continue and DSH have first-class setup flows. They
-        # preview an exact diff, require consent, back up existing config,
-        # write atomically, and verify the server afterwards. The generic
-        # profile writer below still lacks the diff/consent/backup half, but
-        # it does honour --dry-run, so a preview never writes on either path.
-        if profile.name in {"claude-code", "continue", "deepseek-harness"}:
-            from vllm_mlx.agents.setup import (
-                apply_setup_plan,
-                build_setup_plan,
-                confirm_plan,
-                verify_server,
-            )
-
-            # DSH renders a reasoning-effort control from what we write, so
-            # it needs the model's real capability, not a blanket claim.
-            # Scoped to the one profile that consumes it — the other
-            # first-class flows don't, and this is a second HTTP round trip.
-            supports_reasoning = None
-            if profile.name == "deepseek-harness":
-                from vllm_mlx.agents.adapter import fetch_reasoning_support
-
-                supports_reasoning = fetch_reasoning_support(base_url, model_id)
-
             try:
-                plan = build_setup_plan(
-                    profile.name,
-                    base_url,
-                    model_id,
-                    context_length=context_length,
-                    supports_reasoning=supports_reasoning,
-                )
-            except (OSError, ValueError) as exc:
-                print(f"\n  {profile.display_name} setup failed: {exc}\n")
-                sys.exit(1)
+                import httpx
 
-            print(f"\n  {profile.display_name} configuration: {plan.path}")
-            if plan.changed:
-                print(plan.diff())
-            else:
-                print("  Already configured; no file changes needed.")
-
-            if args.dry_run:
-                print("\n  Dry run only; nothing was written.\n")
-                return
-            if plan.changed and not args.yes and not confirm_plan(plan):
-                print("\n  Setup cancelled; nothing was written.\n")
-                return
-            if plan.changed:
-                try:
-                    apply_setup_plan(plan)
-                except RuntimeError as exc:
-                    print(f"\n  {profile.display_name} setup failed: {exc}\n")
-                    sys.exit(1)
-                print(f"\n  Configured {profile.display_name} at {plan.path}.")
-            if not args.no_check:
-                try:
-                    advertised = verify_server(base_url, model_id)
-                except RuntimeError as exc:
-                    status = (
-                        "Configuration was saved"
-                        if plan.changed
-                        else "Configuration is unchanged"
-                    )
-                    print(f"\n  {status}, but the connection check failed: {exc}\n")
-                    sys.exit(1)
-                print(f"  Connection check passed (model: {advertised}).")
-            print()
-            return
+                resp = httpx.get(f"{base_url}/models", timeout=3)
+                model_id = resp.json()["data"][0]["id"]
+            except Exception:
+                pass
 
         summary = setup_agent_config(
-            profile,
-            base_url,
-            model_id,
-            agent_version=args.agent_version,
-            context_length=context_length,
-            dry_run=args.dry_run,
+            profile, base_url, model_id, agent_version=args.agent_version
         )
-        if summary.startswith("Cannot"):
-            print(f"\n  {profile.display_name} setup failed.")
-            print(f"  {summary}")
-            print()
-            sys.exit(1)
-        if args.dry_run:
-            print(f"\n  {summary}")
-            print("\n  Dry run only; nothing was written.\n")
-            return
         print(f"\n  {profile.display_name} configured!")
         print(f"  {summary}")
         print()
         return
 
     # Default: show setup instructions
-    # Pass "default" to trigger auto-detection of running model + context
+    # Pass "default" to trigger auto-detection of running model
     model_id = args.model or "default"
     instructions = get_setup_instructions(
-        profile,
-        base_url,
-        model_id,
-        agent_version=args.agent_version,
+        profile, base_url, model_id, agent_version=args.agent_version
     )
     print()
     print(instructions)
-    print()
-
-
-def connect_command(args):
-    """Show server connection info and wire up a tool (SSOT-backed).
-
-    Renders from :mod:`vllm_mlx.connect` — the same source the serve
-    lifespan banner uses — so ``ready``/``openai``/``anthropic`` and the
-    machine form can never drift from what a running server prints.
-    """
-    from vllm_mlx.connect import (
-        _parse_base_url,
-        probe_server_alive,
-        render_banner,
-        resolve_endpoints,
-    )
-
-    # ``--base-url`` is the explicit way to pass the *live* server instance
-    # context across process boundaries (#2348): the serve banner advertises
-    # ``connect openai-python --base-url <url>`` pointing at the real server,
-    # and a standalone ``connect`` derives host/port from it instead of falling
-    # back to the localhost:8000 default. Parse the base URL first, then let an
-    # explicit ``--host``/``--port`` override its respective coordinate only
-    # when that flag is actually supplied (independent overrides, codex #2348).
-    host = args.host
-    port = args.port
-    base_url = getattr(args, "base_url", None)
-    if base_url is not None:
-        try:
-            base_host, base_port = _parse_base_url(base_url)
-        except ValueError:
-            print(f"  connect: invalid --base-url: {base_url}")
-            sys.exit(1)
-        if args.host is None:
-            host = base_host
-        if args.port is None:
-            port = base_port
-
-    eps = resolve_endpoints(host=host, port=port, model=args.model)
-
-    # Per-target "how to connect" cheat sheet.
-    if args.target:
-        _connect_target(args, eps)
-        return
-
-    if args.json:
-        print(eps.to_json())
-        return
-
-    # Don't announce "Ready:" for a server that isn't there (#1999): probe the
-    # target first so a stopped server reads as "no server", not "warming up".
-    running = eps.listen_fd is not None or probe_server_alive(eps.host, eps.port)
-    print(render_banner(eps, running=running), end="")
-
-
-def _connect_target(args, eps):
-    """Print the exact command / snippet for ``rapid-mlx connect <target>``.
-
-    The ``claude-code`` / ``continue`` entries point at the first-class safe
-    setup flow (`rapid-mlx agents <agent> --setup`) rather than re-implementing
-    the config writer here — that keeps a single owner for each tool's config
-    shape while ``connect`` stays the one place a user learns "how do I point
-    this tool at the server?"
-    """
-    target = args.target
-
-    if target in {"openai", "openai-python", "python"}:
-        model = eps.model or "<detected-model>"
-        print()
-        print(f"  Python (OpenAI SDK)  →  {eps.openai_url}")
-        print()
-        print("      pip install openai")
-        print()
-        print("      from openai import OpenAI")
-        print(f"      client = OpenAI(base_url={eps.openai_url!r}, api_key='sk-noop')")
-        print("      resp = client.chat.completions.create(")
-        print(f"          model={model!r},")
-        print('          messages=[{"role": "user", "content": "Hello!"}],')
-        print("      )")
-        print()
-        return
-
-    if target in {"claude", "claude-code"}:
-        # The setup command is rendered by ``agents`` via ``--base-url``. All
-        # agents CLIs uniformly accept the OpenAI-style ``/v1`` base URL (the
-        # adapter strips ``/v1`` for Claude's profile), so we always hand it
-        # the OpenAI endpoint — never the bare Anthropic base.
-        _print_point_command(
-            "Claude Code", "agents claude-code --setup", eps.openai_url
-        )
-        return
-    if target in {"continue", "continue-dev"}:
-        _print_point_command("Continue.dev", "agents continue --setup", eps.openai_url)
-        return
-
-    print(f"  Unknown connect target: {args.target}")
-    print("  Supported: claude-code, continue, openai-python")
-    sys.exit(1)
-
-
-def _print_point_command(app: str, setup_verb: str, url: str) -> None:
-    """Print the canonical setup command for a first-class agent target.
-
-    ``setup_verb`` is like ``agents claude-code --setup`` and ``url`` is the
-    endpoint that tool should target (OpenAI-style ``/v1`` base). We append
-    ``--base-url`` so the suggested command carries the requested host/port —
-    otherwise the agent would default to localhost:8000 and write a config
-    that silently points at the wrong server.
-    """
-    print()
-    print(f"  {app}  →  {url}")
-    print()
-    print(f"      rapid-mlx {setup_verb} \\")
-    print(f"        --base-url {shlex.quote(url)}")
-    print()
-    print("  This writes your tool's config to point at the running server")
-    print("  (previews a diff, requires consent, verifies the connection).")
     print()
 
 
@@ -9539,13 +6298,6 @@ def upgrade_command(args):
         # as shell separators. install.sh's pipe is wrapped as ``bash -c``
         # in upgrade_argv, so we still get the pipe semantics it needs.
         result = subprocess.run(info.upgrade_argv, check=False)
-    except FileNotFoundError as exc:
-        missing = exc.filename or info.upgrade_argv[0]
-        print(
-            f"\n  Upgrade command not found: {missing}\n"
-            f"  Reinstall {info.method} or run the command above manually.\n"
-        )
-        sys.exit(1)
     except KeyboardInterrupt:
         print("\n  Interrupted.\n")
         sys.exit(130)
@@ -9574,10 +6326,7 @@ def telemetry_command(args) -> None:
         record_consent,
         reset_state,
     )
-    from vllm_mlx.telemetry.schema import (
-        sample_preview_payload,
-        sample_request_preview_payload,
-    )
+    from vllm_mlx.telemetry.schema import sample_preview_payload
     from vllm_mlx.telemetry.state import client_id_path, consent_path
 
     action = getattr(args, "telemetry_action", None) or "status"
@@ -9626,23 +6375,13 @@ def telemetry_command(args) -> None:
 
     if action == "preview":
         cid = get_or_create_client_id()
-        session_sample = sample_preview_payload(
-            client_id=cid, rapid_mlx_version=rapid_mlx_version
-        )
-        request_sample = sample_request_preview_payload(
+        payload = sample_preview_payload(
             client_id=cid, rapid_mlx_version=rapid_mlx_version
         )
         print()
-        print("  Sample payloads (this is exactly the shape we send):")
+        print("  Sample payload (this is exactly the shape we send):")
         print()
-        print("  session event:")
-        print(json.dumps(session_sample.to_dict(), indent=2))
-        print()
-        print("  request event (per completion, sampled) — only bucketed")
-        print("  numbers + booleans; never prompt or response text. The")
-        print("  output_degenerate flag is computed locally and sent as a")
-        print("  bare true/false (#1250):")
-        print(json.dumps(request_sample.to_dict(), indent=2))
+        print(json.dumps(payload.to_dict(), indent=2))
         print()
         if not is_enabled(cli_no_telemetry=cli_no):
             print("  Telemetry is currently disabled — nothing is actually sent.")
@@ -9650,17 +6389,7 @@ def telemetry_command(args) -> None:
         return
 
     if action == "reset":
-        try:
-            reset_state()
-        except OSError as exc:
-            print()
-            print(f"  Reset incomplete — some files could not be removed: {exc}")
-            print("  Telemetry state may still be present; check ~/.rapid-mlx/.")
-            print()
-            # Non-zero exit so automation (`rapid-mlx telemetry reset` in a
-            # script) sees the failure instead of a false success — state may
-            # still be on disk and telemetry may still be enabled.
-            sys.exit(1)
+        reset_state()
         print()
         print("  Removed consent + client-id files. Next interactive run re-prompts.")
         print()
@@ -9672,117 +6401,13 @@ def telemetry_command(args) -> None:
     sys.exit(1)
 
 
-def _parse_args_with_share_passthrough(
-    parser: argparse.ArgumentParser, raw_argv: list[str]
-) -> argparse.Namespace:
-    """Parse ``raw_argv`` with the fully-registered top-level ``parser``,
-    applying ``share``'s ``--`` end-of-options passthrough split.
-
-    ``rapid-mlx share <model> -- <serve flags…>`` forwards everything after
-    the literal ``--`` verbatim to the ``rapid-mlx serve`` that ``share``
-    spawns (stored on ``args._passthrough``). Splitting on ``--`` up front is
-    what keeps a value-taking serve flag such as
-    ``--speculative-config '{"method":"mtp"}'`` from having its JSON value
-    swallowed by share's required ``model`` positional — the passthrough
-    tokens never reach share's parser, so option/value grouping is preserved
-    exactly as typed. Every other subcommand (and ``share`` with no ``--``)
-    keeps argparse's native behavior, including hard errors on unrecognized
-    flags and native ``--`` end-of-options handling.
-
-    Factored out of ``main`` so tests can drive the real parser + split with
-    representative argv orderings (see tests/test_share_cli.py) — the crux
-    being that ``share`` must not corrupt ``model`` or the passthrough list.
-    """
-    # A ``--`` is only the passthrough separator when it comes AFTER a
-    # COMPLETE ``share <model>`` head. A ``--`` positioned BEFORE the model
-    # (``share -- MODEL``) or before the subcommand (``-- share MODEL``) is
-    # argparse's native end-of-options marker and must keep its native
-    # meaning — splitting there would strip the required positional and break
-    # those valid forms. So we only split when the tokens to the left of the
-    # first ``--`` STRICTLY parse as ``share`` WITH a model.
-    #
-    # ``normal`` invocations (no ``--`` at all — the overwhelming majority)
-    # skip this block entirely and hit the single ``parse_args`` below, so no
-    # converter/action runs twice on the common path.
-    if "--" in raw_argv:
-        import contextlib
-        import io
-
-        sep = raw_argv.index("--")
-        head_argv, passthrough_argv = raw_argv[:sep], raw_argv[sep + 1 :]
-        # Cheap gate before the probe: the passthrough split only ever applies
-        # to ``share``, so only probe when ``share`` is the SELECTED subcommand.
-        # The selected subcommand is the first non-option token in the head —
-        # the top-level parser's only pre-subcommand options (``--version`` /
-        # ``-V`` / ``-h`` / ``--no-telemetry``) are all valueless, so no earlier
-        # token can be an option *value* masquerading as the command. Checking
-        # the command token structurally (rather than ``"share" in head_argv``)
-        # excludes a positional value that merely equals "share" — e.g. a model
-        # named "share" after another subcommand (``serve share …``) — so NO
-        # non-share invocation is ever parsed twice (which would rerun argparse
-        # type converters / custom actions). A ``--`` before the command
-        # (``-- share MODEL``, empty head → ``cmd_token is None``) also skips the
-        # probe and keeps argparse's native end-of-options meaning.
-        cmd_token = next((t for t in head_argv if not t.startswith("-")), None)
-        if cmd_token == "share":
-            # Strict probe: does the head fully resolve to a ``share`` command
-            # with a model? A STRICT ``parse_args`` (not ``parse_known_args``)
-            # means an incomplete head (``share`` alone, i.e. ``share -- MODEL``)
-            # or a typo'd share flag makes the probe exit with a NON-ZERO code —
-            # in which case this ``--`` is NOT a passthrough separator and we
-            # fall through to native parsing. stderr is muted so the probe's
-            # would-be usage error never reaches the user (the fall-through
-            # re-parses and either succeeds or emits the real error itself).
-            #
-            # A ZERO exit is different: the probe already ran a terminal argparse
-            # *action* — ``--help`` / ``--version`` printed to stdout and called
-            # ``parser.exit(0)``. Swallowing that would make the fall-through
-            # parse print the SAME message a second time, so re-raise instead:
-            # the text prints exactly once and the process exits cleanly.
-            probed = None
-            with contextlib.redirect_stderr(io.StringIO()):
-                try:
-                    probed = parser.parse_args(head_argv)
-                except SystemExit as exc:
-                    if exc.code not in (None, 0):
-                        probed = None
-                    else:
-                        raise
-            if (
-                probed is not None
-                and getattr(probed, "command", None) == "share"
-                and getattr(probed, "model", None) is not None
-            ):
-                # Head is a complete share command; the tokens after ``--`` are
-                # verbatim serve-flag passthrough. ``probed`` already holds
-                # share's authoritative parsed args (model + share flags); the
-                # denylist in share.cli then vets the passthrough.
-                probed._passthrough = passthrough_argv
-                return probed
-
-    # Everything else — non-share commands, ``share`` with no passthrough
-    # ``--``, and the ``share -- MODEL`` / ``-- share MODEL`` native forms —
-    # keeps argparse's native behavior, including native ``--`` handling and
-    # hard errors on unrecognized flags.
-    args = parser.parse_args(raw_argv)
-    args._passthrough = []
-    return args
-
-
-def _resolve_cli_version() -> str:
+def main():
     from importlib.metadata import version as pkg_version
 
     try:
-        return pkg_version("rapid-mlx")
+        _version = pkg_version("rapid-mlx")
     except Exception:
-        return "dev"
-
-
-def build_parser() -> argparse.ArgumentParser:
-    """Construct the full CLI parser (extracted from ``main`` so tests
-    can assert effective flag defaults on the parsed namespace instead
-    of scraping source or help text)."""
-    _version = _resolve_cli_version()
+        _version = "dev"
 
     parser = argparse.ArgumentParser(
         description="Rapid-MLX: AI inference for Apple Silicon",
@@ -9806,13 +6431,6 @@ Examples:
         help="Disable anonymous usage telemetry for this run "
         "(equivalent to RAPID_MLX_TELEMETRY=0).",
     )
-    parser.add_argument(
-        "--no-banner",
-        action="store_true",
-        help="Do not print the cheetah launch banner. Top-level only "
-        "(place it before the subcommand, e.g. 'rapid-mlx --no-banner "
-        "serve', like --no-telemetry); equivalent to RAPID_MLX_NO_BANNER=1.",
-    )
     subparsers = parser.add_subparsers(dest="command", help="Commands")
 
     # Serve command. ``allow_abbrev=False`` blocks unique-prefix matches
@@ -9827,7 +6445,7 @@ Examples:
         allow_abbrev=False,
     )
     serve_parser.add_argument(
-        "model", nargs="?", type=str, help="Model to serve"
+        "model", type=str, help="Model to serve"
     ).completer = alias_completer
     serve_parser.add_argument(
         "--served-model-name",
@@ -9842,38 +6460,6 @@ Examples:
             "Skip the pre-flight disk-space check that aborts when the model "
             "is larger than free disk. Use only if you know the HF cache lives "
             "on a different filesystem (e.g. external drive via HF_HOME)."
-        ),
-    )
-    # Disk-streaming MoE weight loading (PRD-rapid-mlx-integration.md).
-    # Strictly opt-in: default behavior for every existing invocation is
-    # unchanged. When set, the model loads lazily (routed-expert weights
-    # never materialized) and vllm_mlx.disk_stream_patch.install() patches
-    # its MoE blocks to stream selected experts off disk through a
-    # byte-budgeted LRU cache instead of holding them resident — lets an
-    # operator run a model whose declared min_memory_gb floor
-    # (_check_alias_min_memory above) exceeds this Mac's RAM. Does NOT
-    # suppress that warning: resident components (attention, KV cache,
-    # dense layers, the cache budget itself) still consume real RAM.
-    serve_parser.add_argument(
-        "--disk-stream",
-        action="store_true",
-        default=False,
-        help=(
-            "Stream MoE routed-expert weights from disk instead of holding "
-            "them resident (opt-in). Loads the model lazily and installs "
-            "vllm_mlx.disk_stream_patch on every MoE layer before serving "
-            "starts. Only architectures registered in vllm_mlx.registry "
-            "are supported; an unregistered model_type fails at load time."
-        ),
-    )
-    serve_parser.add_argument(
-        "--disk-stream-cache-gb",
-        type=positive_finite_float,
-        default=1.0,
-        help=(
-            "Byte budget (GB) for the disk-stream expert LRU cache. Only "
-            "used when --disk-stream is set. Default: 1.0 GB, matching "
-            "vllm_mlx.expert_cache.ExpertCache's default."
         ),
     )
     serve_parser.add_argument(
@@ -9947,17 +6533,7 @@ Examples:
         ),
     )
     serve_parser.add_argument(
-        "--prefill-batch-size",
-        type=int,
-        default=8,
-        help=(
-            "Max prompts prefilled together in one cold wave (default: 8). "
-            "Lower it to cut first-token latency under concurrent cold load — "
-            "requests start decoding sooner instead of all sharing one "
-            "full-wave prefill — at an aggregate-throughput cost on large MoE "
-            "models, where staggered rows carry ragged offsets that push "
-            "batched attention onto a slower path (see #1861)."
-        ),
+        "--prefill-batch-size", type=int, default=8, help="Prefill batch size"
     )
     serve_parser.add_argument(
         "--completion-batch-size", type=int, default=32, help="Completion batch size"
@@ -9993,88 +6569,6 @@ Examples:
         help="Fraction of available RAM for cache if auto-detecting (default: 0.20)",
     )
     serve_parser.add_argument(
-        "--idle-cache-clear-seconds",
-        type=float,
-        default=None,
-        help=(
-            "Clear reusable prefix/KV cache after this many seconds with no "
-            "active requests, preserving loaded model weights. 0 disables; "
-            "default: RAPID_MLX_IDLE_CACHE_CLEAR_SECONDS or disabled."
-        ),
-    )
-    # #1103: bounded trim-free prefix reuse for "non-trimmable" cache entries.
-    # Opt-in: the default 0 keeps the #1075 policy of dropping them at store
-    # time. Two model families produce non-trimmable layers and both benefit:
-    #   * hybrid recurrent-state (GatedDeltaNet / Mamba MoE) — ArraysCache;
-    #   * sliding-window attention (Gemma 4, GPT-OSS) — RotatingKVCache once
-    #     the ring has rotated (offset >= sliding_window → is_trimmable False).
-    # The store gate and the trim-free fetch paths are class-agnostic — they
-    # key off is_trimmable() — so lifting the store drop for N>0 recovers
-    # within-conversation prefix reuse for BOTH families (generalized from
-    # recurrent-state to sliding-window). NOTE: prefix-EXTENSION hits (stable
-    # prefix + new suffix) are served trim-free; an EXACT re-request of a
-    # rotated sliding-window prompt instead full-prefills, because the
-    # scheduler's trim(1) exact-hit compensation is unavailable on a rotated
-    # cache (see Scheduler._resolve_exact_hit_tokens).
-    serve_parser.add_argument(
-        "--hybrid-cache-entries",
-        type=int,
-        default=0,
-        help=(
-            "Retain up to N non-trimmable prefix-cache entries for "
-            "prefix-extension reuse (a stable prefix + a new suffix each turn); "
-            "0 disables (default: 0). Covers both hybrid recurrent-state "
-            "(GatedDeltaNet/Mamba) AND sliding-window (Gemma 4, GPT-OSS) "
-            "models. Best for stable-system-prompt / long-context agent "
-            "workloads. An identical exact re-request of a rotated "
-            "sliding-window prompt falls back to a full prefill (byte-equal to "
-            "cold)."
-        ),
-    )
-    # Operator override for the D-METAL-CAP admission projection. The
-    # auto-derived figure assumes an UNCOMPRESSED fp16 KV cache — see
-    # ``Scheduler._infer_kv_dtype_bytes``, which documents that quantized-KV
-    # deployments are not auto-detected and names this knob as the escape
-    # hatch. It was reachable only from the Python API, so a CLI user running
-    # ``--kv-cache-turboquant`` / ``--kv-cache-quantization`` got an admission
-    # projection that ignored the codec entirely and 503'd long prompts the
-    # codec would have fit. Default 0 preserves auto-derivation exactly.
-    serve_parser.add_argument(
-        "--metal-cap-kv-bytes-per-token",
-        type=non_negative_int,
-        default=0,
-        metavar="BYTES",
-        help=(
-            "Override the per-token KV-cache size the D-METAL-CAP admission "
-            "gate projects, in bytes. 0 (default) auto-derives an "
-            "architecture-aware fp16 figure. Set this when running a "
-            "quantized KV cache (--kv-cache-turboquant / "
-            "--kv-cache-quantization), whose real footprint the auto-derived "
-            "figure over-estimates — an over-estimate only costs you spurious "
-            "503s, but on a memory-tight Mac that is the difference between a "
-            "long prompt being served and being rejected. UNDER-setting it "
-            "risks the OOM cliff the gate exists to prevent: lower it only to "
-            "a value you have measured. Overrides the architecture-aware "
-            "estimator wholesale (sliding-window and recurrent terms included)."
-        ),
-    )
-    # Opt-in prompt-deterministic RESPONSE CACHE (exact-match short-circuit).
-    # Distinct from the prefix/KV cache above: this returns the ENTIRE stored
-    # completion for a completely repeated GREEDY request (temperature==0 or
-    # top_k==1), doing zero GPU decode. Default 0 = fully disabled.
-    serve_parser.add_argument(
-        "--response-cache-entries",
-        type=non_negative_int,
-        default=0,
-        help=(
-            "Retain up to N fully-computed deterministic (greedy) chat "
-            "responses; a completely repeated request returns the stored "
-            "completion verbatim with zero GPU decode. 0 disables (default: 0). "
-            "Only temperature==0 / top_k==1 requests are cached — sampled "
-            "requests are never short-circuited."
-        ),
-    )
-    serve_parser.add_argument(
         "--no-memory-aware-cache",
         action="store_true",
         help="Disable memory-aware cache, use legacy entry-count based cache",
@@ -10096,33 +6590,32 @@ Examples:
         ),
     )
     # KV cache quantization options
-    # ``--kv-cache-dtype`` (R15 task #300) is the canonical knob. Default
-    # is bf16 (#1853): the R15 int4 default was justified by "4×-smaller
-    # KV cuts decode bandwidth proportionally", but the live serve path
-    # (QuantizedBatchKVCache, #1197) implements quantization as
-    # dequant-on-read — it MATERIALIZES full-precision K/V on every
-    # decode step, so per-token cost grows with context instead of
-    # shrinking. Measured on qwen3.5-4b, 16k context, N=2 (parity
-    # server, disk checkpoints off): bf16 134.6 tok/s, int4 98.2
-    # (-27%), int8 86.1 (-36%); at 128-ctx: bf16 167, int4 161,
-    # int8 160. The #910 numbers that motivated the int4 default were
-    # short-context (292-tok prompt), where the regression is invisible.
-    # int4/int8 remain available as explicit opt-ins for
-    # memory-constrained hosts (KV is 4×/2× smaller); ``--reasoning``
-    # still pins to int8.
+    # ``--kv-cache-dtype`` (R15 task #300) is the canonical knob: int4 is
+    # the new default because Apple Silicon decode is memory-bandwidth-
+    # bound and a 4×-smaller KV cache cuts bandwidth proportionally
+    # (mlx#3134 UMA discussion, Feb 2026 — Phi-3.5-mini +1.1%
+    # throughput, 3.2× more context room on Qwen2.5-14B). The
+    # safelist in :mod:`vllm_mlx.kv_cache_dtype` auto-downgrades
+    # sliding-window (Gemma 3, GPT-OSS) and MLA (DeepSeek V3+,
+    # Kimi-K2.5) families to bf16 where int4 breaks decode quality.
+    # ``--reasoning`` pins to int8 for AIME-class hard math where
+    # sub-4-bit drops -20pt on thinking variants.
+    #
+    # Qwen3.5-9B-4bit bench (M3, 292-tok prompt, 5×400-tok decode median):
+    # int4 113.6 tok/s / 119 ms TTFT / 5388 MB RSS vs bf16 113.7 tok/s /
+    # 120 ms TTFT / 5392 MB RSS — int4 is a free swap at this size; the
+    # +1.1 % / 3.2× headroom land at multi-k contexts (PR #910 comment).
     serve_parser.add_argument(
         "--kv-cache-dtype",
         type=str,
-        default="bf16",
+        default="int4",
         choices=["bf16", "int8", "int4"],
         help=(
-            "KV cache dtype (R15 #300, default: bf16). int8/int4 shrink the "
-            "KV cache 2x/4x for memory-constrained hosts, but the live-cache "
-            "dequant-on-read costs O(context) per decode step — measured "
-            "-27%% (int4) / -36%% (int8) at 16k context (#1853). "
-            "Sliding-window (Gemma 3, GPT-OSS) and MLA (DeepSeek V3+, "
-            "Kimi K2.5) models auto-downgrade to bf16. Use --reasoning "
-            "for AIME / hard math."
+            "KV cache dtype (R15 #300, default: int4). Apple Silicon decode "
+            "is memory-bandwidth-bound; int4 yields ~4× less bandwidth per "
+            "decode step with 97-98%% quality retention. Sliding-window "
+            "(Gemma 3, GPT-OSS) and MLA (DeepSeek V3+, Kimi K2.5) models "
+            "auto-downgrade to bf16. Use --reasoning for AIME / hard math."
         ),
     )
     serve_parser.add_argument(
@@ -10206,28 +6699,21 @@ Examples:
         default=32,
         help="Group size for TurboQuant V-side quantization (default: 32)",
     )
-    # R15-P1 (task #296): disk-backed KV checkpointing. 0 (default)
-    # disables the feature entirely (no scheduler-hot-path cost, no
-    # ~/.cache/rapid-mlx/kv_checkpoints/ directory creation). Opt-in
-    # only: each snapshot serializes the full KV cache synchronously on
-    # the decode thread — O(context) per boundary, which degraded 16k
-    # decode by up to 45% when this defaulted to 256 (#1853). When
-    # enabling, use a multiple of 256 to match MLX-LM's KVCache.step and
-    # LMCache's external-chunk size so the on-disk shape aligns with the
-    # in-memory shape on reload.
+    # R15-P1 (task #296): disk-backed KV checkpointing at 256-tok boundaries.
+    # 0 disables the feature entirely (no scheduler-hot-path cost, no
+    # ~/.cache/rapid-mlx/kv_checkpoints/ directory creation); the default
+    # 256 matches MLX-LM's KVCache.step and LMCache's external-chunk size
+    # so the on-disk shape aligns with the in-memory shape on reload.
     serve_parser.add_argument(
         "--kv-disk-checkpoint-interval",
         type=int,
-        default=0,
+        default=256,
         help=(
             "Token interval at which the scheduler snapshots KV state to "
-            "~/.cache/rapid-mlx/kv_checkpoints/ (R15 #296). 0 (default) "
-            "disables. Write-only today: no engine path reloads the "
-            "snapshots yet, and each one blocks decode for O(context) — "
-            "enable only for external tooling that consumes the files "
-            "(#1853). Pairs with the RAPID_MLX_KV_CHECKPOINT_MAX_BYTES "
-            "env var (default 20 GiB) for the oldest-first disk-cap "
-            "eviction policy."
+            "~/.cache/rapid-mlx/kv_checkpoints/ for resume / shared-prefix "
+            "reload (R15 #296, default 256). 0 disables. Pairs with the "
+            "RAPID_MLX_KV_CHECKPOINT_MAX_BYTES env var (default 20 GiB) "
+            "for the oldest-first disk-cap eviction policy."
         ),
     )
     serve_parser.add_argument(
@@ -10243,130 +6729,12 @@ Examples:
         help="Default max tokens for generation (default: 32768)",
     )
     serve_parser.add_argument(
-        "--speculative-config",
-        dest="speculative_config",
-        default=None,
-        help=(
-            "vLLM-style speculative decoding JSON config. This frontend "
-            "parses method/model/num_speculative_tokens now. DFlash "
-            "requires the rapid-mlx[dflash] extra and is available with "
-            '\'{"method":"dflash"}\', DDTree with '
-            '\'{"method":"ddtree"}\', and MTP with '
-            '\'{"method":"mtp","num_speculative_tokens":3,'
-            '"disable_auto_k":false}\'. SuffixDecoding is an explicit, '
-            "workload-specific flag for high prompt/output-overlap traffic "
-            "and is available with "
-            '\'{"method":"suffix","num_speculative_tokens":8}\'.'
-        ),
-    )
-    # Hidden deprecated aliases. They are intentionally absent from help;
-    # normalization folds them into the same SpeculativeConfig path as
-    # --speculative-config so old commands do not revive old implementations.
-    serve_parser.add_argument(
-        "--enable-dflash",
-        action="store_true",
-        default=False,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--enable-ddtree",
-        action="store_true",
-        default=False,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--spec-decode",
-        dest="spec_decode",
-        choices=["none", "dflash", "mtp"],
-        default="none",
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--dflash-drafter-path",
-        default="",
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--enable-mtp",
-        action="store_true",
-        default=False,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--mtp-num-draft-tokens",
-        type=int,
-        default=1,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--mtp-optimistic",
-        action="store_true",
-        default=False,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--mtp-sidecar",
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--mtp-max-k",
-        dest="mtp_max_k",
-        type=int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--mtp-disable-auto-k",
-        action="store_true",
-        default=False,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--suffix-decoding",
-        action="store_true",
-        default=False,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--suffix-max-draft",
-        type=int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--suffix-max-suffix-len",
-        type=int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--suffix-min-confidence",
-        type=float,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
-        "--suffix-min-draft-len",
-        type=int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    # Deprecated no-op flags — accepted-but-ignored for backward compat.
-    # These once controlled removed engine paths (the single BatchedEngine,
-    # legacy KV-bit quant, the --draft-model / --num-draft-tokens speculation
-    # frontend, the --specprefill prototype, and the legacy chunked-prefill
-    # monkey-patch that mlx-lm 0.31+ made unreachable). The implementations are
-    # gone, but the launcher must still PARSE these flags without an argparse
-    # hard-fail so existing user launch scripts (and older docs) keep booting.
-    # They are consumed-and-discarded: stored on ``args`` but never read. Hidden
-    # from --help (argparse.SUPPRESS); slated for removal in a future release.
-    serve_parser.add_argument(
         "--continuous-batching",
         action="store_true",
         default=True,
-        help=argparse.SUPPRESS,
+        help="Enable continuous batching (default: on).",
     )
+    # Deprecated flags — accepted silently to avoid breaking user scripts
     serve_parser.add_argument(
         "--simple-engine",
         action="store_true",
@@ -10391,6 +6759,46 @@ Examples:
         type=str,
         default=None,
         help=argparse.SUPPRESS,
+    )
+    # DFlash — block-diffusion drafter speculative decoding (z-lab / mlx-vlm).
+    # Currently single-user serial mode; runs a dedicated DFlash server that
+    # bypasses BatchedEngine. Eligible aliases declare ``supports_dflash=true``
+    # in aliases.json (dense, ≥8-bit, drafter available — qwen3.5-27b-8bit
+    # is the only validated one today). PoC: 1.83–2.18× on Qwen3.5-27B-8bit.
+    serve_parser.add_argument(
+        "--enable-dflash",
+        action="store_true",
+        default=False,
+        help="Enable DFlash speculative decoding (block-diffusion drafter, "
+        "single-user serial mode). Requires a DFlash-eligible alias "
+        "(see ``rapid-mlx info <alias>``). Loads the drafter from the "
+        "alias's ``dflash_draft_model`` field. Install with "
+        "``pip install 'rapid-mlx[dflash]'``.",
+    )
+    serve_parser.add_argument(
+        "--enable-ddtree",
+        action="store_true",
+        default=False,
+        help="Enable experimental DDTree speculative decoding (DFlash draft "
+        "tree verification, single-user serial mode). Requires a "
+        "DDTree-eligible alias (see ``rapid-mlx info <alias>``) and the "
+        "external dtree-mlx runtime.",
+    )
+    serve_parser.add_argument(
+        "--speculative-config",
+        dest="speculative_config",
+        default=None,
+        help=(
+            "vLLM-style speculative decoding JSON config. This frontend "
+            "parses method/model/num_speculative_tokens now. DFlash is "
+            'available with \'{"method":"dflash"}\', DDTree with '
+            '\'{"method":"ddtree"}\', and MTP with '
+            '\'{"method":"mtp","num_speculative_tokens":3,'
+            '"disable_auto_k":false}\'. SuffixDecoding is an explicit, '
+            "workload-specific flag for high prompt/output-overlap traffic "
+            "and is available with "
+            '\'{"method":"suffix","num_speculative_tokens":8}\'.'
+        ),
     )
     serve_parser.add_argument(
         "--num-draft-tokens",
@@ -10423,37 +6831,12 @@ Examples:
         help=argparse.SUPPRESS,
     )
     serve_parser.add_argument(
-        "--chunked-prefill-tokens",
-        type=int,
-        default=0,
-        help=argparse.SUPPRESS,
-    )
-    serve_parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
         default=0.90,
         help="Fraction of device memory for Metal allocation limit and emergency "
         "cache clear threshold (0.0-1.0, default: 0.90). Increase to 0.95 for "
         "large models (200GB+) that need more memory headroom.",
-    )
-    serve_parser.add_argument(
-        "--resident-memory-limit-gb",
-        type=float,
-        default=0.0,
-        help=(
-            "Process-wide resident model ceiling in GiB. Loading another model "
-            "evicts the least-recently-used idle unpinned model first. 0 disables "
-            "the ceiling (default: 0)."
-        ),
-    )
-    serve_parser.add_argument(
-        "--resident-model-idle-ttl",
-        type=float,
-        default=0.0,
-        help=(
-            "Evict idle unpinned secondary models after this many seconds. "
-            "0 disables idle eviction (default: 0)."
-        ),
     )
     # Paged cache options (experimental)
     serve_parser.add_argument(
@@ -10473,12 +6856,23 @@ Examples:
         default=1000,
         help="Maximum number of cache blocks (default: 1000)",
     )
+    # Chunked prefill
+    serve_parser.add_argument(
+        "--chunked-prefill-tokens",
+        type=int,
+        default=0,
+        help="Max prefill tokens per scheduler step (0=disabled). "
+        "Breaks large prompts into chunks to prevent concurrent requests from starving. "
+        "Recommended for Claude Code and agentic workloads with large tool schemas: "
+        "--chunked-prefill-tokens 2048",
+    )
     # Task #292: opt-in for ``/v1/audio/*`` routes on a text-only server.
     # The audio-mode boot path (``rapid-mlx serve kokoro`` etc.) auto-
     # enables the routes via the registry hit — this flag is the
     # escape hatch for operators who want the audio router mounted
     # alongside a text engine (e.g. side-car deployments that proxy the
-    # audio paths to a separate process).
+    # audio paths to a separate process). Mirrors the ``--enable-mtp``
+    # / ``--enable-dflash`` pattern so the surface stays consistent.
     serve_parser.add_argument(
         "--enable-audio",
         action="store_true",
@@ -10489,43 +6883,135 @@ Examples:
         "(kokoro / whisper / parakeet / chatterbox / vibevoice / voxcpm) "
         "auto-mount the routes — this flag is only needed on text-mode boots.",
     )
+    # MTP (Multi-Token Prediction)
+    serve_parser.add_argument(
+        "--enable-mtp",
+        action="store_true",
+        default=False,
+        help="Enable MTP (Multi-Token Prediction) for models with built-in MTP heads. "
+        "Uses cache snapshot/restore for speculative generation.",
+    )
+    serve_parser.add_argument(
+        "--mtp-num-draft-tokens",
+        type=int,
+        default=1,
+        help="Number of draft tokens per MTP step (default: 1)",
+    )
+    serve_parser.add_argument(
+        "--mtp-optimistic",
+        action="store_true",
+        default=False,
+        help="Skip MTP acceptance check for maximum speed. "
+        "~5-10%% wrong tokens. Best for chat, not for code.",
+    )
+    serve_parser.add_argument(
+        "--mtp-sidecar",
+        dest="mtp_sidecar",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--mtp-max-k",
+        dest="mtp_max_k",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--mtp-disable-auto-k",
+        dest="mtp_disable_auto_k",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    # Compatibility selector kept for older public shorthands.
+    # ``mtp`` is accepted as a deprecated hidden choice and normalized to
+    # ``--speculative-config '{"method":"mtp"}'``. Keep help focused on
+    # the non-deprecated values via ``metavar``.
+    serve_parser.add_argument(
+        "--spec-decode",
+        dest="spec_decode",
+        choices=["none", "dflash", "mtp"],
+        metavar="{none,dflash}",
+        default="none",
+        help=(
+            "Compatibility selector for model-side speculative decode; "
+            "prefer --speculative-config for new usage. "
+            "``none`` (default) disables; ``dflash`` enables the "
+            "block-diffusion drafter from arxiv 2410.04097 (R15-P1 "
+            "#313) for Qwen3.5/3.6 with a bound drafter (default "
+            "block size 16). DFlash validates its model/drafter pair "
+            "at boot so misuse fails loud."
+        ),
+    )
+    # R15-P1 #313: DFlash drafter HF path override. Empty by default
+    # so the side-registry's per-alias binding wins; an operator who
+    # wants to swap the default drafter for a fine-tuned variant can
+    # pass this without editing the registry.
+    serve_parser.add_argument(
+        "--dflash-drafter-path",
+        dest="dflash_drafter_path",
+        default="",
+        help=(
+            "Compatibility override for the per-alias DFlash drafter HF path; "
+            'prefer --speculative-config \'{"method":"dflash","model":...}\'. '
+            "Defaults to the empty string, in which case "
+            "vllm_mlx.spec_decode.dflash.drafter_registry resolves "
+            "the drafter for the loaded alias."
+        ),
+    )
+    # SuffixDecoding — drafter-free spec-decode using a suffix tree over
+    # prompt/generated tokens. This is an explicit workload flag, not a
+    # general accelerator: it can help long high-overlap copy/code-edit/
+    # repeated tool-XML traffic, and can regress ordinary chat / JSONL /
+    # unsupported model families. Pure-attention only.
+    serve_parser.add_argument(
+        "--suffix-decoding",
+        action="store_true",
+        default=False,
+        help="Enable SuffixDecoding spec-decode (drafter-free, statistical). "
+        "Explicit opt-in only: useful for long high-overlap workloads such "
+        "as prompt-copy, code editing, and repeated tool XML on validated "
+        "models. Do not use as a general chat accelerator; GPT-OSS/Qwen "
+        "families have shown regressions in local benches. Auto-disabled "
+        "on hybrid models (Qwen3.5/3.6 A3B/A10B, Granite4, Mamba/Jamba/RWKV).",
+    )
+    serve_parser.add_argument(
+        "--suffix-max-draft",
+        type=int,
+        default=None,
+        help="Max draft tokens per verify step (default: 8). "
+        "Verify forward cost grows linearly with this.",
+    )
+    serve_parser.add_argument(
+        "--suffix-max-suffix-len",
+        type=int,
+        default=None,
+        help="Max k-gram length indexed for suffix matching (default: 4).",
+    )
+    serve_parser.add_argument(
+        "--suffix-min-confidence",
+        type=float,
+        default=None,
+        help="Vote confidence floor for draft truncation (default: 0.3). "
+        "Lower → more optimistic drafts; higher → fewer but more reliable.",
+    )
+    serve_parser.add_argument(
+        "--suffix-min-draft-len",
+        type=int,
+        default=None,
+        help="Skip the verify forward when drafter returns fewer than "
+        "this many tokens (default: 2). Protects free-form chat from "
+        "verify overhead on weak 1-token drafts. Set to 1 to verify "
+        "every draft (more aggressive; can regress chat).",
+    )
     # Prefill step size
     serve_parser.add_argument(
         "--prefill-step-size",
         type=int,
         default=2048,
         help="Chunk size for prompt prefill processing. Larger values use more memory "
-        "but can improve prefill throughput. (default: 2048; bench-verified model "
-        "profiles may recommend a smaller value unless explicitly set)",
-    )
-    serve_parser.add_argument(
-        "--vision-prefill-token-budget",
-        type=positive_int,
-        default=None,
-        help=(
-            "Advanced: maximum prompt tokens per vision-bearing request. "
-            "Defaults to 8192 for automatic profiles; an explicit "
-            "--prefill-step-size preserves the legacy shared limit."
-        ),
-    )
-    serve_parser.add_argument(
-        "--vision-min-pixels",
-        type=non_negative_int,
-        default=0,
-        help=(
-            "Minimum pixels used by dynamic-resolution VLM image processors. "
-            "0 keeps the model default (default: 0)."
-        ),
-    )
-    serve_parser.add_argument(
-        "--vision-max-pixels",
-        type=non_negative_int,
-        default=0,
-        help=(
-            "Maximum pixels used by dynamic-resolution VLM image processors. "
-            "Lower values trade image detail for lower TTFT and memory. "
-            "0 keeps the model default (default: 0)."
-        ),
+        "but can improve prefill throughput. (default: 2048)",
     )
     # MCP options
     serve_parser.add_argument(
@@ -10558,22 +7044,6 @@ Examples:
         help=(
             "Allowed CORS origins (default: * for all origins). "
             "Example: --cors-origins http://localhost:3000 https://myapp.com"
-        ),
-    )
-    serve_parser.add_argument(
-        "--trusted-hosts",
-        type=str,
-        nargs="+",
-        default=None,
-        metavar="HOST",
-        help=(
-            "OPT-IN Host-header allowlist (DNS-rebinding hardening): only "
-            "requests whose Host header matches one of these values are "
-            "accepted; everything else gets 400. Off by default so "
-            "rapid-mlx share and LAN access keep working. Values may be "
-            "space- or comma-separated. Example: --trusted-hosts localhost "
-            "127.0.0.1 (also settable via "
-            "RAPID_MLX_TRUSTED_HOSTS)."
         ),
     )
     serve_parser.add_argument(
@@ -10806,24 +7276,11 @@ Examples:
         default=False,
         help="Auto-pin system prompt in prefix cache to prevent eviction under memory pressure",
     )
-    serve_parser.add_argument(
-        "--relocate-mid-conversation-system",
-        action="store_true",
-        default=False,
-        help=(
-            "Keep a mid-conversation system message at its position (folded "
-            "into the next user turn) instead of hoisting it into the leading "
-            "system block. Preserves the prefix cache for clients that inject "
-            "reminders mid-session (Claude Code); OFF by default because the "
-            "relocated text carries user authority rather than system "
-            "authority."
-        ),
-    )
     # Multimodal option
     serve_parser.add_argument(
         "--mllm",
         action="store_true",
-        help="Force load model as multimodal (vision) even if name doesn't match auto-detection patterns. Also DISABLES the automatic text-only fallback: normally a vision-config checkpoint that ships no usable vision tower auto-degrades to text-only serving (#1187); with --mllm it hard-fails instead so a deliberate demand for the vision lane is never silently downgraded.",
+        help="Force load model as multimodal (vision) even if name doesn't match auto-detection patterns",
     )
     serve_parser.add_argument(
         "--no-mllm",
@@ -10875,6 +7332,33 @@ Examples:
         default=None,
         help="Override default frequency_penalty for all requests (default: use model default)",
     )
+    # Cloud routing options
+    serve_parser.add_argument(
+        "--cloud-model",
+        type=str,
+        default=None,
+        help="Cloud model string for litellm (e.g. 'anthropic/claude-sonnet-4-5-20250929'). "
+        "When set, large-context requests are routed to the cloud provider.",
+    )
+    serve_parser.add_argument(
+        "--cloud-threshold",
+        type=int,
+        default=20000,
+        help="New token threshold to trigger cloud routing (default: 20000). "
+        "Only requests with more new (uncached) tokens than this are routed.",
+    )
+    serve_parser.add_argument(
+        "--cloud-api-base",
+        type=str,
+        default=None,
+        help="Custom API base URL for cloud model (for OpenAI-compatible providers like Zhipu).",
+    )
+    serve_parser.add_argument(
+        "--cloud-api-key",
+        type=str,
+        default=None,
+        help="API key for cloud model (overrides environment variable).",
+    )
     # Embedding model option
     serve_parser.add_argument(
         "--embedding-model",
@@ -10884,37 +7368,6 @@ Examples:
             "Pre-load an embedding model at startup (e.g. "
             "mlx-community/embeddinggemma-300m-6bit). Requires the "
             "[embeddings] extra: pip install 'rapid-mlx[embeddings]'."
-        ),
-    )
-    # Embedding input-length controls (issue #1381). Prevents silent
-    # 512-token truncation: derive a model-aware limit and make overflow
-    # observable / configurable.
-    serve_parser.add_argument(
-        "--embedding-max-length",
-        type=str,
-        default="auto",
-        metavar="TOKENS",
-        help=(
-            "Max input length (tokens) for --embedding-model. 'auto' "
-            "(default) derives it from the model's declared maximum "
-            "(config.max_position_embeddings, else tokenizer.model_max_length); "
-            "or pass a positive integer to set a lower operational ceiling. "
-            "Inputs above the effective limit are handled per "
-            "--embedding-overflow-policy (never truncated silently)."
-        ),
-    )
-    serve_parser.add_argument(
-        "--embedding-overflow-policy",
-        type=str,
-        choices=["truncate", "error"],
-        default="truncate",
-        help=(
-            "How to handle embedding inputs longer than "
-            "--embedding-max-length: 'truncate' (default) discards the tail "
-            "but logs a warning and increments the "
-            "rapid_mlx_embedding_truncations_total metric (never silent); "
-            "'error' rejects the request with a 400 carrying the observed "
-            "and allowed token counts."
         ),
     )
     # Parent-PID watchdog (rapid-desktop issue #449). When set, the
@@ -10953,23 +7406,6 @@ Examples:
             "is larger than free disk. Use only if you know the HF cache lives "
             "on a different filesystem (e.g. external drive via HF_HOME)."
         ),
-    )
-    # Disk-streaming MoE weight loading — same opt-in flags as `serve`,
-    # see the `serve_parser` registration above for the full rationale.
-    bench_parser.add_argument(
-        "--disk-stream",
-        action="store_true",
-        default=False,
-        help=(
-            "Stream MoE routed-expert weights from disk instead of holding "
-            "them resident (opt-in). See `rapid-mlx serve --help`."
-        ),
-    )
-    bench_parser.add_argument(
-        "--disk-stream-cache-gb",
-        type=positive_finite_float,
-        default=1.0,
-        help="Byte budget (GB) for the disk-stream expert LRU cache.",
     )
     bench_parser.add_argument(
         "--num-prompts", type=int, default=10, help="Number of prompts"
@@ -11046,27 +7482,6 @@ Examples:
         default=256,
         help="Minimum tokens for quantization to apply (default: 256)",
     )
-    # #1103 codex BLOCKING-2: the bench path reads args.hybrid_cache_entries
-    # (see the MemoryCacheConfig assembly above) but the flag was only
-    # registered on serve_parser, so `rapid-mlx bench --hybrid-cache-entries N`
-    # was rejected and the getattr fell back to 0. Register it here too, with
-    # the same semantics/default as serve, so bench honors the knob.
-    bench_parser.add_argument(
-        "--hybrid-cache-entries",
-        type=int,
-        default=0,
-        help=(
-            "Retain up to N hybrid (recurrent-state) prefix-cache entries for "
-            "exact/prefix-extension reuse; 0 disables (default: 0). Useful for "
-            "stable-system-prompt agent workloads on GatedDeltaNet/Mamba models."
-        ),
-    )
-    # --response-cache-entries is intentionally NOT registered on the bench
-    # parser. The prompt-deterministic response cache is a chat/serve feature
-    # whose lookup/store logic lives only in the chat route; `rapid-mlx bench`
-    # never consumes it, so exposing the flag here would advertise a no-op
-    # (and wiring bench to the cache would change its measurement semantics).
-    # The flag stays serve-only.
     # Paged cache options (experimental)
     bench_parser.add_argument(
         "--use-paged-cache",
@@ -11092,37 +7507,9 @@ Examples:
         "--submit",
         action="store_true",
         help=(
-            "Run the standardized B=1 community benchmark and submit it to "
-            "the community board at rapidmlx.com. Asks for consent first; "
-            "declining writes and sends nothing. After consent a local copy "
-            "is saved before the upload where the filesystem allows it, so "
-            "a failed send is usually recoverable; if the copy cannot be "
-            "written you are warned before anything is sent. "
-            "Locks every comparability knob; "
-            "ignores the freeform --num-prompts / --max-tokens / "
-            "--max-num-seqs args."
-        ),
-    )
-    bench_parser.add_argument(
-        "--spec-decode",
-        type=str,
-        default="none",
-        choices=["none", "mtp"],
-        help=(
-            "Speculative-decoding arm for --submit. 'none' (default) is the "
-            "baseline. Run the same model twice with a shared --run-group to "
-            "put a same-machine A/B on the board."
-        ),
-    )
-    bench_parser.add_argument(
-        "--run-group",
-        type=str,
-        default=None,
-        metavar="HEX12",
-        help=(
-            "12 hex chars linking the arms of one A/B. The board only reports "
-            "a speedup for two arms that share this AND ran on one machine; "
-            "without it the runs are published as independent rows."
+            "Run the standardized B=1 community benchmark and open a PR to "
+            "community-benchmarks/. Locks every comparability knob; ignores "
+            "the freeform --num-prompts / --max-tokens / --max-num-seqs args."
         ),
     )
     bench_parser.add_argument(
@@ -11202,27 +7589,6 @@ Examples:
         help="Only list models that are downloaded to the local HuggingFace "
         "cache (alias, HF repo, size on disk, last modified).",
     )
-    models_parser.add_argument(
-        "--json",
-        action="store_true",
-        default=False,
-        help="Emit the model list as machine-readable JSON instead of the "
-        "human table (stable keys; pairs with --cached). Prefer this over "
-        "scraping the text columns.",
-    )
-    recipe_parser = subparsers.add_parser(
-        "recipe", help="Recommend the smart and fast models for this Mac"
-    )
-    recipe_parser.add_argument(
-        "--max-ram",
-        type=float,
-        default=None,
-        metavar="GB",
-        help="Use this RAM size instead of auto-detecting the current Mac",
-    )
-    recipe_parser.add_argument(
-        "--json", action="store_true", help="Print the recommendation as JSON"
-    )
     subparsers.add_parser(
         "ls",
         help="List models in the local HuggingFace cache (alias for `models --cached`)",
@@ -11243,37 +7609,12 @@ Examples:
     pull_parser.add_argument(
         "model", help="Model alias (e.g. qwen3.5-4b-4bit) or HF repo (org/name)"
     ).completer = alias_completer
-# #2145: a multi-variant repo ships every quantization side by side as
-    # top-level folders (e.g. LiquidAI/LFM2.5-2.6B-MLX holds 4bit/ 5bit/ 6bit/
-    # 8bit/ mxfp4/...). Without selection, `pull <repo>` fetches ALL of them.
-    # These flags let a constrained Mac fetch only the variant it can serve.
-    # They select the SAME dimension (one variant folder), so --bits and
-    # --format are mutually exclusive — passing both would be ambiguous about
-    # which single variant the caller wants.
-    _variant_group = pull_parser.add_mutually_exclusive_group()
-    _variant_group.add_argument(
-        "--bits",
-        metavar="N",
-        help=(
-            "Pull only the <N>bit variant of a multi-variant repo "
-            "(e.g. --bits 4 fetches only 4bit/; any N the repo ships works)."
-        ),
-    )
-    _variant_group.add_argument(
-        "--format",
-        metavar="name",
-        help=(
-            "Pull only the named format variant of a multi-variant repo "
-            "(e.g. --format mxfp4 or --format gguf, when the repo ships one)."
-        ),
-    )
     pull_parser.add_argument(
         "--dest",
         metavar="DIR",
         help="Download into this directory instead of the HuggingFace cache "
         "(e.g. ~/ai/Models) — the model lands in DIR/<repo-name>, with "
         "resume support and SHA256 verification.",
-    )
     )
     rm_parser = subparsers.add_parser(
         "rm", help="Remove a cached model from the HuggingFace cache"
@@ -11287,34 +7628,12 @@ Examples:
         action="store_true",
         help="Skip the confirmation prompt and remove the model immediately.",
     )
-    alias_parser = subparsers.add_parser(
-        "alias", help="Manage user-owned model aliases"
-    )
-    alias_subparsers = alias_parser.add_subparsers(
-        dest="alias_action", required=True, help="Alias action"
-    )
-    alias_set = alias_subparsers.add_parser("set", help="Create or replace an alias")
-    alias_set.add_argument("name", help="Private alias name")
-    alias_set.add_argument("target", help="Built-in alias or Hugging Face repo id")
-    alias_remove = alias_subparsers.add_parser("remove", help="Remove an alias mapping")
-    alias_remove.add_argument("name", help="Private alias name")
-    alias_subparsers.add_parser("list", help="List user alias mappings")
     subparsers.add_parser("ps", help="List running rapid-mlx servers")
 
     # Upgrade — detect install method and run the right upgrade command
-    # ``update`` is exposed as a subparser alias purely for muscle-memory
-    # parity (``npm update`` / ``brew update`` / ``claude update`` /
-    # ``rustup update`` all spell it "update"); both names route to
-    # ``upgrade_command``. argparse reports the user-typed name on
-    # ``args.command``, so the dispatch below matches both.
     upgrade_parser = subparsers.add_parser(
         "upgrade",
-        aliases=["update"],
         help="Upgrade rapid-mlx to the latest version (brew / pip / install.sh)",
-        description=(
-            "Upgrade rapid-mlx to the latest version.\n\n"
-            "Note: 'rapid-mlx update' is an alias for 'upgrade'."
-        ),
     )
     upgrade_parser.add_argument(
         "-y",
@@ -11352,11 +7671,9 @@ Examples:
     chat_parser.add_argument(
         "model",
         nargs="?",
-        default=None,
+        default="qwen3.5-4b-4bit",
         help="Model alias (e.g. qwen3.5-4b-4bit) or HF repo (org/name). "
-        "When omitted, defaults to the qwen3.5-4b-4bit starter — a "
-        "dogfood-tested, tool-call-reliable model — downloaded once on first "
-        "use. See `vllm_mlx.first_run.select_chat_default`.",
+        "Defaults to qwen3.5-4b-4bit when omitted.",
     ).completer = alias_completer
     chat_parser.add_argument(
         "--system",
@@ -11424,30 +7741,6 @@ Examples:
         default=600,
         help="Seconds to wait for a single assistant response (default: 600)",
     )
-    chat_parser.add_argument(
-        "--mcp-config",
-        type=str,
-        default=None,
-        help="Path to an MCP config file whose tools are available in this chat",
-    )
-    chat_parser.add_argument(
-        "--mcp-max-rounds",
-        type=positive_int,
-        default=8,
-        help=(
-            "Maximum tool-call rounds per turn when --mcp-config is set "
-            "(default: 8). Multi-step tasks may need more."
-        ),
-    )
-    chat_parser.add_argument(
-        "--disable-prefix-cache",
-        action="store_true",
-        help=(
-            "Disable reusable prefix-cache persistence in the server spawned "
-            "by chat, so prompt token IDs are not written to disk. Has no "
-            "effect with --port or --base-url; configure that server directly."
-        ),
-    )
 
     # Info command — show the per-model profile (parsers + capability gates)
     info_parser = subparsers.add_parser(
@@ -11459,6 +7752,39 @@ Examples:
         help="Model alias (e.g. qwen3.5-4b-4bit) or HF repo (e.g. mlx-community/SmolLM3-3B-4bit)",
     ).completer = alias_completer
 
+    # Jlens command — read a model's internal "draft" with the Jacobian lens
+    jlens_parser = subparsers.add_parser(
+        "jlens",
+        help="Read a model's internal thoughts across layers (Jacobian lens)",
+    )
+    jlens_parser.add_argument(
+        "prompt",
+        help='Prompt to trace, e.g. "why is the sky blue"',
+    )
+    jlens_parser.add_argument(
+        "--model",
+        "-m",
+        default="qwen3-1.7b",
+        help="Model alias or HF repo to inspect (default: qwen3-1.7b)",
+    ).completer = alias_completer
+    jlens_parser.add_argument(
+        "--step",
+        type=int,
+        default=2,
+        help="Probe every Nth layer (default: 2; use 1 for full-resolution)",
+    )
+    jlens_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of the rendered view",
+    )
+    jlens_parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Show full per-layer readouts and the answer's rank trajectory",
+    )
+
     # Agents command
     agents_parser = subparsers.add_parser(
         "agents", help="List, configure, and test agent integrations"
@@ -11467,31 +7793,12 @@ Examples:
         "agent_name",
         nargs="?",
         default=None,
-        help=(
-            "Agent name (e.g. codex, opencode, qwen-code, aider; "
-            "continue-dev is accepted for continue). Omit to list all."
-        ),
+        help="Agent name (e.g. codex, opencode, qwen-code, aider). Omit to list all.",
     )
     agents_parser.add_argument(
         "--setup",
         action="store_true",
         help="Auto-configure the agent to point at this server",
-    )
-    agents_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Preview setup changes without writing configuration",
-    )
-    agents_parser.add_argument(
-        "--yes",
-        "-y",
-        action="store_true",
-        help="Apply setup without an interactive confirmation",
-    )
-    agents_parser.add_argument(
-        "--no-check",
-        action="store_true",
-        help="Skip the post-write server health and model check",
     )
     agents_parser.add_argument(
         "--test",
@@ -11515,58 +7822,6 @@ Examples:
         type=str,
         default=None,
         help="Agent version for version-specific config (e.g. 0.8.5)",
-    )
-
-    # Connect command — the single place to learn "the server is up, now
-    # point a tool at it." Renders from the same SSOT as the serve banner
-    # (:mod:`vllm_mlx.connect`) so ``ready``/``openai``/``anthropic`` and the
-    # ``--json`` machine form can never drift from what the server prints.
-    connect_parser = subparsers.add_parser(
-        "connect",
-        help="Show the server's connection info and wire up a tool",
-    )
-    connect_parser.add_argument(
-        "target",
-        nargs="?",
-        default=None,
-        help=(
-            "Tool to set up: claude-code, continue, or openai-python. "
-            "Omit to print the connection banner."
-        ),
-    )
-    connect_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit machine-readable JSON instead of the rendered banner",
-    )
-    connect_parser.add_argument(
-        "--host",
-        type=str,
-        default=None,
-        help="Server host (default: auto-detect or localhost)",
-    )
-    connect_parser.add_argument(
-        "--port",
-        type=_port_arg,
-        default=None,
-        help="Server port 1-65535 (default: auto-detect or 8000)",
-    )
-    connect_parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="Model name to advertise (default: auto-detect from server)",
-    ).completer = alias_completer
-    connect_parser.add_argument(
-        "--base-url",
-        type=str,
-        default=None,
-        help=(
-            "Explicit OpenAI-style base URL of the running server "
-            "(e.g. http://localhost:8123/v1) — the banner's pasted commands "
-            "carry this so the snippet targets the live host/port, not the "
-            "default. Overrides --host/--port only when those are unset."
-        ),
     )
 
     # Doctor command — pure env-health probe (≤5 s, no model load, no server).
@@ -11659,19 +7914,6 @@ Examples:
 
     _register_launch(subparsers)
 
-    return parser
-
-
-def main():
-    parser = build_parser()
-    _version = _resolve_cli_version()
-    # The subcommand help printer below needs the subparsers action;
-    # recover it from the parser rather than keeping it as a shared
-    # local across the build/parse split.
-    subparsers = next(
-        a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
-    )
-
     # Shell tab completion via argcomplete. Must fire before parse_args:
     # when the shell completion handler invokes us with the
     # ``_ARGCOMPLETE`` env var set, this function short-circuits before
@@ -11715,65 +7957,7 @@ def main():
     else:
         argcomplete.autocomplete(parser)
 
-    # Systematic serve-flag passthrough for ``share`` via the standard ``--``
-    # end-of-options separator — see ``_parse_args_with_share_passthrough``.
-    args = _parse_args_with_share_passthrough(parser, sys.argv[1:])
-    # A missing required positional normally makes argparse print the entire
-    # serve help (dozens of expert flags) before its one actionable error.
-    # Keep the positional optional at parse time so this first-run mistake gets
-    # a short recovery path. Explicit ``serve --help`` still exits from
-    # argparse above and retains the complete reference.
-    if getattr(args, "command", None) == "serve" and not args.model:
-        print("rapid-mlx serve: a model is required.", file=sys.stderr)
-        print("  Pick one for this Mac:  rapid-mlx recipe", file=sys.stderr)
-        print(
-            "  Or start a small one:   rapid-mlx serve qwen3.5-4b-4bit",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    if getattr(args, "command", None) in ("chat", "run"):
-        args._model_was_explicit = getattr(args, "model", None) is not None
-
-    # Cheetah launch banner. Interactive only — stdout must be a real
-    # terminal, not a pipe/redirect, and none of the machine-facing opt-outs
-    # may be set. Rationale per cue:
-    #   - stdout.isatty(): the banner is decorative; a script parsing
-    #     ``rapid-mlx`` output (e.g. ``rapid-mlx models | jq`` / a NIX
-    #     wrapper) must see bytes it can depend on. Non-TTY stays byte-clean.
-    #   - --json: ``models/recipe/connect --json`` emit machine-readable
-    #     payloads on stdout; a banner in front would corrupt them.
-    #   - --no-banner / RAPID_MLX_NO_BANNER: explicit user opt-out.
-    #   - NO_COLOR: the art's ROSETTE spots and TEAR marks are painted with
-    #     ANSI; under NO_COLOR we keep the (already monochrome) glyphs but
-    #     drop all escapes — suppressing them entirely would be wrong, since
-    #     the mono cheetah is still legible and tasteful.
-    # ``--help`` / ``--version`` (``-V``) are handled by argparse during
-    # parse and exit before this point, so they stay byte-clean; the
-    # equivalent ``help`` / ``version`` SUBCOMMANDS do reach here, and
-    # ``should_show_banner`` suppresses them by name (see
-    # ``_BYTE_CLEAN_SUBCOMMANDS``) so a ``rapid-mlx version`` contract stays
-    # greppable. Only the bare launcher and machine-facing-clean interactive
-    # subcommands show the banner.
-    try:
-        from vllm_mlx._banner import render_banner, should_show_banner
-
-        _no_banner = getattr(args, "no_banner", False) or (
-            os.environ.get("RAPID_MLX_NO_BANNER", "").strip().lower()
-            in {"1", "true", "yes"}
-        )
-        if should_show_banner(
-            command=getattr(args, "command", None),
-            json_output=getattr(args, "json", False),
-            no_banner=_no_banner,
-            stdout_isatty=sys.stdout.isatty(),
-            stdin_isatty=sys.stdin.isatty(),
-        ):
-            print(render_banner(_version, color="NO_COLOR" not in os.environ))
-            print()
-    except Exception:
-        # The banner is decorative; never let a rendering hiccup block the
-        # user's actual command.
-        pass
+    args = parser.parse_args()
 
     # First-run consent prompt — fires at most once per machine, only on
     # interactive subcommands when stdin is a tty. Safe no-op otherwise.
@@ -11854,28 +8038,6 @@ def main():
         )
 
         _session_flag_names = _telemetry_extract_flag_names(_sys.argv[1:])
-        # #1272 activation-funnel signals, computed HERE (before dispatch)
-        # where the argparse result is available. Both are session metadata,
-        # never content.
-        #   - first_session: claim the one-time local marker. This block is
-        #     already skipped on the ``_just_collected_consent`` run (the
-        #     disclosure promises "nothing from before this prompt"), so the
-        #     marker is claimed on the first RECORDED session -- exactly once
-        #     per client -- not the first-ever binary run. That is the funnel
-        #     semantic we want ("first session we recorded from this new
-        #     client"); see ``mark_first_session`` for the full rationale
-        #     (codex #1273). Runs regardless of telemetry on/off within this
-        #     block so a later opt-in still sees the marker already set.
-        #   - auto_selected: ``chat`` with no positional model (nargs="?"
-        #     default None) is exactly the auto-select-the-starter path
-        #     (see ``first_run.select_chat_default``), so the wizard's
-        #     contribution to activation is attributable.
-        from vllm_mlx.first_run import mark_first_session as _mark_first_session
-
-        _first_session = _mark_first_session()
-        _auto_selected = (
-            _session_subcommand == "chat" and getattr(args, "model", None) is None
-        )
         # Round 19 codex NIT: session_start sees an empty IMMUTABLE
         # snapshot of models_loaded so it does not depend on whether
         # ``emit.session_start()`` eagerly copies its input. The closure-
@@ -11885,8 +8047,6 @@ def main():
             subcommand=_session_subcommand,
             flag_names=_session_flag_names,
             models_loaded=(),
-            first_session=_first_session,
-            auto_selected=_auto_selected,
         )
 
         def _emit_session_end() -> None:
@@ -11952,44 +8112,6 @@ def main():
         # atexit fallback) fires first.
         _telemetry_emit.register_session_end_hook(_emit_session_end)
         _atexit.register(_telemetry_emit.fire_session_end_hook)
-
-    # First-run auto-select: ``chat`` / ``run`` invoked with no model arg.
-    # Resolve the starter alias HERE — before the alias→path resolution below —
-    # so it flows through the normal resolve + download path (and the
-    # ``_original_alias`` banner) exactly as if the user had typed it. Always
-    # the known-good starter, never an arbitrary cached model (which could be a
-    # non-chat checkpoint); the bare-command nameplate lists cached models for
-    # explicit selection instead.
-    if (
-        getattr(args, "command", None) in ("chat", "run")
-        and getattr(args, "model", None) is None
-    ):
-        from vllm_mlx.first_run import FIRST_RUN_MODEL_SIZE, select_chat_default
-
-        _cmd = getattr(args, "command", "chat")
-        _sel_alias, _starter_cached = select_chat_default()
-        args.model = _sel_alias
-        if sys.stdin.isatty() and not (args.base_url or args.port is not None):
-            if _starter_cached:
-                print(
-                    f"  No model specified — using {_sel_alias} (already downloaded)."
-                )
-            else:
-                print(
-                    f"  No model specified — using {_sel_alias} "
-                    f"({FIRST_RUN_MODEL_SIZE}, one-time download)."
-                )
-            print(f"  Browse: rapid-mlx models · Override: rapid-mlx {_cmd} <model>")
-            print()
-        # We intentionally do NOT special-case the download gate for the
-        # auto-selected starter. The starter is a small (~2.5 GB) model, well
-        # under the gate's 10 GiB confirm threshold, so the gate never prompts
-        # for it regardless — deferring to the gate's own authoritative
-        # ``is_repo_cached`` + threshold policy is simpler and safer than a
-        # bypass flag derived from a fail-silent pre-scan. Non-interactive
-        # (CI / pipe): no notice (it is TTY-only); ``main()`` sets the starter
-        # and falls through to the same gate a bare ``rapid-mlx chat`` always
-        # used, so scripted callers are unchanged (no new exit-1 path).
 
     # Resolve model aliases before dispatch.
     #
@@ -12112,16 +8234,7 @@ def main():
     # NOT inherit the bypass. Codex round-2 BLOCKING #2.
     _chat_spawn_child = os.environ.pop("RAPID_MLX_CHAT_SPAWN", "") == "1"
 
-    _GATED_COMMANDS = {"chat", "run", "serve", "pull", "bench"}
-    # Attached client (chat/bench pointed at an existing server via
-    # --base-url/--port): the named model lives remotely and is NOT meant to
-    # be downloaded into the local HF cache, so neither the confirm gate nor
-    # the offline+uncached refusal applies (codex #2357-P1). --port on a
-    # top-level serve means "bind here", not "attach", so only the
-    # client-capable commands are exempted.
-    _attached_remote = getattr(args, "command", None) in {"chat", "run", "bench"} and (
-        getattr(args, "base_url", None) or getattr(args, "port", None) is not None
-    )
+    _GATED_COMMANDS = {"chat", "run", "serve", "pull", "bench", "jlens"}
     if (
         getattr(args, "command", None) in _GATED_COMMANDS
         and hasattr(args, "model")
@@ -12129,7 +8242,6 @@ def main():
         and "/" in args.model  # only HF-style repo ids; local paths skip
         and not os.path.exists(args.model)
         and not _chat_spawn_child
-        and not _attached_remote
     ):
         # Cheap checks first: env override and non-TTY both short-circuit
         # without touching the HF API. ``confirm_or_abort`` re-checks
@@ -12141,64 +8253,32 @@ def main():
         if not _auto_yes and _interactive:
             from vllm_mlx._download_gate import (
                 confirm_or_abort,
-                estimate_download_size_bytes,
+                estimate_repo_size_bytes,
                 is_repo_cached,
             )
 
-            if not is_repo_cached(args.model):
-                # Offline + uncached (#2357): short-circuit BEFORE the size
-                # estimate + ``confirm_or_abort``. ``estimate_repo_size_bytes``
-                # makes a silent HF ``model_info`` round-trip that returns None
-                # under offline mode, which ``confirm_or_abort`` treats as
-                # "about to download … proceed" — so without this, the user
-                # would see a contradictory "About to download / Proceeding
-                # anyway" pair right before the refusal below. Refuse once here,
-                # identically to ``_ensure_model_downloaded``. Scope the refusal
-                # on the SAME runnability predicate (``_cache_entry_is_runnable``)
-                # rather than ``is_repo_cached`` alone: a fully-cached mflux or
-                # split-video checkpoint has no root ``model*.safetensors``, so a
-                # text-only check would wrongly refuse a model that IS cached
-                # (codex #2357-P1). Also skip when a lane-local source makes the
-                # model available offline even with an empty HF cache — Wan's
-                # ``RAPID_MLX_WAN_MODEL_DIR`` override (its own download path
-                # never goes through ``_ensure_model_downloaded``) (codex #2357-P1).
-                # The exemption is scoped to the video-gen lane so a stray env
-                # var can't exempt an unrelated text model from the refusal.
-                _is_wane_exempt = False
-                if os.environ.get("RAPID_MLX_WAN_MODEL_DIR"):
-                    from vllm_mlx.model_aliases import resolve_profile as _rp
+            _dest = getattr(args, "dest", None)
+            if _dest:
+                # Custom --dest (pull only): is_repo_cached only knows
+                # about the default HF cache, so it always says "not
+                # cached" here and re-prompts on every resume. Check
+                # whether a download into THIS destination was already
+                # started instead — if the target dir exists with any
+                # content (complete or still-partial), the user already
+                # confirmed once; don't ask again.
+                _owner, _, _repo = args.model.partition("/")
+                _dest_dir = os.path.join(os.path.expanduser(_dest), _repo)
+                _already_started = os.path.isdir(_dest_dir) and bool(
+                    os.listdir(_dest_dir)
+                )
+            else:
+                _already_started = is_repo_cached(args.model)
 
-                    _rp_entry = _rp(args.model)
-                    _is_wane_exempt = (
-                        _rp_entry is not None
-                        and _rp_entry.modality == "video-gen"
-                        and os.path.isdir(os.environ.get("RAPID_MLX_WAN_MODEL_DIR", ""))
-                    )
-                if (
-                    _offline_hub_mode_active()
-                    and _cache_runnability(args.model) is False
-                    and not _is_wane_exempt
-                ):
-                    _refuse_offline_uncached(args.model)
-                # The size estimate is a silent HF ``model_info`` round-trip
-                # (up to 5s). Cover it with a "Resolving…" spinner so the
-                # first-run cold start doesn't read as a hang here — the same
-                # treatment the download prep gets in ``_ensure_model_
-                # downloaded``. The spinner clears BEFORE ``confirm_or_abort``
-                # so a genuine confirm prompt (large uncached model) lands on a
-                # clean line. We keep the real size-based gate for EVERY model,
-                # including the auto-selected starter: it is an unpinned HF repo
-                # whose declared size we must actually verify, never assume,
-                # before waiving consent.
-                #
-                # ``estimate_download_size_bytes`` (not the raw
-                # ``estimate_repo_size_bytes``) so a catalog model's checked-in
-                # footprint still gates when the Hub can't be reached offline
-                # (issue #2350).
-                _short = args.model.split("/")[-1]
-                with _StatusSpinner(f"Resolving {_short} …"):
-                    _size = estimate_download_size_bytes(args.model)
-                confirm_or_abort(args.model, _size)
+            if not _already_started:
+                confirm_or_abort(
+                    args.model,
+                    estimate_repo_size_bytes(args.model),
+                )
     # --- END B2 --------------------------------------------------------
 
     if args.command == "serve":
@@ -12207,8 +8287,6 @@ def main():
         bench_command(args)
     elif args.command == "models":
         models_command(args)
-    elif args.command == "recipe":
-        recipe_command(args)
     elif args.command == "ls":
         # `ls` is a top-level alias for `models --cached`. Synthesize the
         # missing flag so models_command's branch fires without having to
@@ -12238,14 +8316,9 @@ def main():
         pull_command(args)
     elif args.command == "rm":
         rm_command(args)
-    elif args.command == "alias":
-        alias_command(args)
     elif args.command == "ps":
         ps_command(args)
-    elif args.command in ("upgrade", "update"):
-        # ``update`` is exposed as a subparser alias for muscle-memory
-        # parity; argparse routes via ``aliases=`` but reports the
-        # user-typed name on ``args.command``. Both names land here.
+    elif args.command == "upgrade":
         upgrade_command(args)
     elif args.command in ("chat", "run"):
         # ``run`` is exposed as a subparser alias for Ollama compatibility;
@@ -12254,10 +8327,12 @@ def main():
         chat_command(args)
     elif args.command == "info":
         info_command(args)
+    elif args.command == "jlens":
+        from vllm_mlx.jlens import jlens_command
+
+        jlens_command(args)
     elif args.command == "agents":
         agents_command(args)
-    elif args.command == "connect":
-        connect_command(args)
     elif args.command == "doctor":
         from vllm_mlx.doctor.cli import doctor_command
 
@@ -12272,45 +8347,10 @@ def main():
         from vllm_mlx.launch.cli import launch_command
 
         launch_command(args)
-    elif (
-        getattr(args, "command", None) is None
-        and sys.stdout.isatty()
-        and sys.stdin.isatty()
-    ):
-        # Bare ``rapid-mlx`` in an interactive terminal = a first-run
-        # nameplate (hardware + cached-model hint + "get started" signpost),
-        # not a wall of argparse help. Non-blocking: it prints and exits 0.
-        # Non-interactive invocations (pipe, redirect, CI) fall through to the
-        # unchanged help + exit 1 so scripts parsing ``rapid-mlx`` output are
-        # unaffected. Fail-silent: any nameplate error also falls through.
-        try:
-            from vllm_mlx.first_run import build_nameplate
-
-            print(build_nameplate(_version))
-            sys.exit(0)
-        except SystemExit:
-            raise
-        except Exception:
-            parser.print_help()
-            sys.exit(1)
     else:
         parser.print_help()
         sys.exit(1)
 
 
-def cli_entrypoint() -> None:
-    """Console entry point with normal Unix broken-pipe semantics."""
-    try:
-        main()
-    except BrokenPipeError:
-        # Unix consumers commonly stop reading early (for example,
-        # ``rapid-mlx models | head``).  Treat EPIPE as normal completion
-        # instead of printing a traceback from the CLI entry point.
-        try:
-            sys.stdout.close()
-        finally:
-            sys.exit(0)
-
-
 if __name__ == "__main__":
-    cli_entrypoint()
+    main()
