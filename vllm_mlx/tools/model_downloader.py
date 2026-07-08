@@ -14,6 +14,8 @@ LFS redirects, partial-download resume, and per-file parallelism correctly.
 from __future__ import annotations
 
 import hashlib
+import multiprocessing
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -28,11 +30,44 @@ class ModelDownloadError(Exception):
     pass
 
 
+def _snapshot_download_worker(model_id: str, final_dir: str, max_workers: int, result_queue) -> None:
+    """Runs snapshot_download in its own process so a stalled transfer can
+    be killed outright. ``requests`` (used under the hood) has no default
+    read timeout — a CDN connection that goes silent without a clean close
+    leaves the process blocked in a socket read forever, with nothing to
+    detect "no bytes for N minutes" from inside that same call. A
+    subprocess can be terminated from outside; a stuck thread in this
+    process couldn't be.
+    """
+    try:
+        snapshot_download(repo_id=model_id, local_dir=final_dir, max_workers=max_workers)
+        result_queue.put(("ok", None))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Total size of all files under path, 0 if it doesn't exist yet."""
+    if not path.exists():
+        return 0
+    total = 0
+    for f in path.rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
 class ModelDownloader:
     """Downloads full HuggingFace model repos with resume support and integrity verification."""
 
     MAX_CONCURRENT_DOWNLOADS = 8
     CONNECT_TIMEOUT = 10
+    STALL_MINUTES = 5
+    MAX_STALL_RETRIES = 3
+    STALL_POLL_SECONDS = 15
 
     def __init__(self, cache_dir: Optional[Path | str] = None):
         """
@@ -114,6 +149,67 @@ class ModelDownloader:
 
         return (len(problems) == 0), problems
 
+    def _download_with_stall_watchdog(
+        self,
+        model_id: str,
+        final_dir: Path,
+        show_progress: bool = True,
+    ) -> tuple[bool, Optional[str]]:
+        """Runs snapshot_download in a subprocess, watching final_dir's
+        total size. If it hasn't grown in STALL_MINUTES, the transfer has
+        gone silent (e.g. a CDN connection stuck in CLOSE_WAIT that
+        `requests` never notices, since it has no default read timeout) —
+        kill the subprocess and retry, relying on snapshot_download's own
+        resume support (partial files under .cache/huggingface/download/)
+        to continue rather than start over. Gives up after
+        MAX_STALL_RETRIES stalls in a row.
+        """
+        ctx = multiprocessing.get_context("spawn")
+        stall_seconds = self.STALL_MINUTES * 60
+
+        for attempt in range(1, self.MAX_STALL_RETRIES + 1):
+            result_queue = ctx.Queue()
+            proc = ctx.Process(
+                target=_snapshot_download_worker,
+                args=(model_id, str(final_dir), self.MAX_CONCURRENT_DOWNLOADS, result_queue),
+            )
+            proc.start()
+
+            last_size = _dir_size_bytes(final_dir)
+            last_progress = time.monotonic()
+            stalled = False
+
+            while proc.is_alive():
+                time.sleep(self.STALL_POLL_SECONDS)
+                size = _dir_size_bytes(final_dir)
+                if size > last_size:
+                    last_size = size
+                    last_progress = time.monotonic()
+                elif time.monotonic() - last_progress > stall_seconds:
+                    stalled = True
+                    if show_progress:
+                        print(
+                            f"  No progress for {self.STALL_MINUTES} min — "
+                            f"restarting the transfer (attempt {attempt}/{self.MAX_STALL_RETRIES})..."
+                        )
+                    proc.terminate()
+                    proc.join(timeout=10)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join()
+                    break
+
+            if not stalled:
+                proc.join()
+                if result_queue.empty():
+                    return False, "download process exited without reporting a result"
+                status, err = result_queue.get()
+                return (True, None) if status == "ok" else (False, err)
+            # Stalled: loop retries, snapshot_download resumes the partial
+            # files already on disk instead of starting over.
+
+        return False, f"gave up after {self.MAX_STALL_RETRIES} stalled retries"
+
     def download_model(
         self,
         model_id: str,
@@ -157,16 +253,11 @@ class ModelDownloader:
         if show_progress:
             print(f"Downloading '{model_id}' into {final_dir} ...")
 
-        try:
-            snapshot_download(
-                repo_id=model_id,
-                local_dir=str(final_dir),
-                max_workers=self.MAX_CONCURRENT_DOWNLOADS,
-            )
-        except Exception as e:
-            self.status_manager.set_model_status(model_id, "error", error=str(e))
+        ok, err = self._download_with_stall_watchdog(model_id, final_dir, show_progress=show_progress)
+        if not ok:
+            self.status_manager.set_model_status(model_id, "error", error=err or "download failed")
             if show_progress:
-                print(f"✗ Download failed for '{model_id}': {e}")
+                print(f"✗ Download failed for '{model_id}': {err}")
             return False, None
 
         ok, problems = self._verify_repo_integrity(model_id, final_dir)

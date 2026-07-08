@@ -8257,7 +8257,24 @@ Examples:
                 is_repo_cached,
             )
 
-            if not is_repo_cached(args.model):
+            _dest = getattr(args, "dest", None)
+            if _dest:
+                # Custom --dest (pull only): is_repo_cached only knows
+                # about the default HF cache, so it always says "not
+                # cached" here and re-prompts on every resume. Check
+                # whether a download into THIS destination was already
+                # started instead — if the target dir exists with any
+                # content (complete or still-partial), the user already
+                # confirmed once; don't ask again.
+                _owner, _, _repo = args.model.partition("/")
+                _dest_dir = os.path.join(os.path.expanduser(_dest), _repo)
+                _already_started = os.path.isdir(_dest_dir) and bool(
+                    os.listdir(_dest_dir)
+                )
+            else:
+                _already_started = is_repo_cached(args.model)
+
+            if not _already_started:
                 confirm_or_abort(
                     args.model,
                     estimate_repo_size_bytes(args.model),
