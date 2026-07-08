@@ -48,20 +48,14 @@ Full reference: [`vllm_mlx/alias_resolver.py`](vllm_mlx/alias_resolver.py), test
 
 A parallel-download manager (`vllm_mlx/tools/model_downloader.py` + `model_download_status.py`) that fetches a full HuggingFace model repo (config, tokenizer, weight shards — not just one file) into a target directory, with resume support and SHA256 verification of LFS-tracked files. File transfer itself is delegated to `huggingface_hub.snapshot_download` (already a core dependency) rather than reimplementing HTTP range-request resume logic — `snapshot_download` already does that correctly, including per-file parallelism (default 8 workers).
 
+Wired into the CLI as `rapid-mlx pull <repo> --dest <dir>` — with `--dest`, `pull` uses this downloader (resume + SHA256 verification, lands in `<dir>/<repo-name>`) instead of the default HuggingFace-cache path.
+
 **Full example — download into a folder of your choice, then register it under an alias of your choice:**
 
-```python
-from vllm_mlx.tools.model_downloader import download_model
-
-# 1. Download a model. `dest_dir` can be anywhere — `~` is expanded, and the
-#    model lands in `dest_dir/<repo-name>` (here: ~/my-models/SmolLM2-135M-Instruct-8bit).
-success, path = download_model(
-    "mlx-community/SmolLM2-135M-Instruct-8bit",
-    dest_dir="~/my-models",
-)
-if not success:
-    raise SystemExit("Download failed — see the printed error above")
-print(f"Downloaded to: {path}")
+```bash
+# 1. Download a model. DIR can be anywhere — `~` is expanded, and the
+#    model lands in DIR/<repo-name> (here: ~/my-models/SmolLM2-135M-Instruct-8bit).
+rapid-mlx pull mlx-community/SmolLM2-135M-Instruct-8bit --dest ~/my-models
 ```
 
 ```yaml
@@ -87,11 +81,11 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"smol","messages":[{"role":"user","content":"Say hi in one short sentence."}]}'
 ```
 
-Interrupted downloads resume correctly: `huggingface_hub` tracks partial files under `<dest_dir>/<repo-name>/.cache/huggingface/download/*.incomplete`, and re-running the same `download_model(...)` call skips whatever's already complete and only re-fetches what's missing — verified by killing a download mid-transfer and re-running it, which picked up exactly where it left off and passed the SHA256 check afterward.
+Interrupted downloads resume correctly: `huggingface_hub` tracks partial files under `<dest_dir>/<repo-name>/.cache/huggingface/download/*.incomplete`, and re-running the same `rapid-mlx pull ... --dest ...` call skips whatever's already complete and only re-fetches what's missing — verified twice: once on a small test model, and again on a real 18 GB model (`mlx-community/gemma-4-31b-it-4bit`) interrupted mid-transfer by hand and re-run, which picked up exactly where it left off (already-complete files untouched, only the still-partial shards resumed) rather than starting over.
 
 Verified end-to-end, literally running the three steps above: fresh download to a custom folder, kill-and-resume, register a custom alias with a path override, serve it, and get a real completion back through the API.
 
-It isn't wired into the CLI yet (`rapid-mlx ds4 download ...`-style commands from earlier drafts of this README were aspirational, not implemented) — for now it's a Python API, not a subcommand. There's also an earlier, broken draft of the same idea kept around for reference (`model_download_draft.py`) — not used by anything, not exported, not maintained.
+The same downloader is also available directly from Python for scripting: `from vllm_mlx.tools.model_downloader import download_model; download_model("org/repo", dest_dir="~/my-models")` — `rapid-mlx pull --dest` is a thin CLI wrapper around this same function. There's also an earlier, broken draft of the same idea kept around for reference (`model_download_draft.py`) — not used by anything, not exported, not maintained.
 
 **Bugs found and fixed while verifying this end-to-end** (all pre-existing, not introduced by this session's work):
 - `vllm_mlx/cli.py`'s alias-resolution step in `main()` unconditionally crashed with `NameError` — a call to an unimported `get_resolver()`, plus a dangling reference to an undefined `resolved` variable left over from merging the user-alias feature with upstream's own alias-resolution block. This affected **every** `rapid-mlx serve`/`chat`/`run` invocation, not just this download tooling.

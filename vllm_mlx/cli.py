@@ -4337,14 +4337,34 @@ def _print_pull_summary(repo_id: str, snapshot_dir, elapsed: float) -> None:
 
 
 def pull_command(args):
-    """Download a model to the HuggingFace cache without serving."""
+    """Download a model to the HuggingFace cache without serving.
+
+    With --dest, downloads into that directory instead (e.g. ~/ai/Models,
+    laid out as DIR/<repo-name>) via vllm_mlx.tools.model_downloader —
+    resume support and SHA256 verification, no HF-cache mirror-prefetch
+    path involved since the destination isn't the HF cache.
+    """
     import time
+
+    repo_id = args.model  # already alias-resolved by main()
+
+    dest = getattr(args, "dest", None)
+    if dest:
+        from vllm_mlx.tools.model_downloader import download_model
+
+        print(f"\n  Pulling {repo_id} into {dest} ...")
+        t0 = time.monotonic()
+        success, final_dir = download_model(repo_id, dest_dir=dest)
+        if not success:
+            print(f"\n  Error: download of '{repo_id}' failed — see above.")
+            sys.exit(1)
+        _print_pull_summary(repo_id, final_dir, time.monotonic() - t0)
+        return
 
     from huggingface_hub import snapshot_download
     from huggingface_hub.errors import HFValidationError
     from huggingface_hub.utils import RepositoryNotFoundError
 
-    repo_id = args.model  # already alias-resolved by main()
     t0 = time.monotonic()
 
     # R2-first / HuggingFace-fallback per file. Default mirror is
@@ -7589,6 +7609,13 @@ Examples:
     pull_parser.add_argument(
         "model", help="Model alias (e.g. qwen3.5-4b-4bit) or HF repo (org/name)"
     ).completer = alias_completer
+    pull_parser.add_argument(
+        "--dest",
+        metavar="DIR",
+        help="Download into this directory instead of the HuggingFace cache "
+        "(e.g. ~/ai/Models) — the model lands in DIR/<repo-name>, with "
+        "resume support and SHA256 verification.",
+    )
     rm_parser = subparsers.add_parser(
         "rm", help="Remove a cached model from the HuggingFace cache"
     )
