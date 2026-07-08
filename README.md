@@ -46,7 +46,7 @@ Full reference: [`vllm_mlx/alias_resolver.py`](vllm_mlx/alias_resolver.py), test
 
 ### 3. Model download tooling
 
-A parallel-download manager (`vllm_mlx/tools/model_downloader.py` + `model_download_status.py`) that fetches a full HuggingFace model repo (config, tokenizer, weight shards — not just one file) into a target directory, with resume support and SHA256 verification of LFS-tracked files. File transfer itself is delegated to `huggingface_hub.snapshot_download` (already a core dependency) rather than reimplementing HTTP range-request resume logic — `snapshot_download` already does that correctly, including per-file parallelism (default 8 workers).
+A parallel-download manager (`vllm_mlx/tools/model_downloader.py` + `model_download_status.py`) that fetches a full HuggingFace model repo (config, tokenizer, weight shards — not just one file) into a target directory, with resume support and SHA256 verification of LFS-tracked files. File transfer itself is delegated to `huggingface_hub.snapshot_download` (already a core dependency) rather than reimplementing HTTP range-request resume logic — `snapshot_download` already does that correctly, including per-file parallelism (default 8 workers, configurable — `--workers N` on `rapid-mlx pull --dest`, or `max_workers=` on `download_model()`).
 
 Wired into the CLI as `rapid-mlx pull <repo> --dest <dir>` — with `--dest`, `pull` uses this downloader (resume + SHA256 verification, lands in `<dir>/<repo-name>`) instead of the default HuggingFace-cache path.
 

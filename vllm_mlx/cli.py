@@ -4359,6 +4359,7 @@ def pull_command(args):
             dest_dir=dest,
             stall_minutes=getattr(args, "stall_timeout", None),
             retries=getattr(args, "stall_retries", None),
+            max_workers=getattr(args, "workers", None),
         )
         if not success:
             print(f"\n  Error: download of '{repo_id}' failed — see above.")
@@ -7639,6 +7640,14 @@ Examples:
         "up on a stalled transfer (2 attempts total by default) — a "
         "stall this deep switches to HF_HUB_DISABLE_XET=1 instead of "
         "retrying the same transport again. Default: 1.",
+    )
+    pull_parser.add_argument(
+        "--workers",
+        type=int,
+        metavar="N",
+        default=None,
+        help="With --dest: parallel per-file transfers passed straight to "
+        "snapshot_download. Default: 8.",
     )
     rm_parser = subparsers.add_parser(
         "rm", help="Remove a cached model from the HuggingFace cache"
