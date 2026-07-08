@@ -99,6 +99,155 @@ Verified directly: `mlx-community/Mixtral-8x22B-4bit` (73.9 GiB) stalled at 0 by
 
 Verified end-to-end, literally running the three steps above: fresh download to a custom folder, kill-and-resume, register a custom alias with a path override, serve it, and get a real completion back through the API.
 
+**Real-world model catalog.** Download commands (both forms — `hf download` and `rapid-mlx pull`) for a working set of models actually used alongside this fork, grouped by family. Every repo listed here was verified live before being added (HuggingFace API returns the repo and it contains real `.safetensors` files, not an empty/placeholder repo).
+
+<details>
+<summary>Full list (18 models)</summary>
+
+#### DeepSeek
+
+```bash
+# DeepSeek-R1-Distill-Qwen-32B — 8-bit
+hf download mlx-community/DeepSeek-R1-Distill-Qwen-32B-MLX-8Bit --local-dir ~/ai/Models/DeepSeek-R1-Distill-Qwen-32B-MLX-8Bit --max-workers 1
+rapid-mlx pull mlx-community/DeepSeek-R1-Distill-Qwen-32B-MLX-8Bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+```bash
+# DeepSeek-R1-Distill-Qwen-32B — 4-bit
+hf download mlx-community/DeepSeek-R1-Distill-Qwen-32B-4bit --local-dir ~/ai/Models/DeepSeek-R1-Distill-Qwen-32B-4bit --max-workers 1
+rapid-mlx pull mlx-community/DeepSeek-R1-Distill-Qwen-32B-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+```bash
+# DeepSeek V4 Flash 158B-A13B — 4-bit
+hf download mlx-community/deepseek-ai-DeepSeek-V4-Flash-4bit --local-dir ~/ai/Models/deepseek-ai-DeepSeek-V4-Flash-4bit --max-workers 1
+rapid-mlx pull mlx-community/deepseek-ai-DeepSeek-V4-Flash-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+#### Qwen 3.5
+
+```bash
+# Qwen3.5-27B — 4-bit
+hf download mlx-community/Qwen3.5-27B-4bit --local-dir ~/ai/Models/Qwen3.5-27B-4bit --max-workers 1
+rapid-mlx pull mlx-community/Qwen3.5-27B-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+```bash
+# Qwen3.5-27B Claude-4.6-Opus Distilled — 4-bit
+hf download mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit --local-dir ~/ai/Models/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit --max-workers 1
+rapid-mlx pull mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+#### Qwen 3.6
+
+```bash
+# Qwen3.5-122B-A10B — mxfp4 (MoE)
+hf download mlx-community/Qwen3.5-122B-A10B-mxfp4 --local-dir ~/ai/Models/Qwen3.5-122B-A10B-mxfp4 --max-workers 1
+rapid-mlx pull mlx-community/Qwen3.5-122B-A10B-mxfp4 --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+```bash
+# Qwen3.6-35B-A3B — OptiQ 4-bit
+hf download mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit --local-dir ~/ai/Models/Qwen3.6-35B-A3B-OptiQ-4bit --max-workers 1
+rapid-mlx pull mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+```bash
+# Qwen3.6-40B Claude-like — 8-bit
+hf download mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit --local-dir ~/ai/Models/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit --max-workers 1
+rapid-mlx pull mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+#### Gemma 4
+
+```bash
+# Gemma-4-31B-it — 4-bit
+hf download mlx-community/gemma-4-31b-it-4bit --local-dir ~/ai/Models/gemma-4-31b-it-4bit --max-workers 1
+rapid-mlx pull mlx-community/gemma-4-31b-it-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+```bash
+# Gemma-4-12B-coder — 4-bit
+hf download mlx-community/gemma-4-12b-coder-fable5-composer2.5-4bit --local-dir ~/ai/Models/gemma-4-12b-coder-fable5-composer2.5-4bit --max-workers 1
+rapid-mlx pull mlx-community/gemma-4-12b-coder-fable5-composer2.5-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+```bash
+# Gemma-4-12B-coder — 8-bit
+hf download mlx-community/gemma-4-12b-coder-fable5-composer2.5-8bit --local-dir ~/ai/Models/gemma-4-12b-coder-fable5-composer2.5-8bit --max-workers 1
+rapid-mlx pull mlx-community/gemma-4-12b-coder-fable5-composer2.5-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+#### Devstral
+
+```bash
+hf download mlx-community/Devstral-Samll-2507-bf16 --local-dir ~/ai/Models/Devstral-Samll-2507-bf16 --max-workers 1
+rapid-mlx pull mlx-community/Devstral-Samll-2507-bf16 --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+#### Mistral
+
+```bash
+# Mixtral-8x22B — 4-bit (known to stall on Xet — see above)
+hf download mlx-community/Mixtral-8x22B-4bit --local-dir ~/ai/Models/Mixtral-8x22B-4bit --max-workers 1
+rapid-mlx pull mlx-community/Mixtral-8x22B-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8 --disable-xet
+```
+
+```bash
+hf download mlx-community/Mistral-Large-Instruct-2407-4bit --local-dir ~/ai/Models/Mistral-Large-Instruct-2407-4bit --max-workers 1
+rapid-mlx pull mlx-community/Mistral-Large-Instruct-2407-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+#### Unlimited-OCR (MLX)
+
+```bash
+# Block-float MX FP8 (recommended for quality/performance)
+hf download sahilchachra/unlimited-ocr-mxfp8-mlx --local-dir ~/ai/Models/unlimited-ocr-mxfp8-mlx --max-workers 1
+rapid-mlx pull sahilchachra/unlimited-ocr-mxfp8-mlx --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+#### Additional models
+
+```bash
+# Nemotron-3-Super-120B — 6-bit (~98GB)
+hf download mlx-community/Nemotron-3-Super-120B-A12B-MLX-6bit --local-dir ~/ai/Models/Nemotron-3-Super-120B-A12B-MLX-6bit --max-workers 1
+rapid-mlx pull mlx-community/Nemotron-3-Super-120B-A12B-MLX-6bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+```bash
+# Qwen3-Coder-Next — 8-bit
+hf download mlx-community/Qwen3-Coder-Next-8bit --local-dir ~/ai/Models/Qwen3-Coder-Next-8bit --max-workers 1
+rapid-mlx pull mlx-community/Qwen3-Coder-Next-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+```bash
+# Qwopus3.6-35B-A3B-Coder — 8-bit
+hf download mlx-community/Qwopus3.6-35B-A3B-Coder-8bit --local-dir ~/ai/Models/Qwopus3.6-35B-A3B-Coder-8bit --max-workers 1
+rapid-mlx pull mlx-community/Qwopus3.6-35B-A3B-Coder-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+```bash
+# GLM-5.2 — 4-bit
+hf download mlx-community/GLM-5.2-mxfp4 --local-dir ~/ai/Models/GLM-5.2-mxfp4 --max-workers 1
+rapid-mlx pull mlx-community/GLM-5.2-mxfp4 --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+```bash
+# Ornith-1.0-35B — 8-bit
+hf download mlx-community/Ornith-1.0-35B-8bit --local-dir ~/ai/Models/Ornith-1.0-35B-8bit --max-workers 1
+rapid-mlx pull mlx-community/Ornith-1.0-35B-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+```bash
+# GPT-OSS-120B
+hf download mlx-community/gpt-oss-120b-mxfp4-bf16 --local-dir ~/ai/Models/gpt-oss-120b-mxfp4-bf16 --max-workers 1
+rapid-mlx pull mlx-community/gpt-oss-120b-mxfp4-bf16 --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+```
+
+</details>
+
+Three custom mixed-precision quantizations of DeepSeek-R1-Distill-Qwen-32B (2.6 / 3.4 / 3.6 bits average) are excluded from this list — they were produced locally from an unquantized base rather than downloaded as a single repo, and no verified HuggingFace source exists for them.
+
 The same downloader is also available directly from Python for scripting: `from vllm_mlx.tools.model_downloader import download_model; download_model("org/repo", dest_dir="~/my-models")` — `rapid-mlx pull --dest` is a thin CLI wrapper around this same function. There's also an earlier, broken draft of the same idea kept around for reference (`model_download_draft.py`) — not used by anything, not exported, not maintained.
 
 **Bugs found and fixed while verifying this end-to-end** (all pre-existing, not introduced by this session's work):
