@@ -77,6 +77,26 @@ def _format_size(num_bytes: float) -> str:
     return f"{num_bytes:.1f} TiB"
 
 
+def _env_is_true(name: str) -> bool:
+    return os.environ.get(name, "").strip().upper() in {"1", "TRUE", "YES", "ON"}
+
+
+def _print_status_line(text: str, last_len: int) -> int:
+    """Overwrites the current terminal line instead of stacking a new one
+    each call — used for the heartbeat, which would otherwise print dozens
+    of near-identical lines over a long download."""
+    pad = max(0, last_len - len(text))
+    print("\r" + text + " " * pad, end="", flush=True)
+    return len(text)
+
+
+def _end_status_line(last_len: int) -> None:
+    """Moves past an in-place status line so the next print() starts on
+    its own fresh line instead of overwriting/appending to it."""
+    if last_len:
+        print()
+
+
 class ModelDownloader:
     """Downloads full HuggingFace model repos with resume support and integrity verification."""
 
@@ -86,6 +106,7 @@ class ModelDownloader:
     MAX_STALL_RETRIES = 3
     STALL_POLL_SECONDS = 15
     HEARTBEAT_SECONDS = 30
+    XET_DISABLE_VAR = "HF_HUB_DISABLE_XET"
 
     def __init__(self, cache_dir: Optional[Path | str] = None):
         """
@@ -167,35 +188,37 @@ class ModelDownloader:
 
         return (len(problems) == 0), problems
 
-    def _download_with_stall_watchdog(
+    def _run_stall_attempts(
         self,
         model_id: str,
         final_dir: Path,
-        show_progress: bool = True,
-        stall_minutes: Optional[float] = None,
-        token: Optional[str] = None,
-    ) -> tuple[bool, Optional[str]]:
-        """Runs snapshot_download in a subprocess, watching final_dir's
-        total size. If it hasn't grown in stall_minutes (default
-        STALL_MINUTES), the transfer has gone silent (e.g. a CDN
-        connection stuck in CLOSE_WAIT that `requests` never notices,
-        since it has no default read timeout) — kill the subprocess and
-        retry, relying on snapshot_download's own resume support (partial
-        files under .cache/huggingface/download/) to continue rather than
-        start over. Gives up after MAX_STALL_RETRIES stalls in a row.
+        show_progress: bool,
+        stall_seconds: float,
+        stall_minutes: float,
+        token: Optional[str],
+        max_attempts: int,
+    ) -> tuple[bool, Optional[str], bool]:
+        """Runs up to max_attempts download attempts, restarting the
+        subprocess whenever final_dir's total size hasn't grown in
+        stall_seconds (a CDN connection stuck in CLOSE_WAIT that `requests`
+        never notices, since it has no default read timeout — the process
+        would otherwise block in a socket read forever).
 
-        Also prints a heartbeat every HEARTBEAT_SECONDS regardless of
-        whether anything stalled — snapshot_download goes quiet for a
-        while up front verifying already-downloaded partial files before
-        resuming the transfer, and that quiet phase has no progress
-        signal of its own to show. The heartbeat is our own, independent
-        of whatever huggingface_hub's tqdm bars are doing.
+        Prints a heartbeat every HEARTBEAT_SECONDS regardless of whether
+        anything stalled — snapshot_download goes quiet for a while up
+        front verifying already-downloaded partial files before resuming,
+        and that quiet phase has no progress signal of its own. Both the
+        heartbeat and the huggingface_hub tqdm bar it would otherwise race
+        against on the same terminal line are handled by the caller.
+
+        Returns (ok, err, all_attempts_stalled) — the third value is True
+        only when every attempt stalled out (as opposed to a real error
+        like a bad token), since that's the only case where switching
+        transport (Xet on/off) has any chance of helping.
         """
         ctx = multiprocessing.get_context("spawn")
-        stall_minutes = stall_minutes if stall_minutes is not None else self.STALL_MINUTES
-        stall_seconds = stall_minutes * 60
 
-        for attempt in range(1, self.MAX_STALL_RETRIES + 1):
+        for attempt in range(1, max_attempts + 1):
             result_queue = ctx.Queue()
             proc = ctx.Process(
                 target=_snapshot_download_worker,
@@ -207,6 +230,7 @@ class ModelDownloader:
             last_size = _dir_size_bytes(final_dir)
             last_progress = start_time
             last_heartbeat = start_time
+            last_line_len = 0
             stalled = False
 
             while proc.is_alive():
@@ -219,9 +243,10 @@ class ModelDownloader:
                 elif now - last_progress > stall_seconds:
                     stalled = True
                     if show_progress:
+                        _end_status_line(last_line_len)
                         print(
                             f"  Stalled: no progress for {stall_minutes:g} min — "
-                            f"restarting the transfer (attempt {attempt}/{self.MAX_STALL_RETRIES})..."
+                            f"restarting the transfer (attempt {attempt}/{max_attempts})..."
                         )
                     proc.terminate()
                     proc.join(timeout=10)
@@ -231,19 +256,73 @@ class ModelDownloader:
                     break
 
                 if show_progress and now - last_heartbeat >= self.HEARTBEAT_SECONDS:
-                    print(f"  ... {_format_size(size)} on disk, {now - start_time:.0f}s elapsed")
+                    last_line_len = _print_status_line(
+                        f"  ... {_format_size(size)} on disk, {now - start_time:.0f}s elapsed", last_line_len
+                    )
                     last_heartbeat = now
 
             if not stalled:
+                if show_progress:
+                    _end_status_line(last_line_len)
                 proc.join()
                 if result_queue.empty():
-                    return False, "download process exited without reporting a result"
+                    return False, "download process exited without reporting a result", False
                 status, err = result_queue.get()
-                return (True, None) if status == "ok" else (False, err)
+                return (True, None, False) if status == "ok" else (False, err, False)
             # Stalled: loop retries, snapshot_download resumes the partial
             # files already on disk instead of starting over.
 
-        return False, f"gave up after {self.MAX_STALL_RETRIES} stalled retries"
+        return False, f"gave up after {max_attempts} stalled retries", True
+
+    def _download_with_stall_watchdog(
+        self,
+        model_id: str,
+        final_dir: Path,
+        show_progress: bool = True,
+        stall_minutes: Optional[float] = None,
+        token: Optional[str] = None,
+    ) -> tuple[bool, Optional[str]]:
+        """Runs the download, retrying stalls, and escalating once if every
+        retry in a row stalls out.
+
+        Stalling on *every* attempt (as opposed to one transient blip) is
+        the signature of HuggingFace's Xet transfer backend being broken
+        or blocked — observed directly: huggingface_hub's own transfer
+        progress (not just our polling) sits at 0 bytes for the entire
+        stall window, identically on every retry, while huggingface.co
+        itself is reachable fine. No amount of retrying the same transport
+        fixes that. So after MAX_STALL_RETRIES straight stalls, if Xet
+        isn't already disabled, switch to the classic HTTP/LFS path
+        (HF_HUB_DISABLE_XET=1) and run one more fresh set of attempts
+        before giving up for good.
+        """
+        # huggingface_hub's own tqdm bar and our heartbeat below both write
+        # to the same terminal line independently — left enabled, they
+        # interleave into garbled output. Ours is the one meant to survive
+        # subprocess restarts, so it's the one that stays.
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+        stall_minutes = stall_minutes if stall_minutes is not None else self.STALL_MINUTES
+        stall_seconds = stall_minutes * 60
+
+        ok, err, all_stalled = self._run_stall_attempts(
+            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, self.MAX_STALL_RETRIES
+        )
+        if ok or not all_stalled or _env_is_true(self.XET_DISABLE_VAR):
+            return ok, err
+
+        if show_progress:
+            print(
+                f"  Still stalled after {self.MAX_STALL_RETRIES} tries — this looks like HuggingFace's Xet "
+                f"transfer backend, not a slow connection. Switching to the classic HTTP/LFS transfer "
+                f"({self.XET_DISABLE_VAR}=1) and trying again..."
+            )
+        os.environ[self.XET_DISABLE_VAR] = "1"
+
+        ok, err, _ = self._run_stall_attempts(
+            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, self.MAX_STALL_RETRIES
+        )
+        return ok, err
 
     def download_model(
         self,
