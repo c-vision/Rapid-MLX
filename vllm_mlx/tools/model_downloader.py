@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import multiprocessing
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -30,7 +31,15 @@ class ModelDownloadError(Exception):
     pass
 
 
-def _snapshot_download_worker(model_id: str, final_dir: str, max_workers: int, result_queue) -> None:
+def _masked_token(token: str) -> str:
+    """Last 4 chars only — enough to confirm "yes, this is my token" without
+    printing the whole secret to a terminal or log file."""
+    return f"...{token[-4:]}" if len(token) > 4 else "...(short token)"
+
+
+def _snapshot_download_worker(
+    model_id: str, final_dir: str, max_workers: int, token: Optional[str], result_queue
+) -> None:
     """Runs snapshot_download in its own process so a stalled transfer can
     be killed outright. ``requests`` (used under the hood) has no default
     read timeout — a CDN connection that goes silent without a clean close
@@ -40,7 +49,7 @@ def _snapshot_download_worker(model_id: str, final_dir: str, max_workers: int, r
     process couldn't be.
     """
     try:
-        snapshot_download(repo_id=model_id, local_dir=final_dir, max_workers=max_workers)
+        snapshot_download(repo_id=model_id, local_dir=final_dir, max_workers=max_workers, token=token)
         result_queue.put(("ok", None))
     except Exception as e:
         result_queue.put(("error", str(e)))
@@ -154,24 +163,27 @@ class ModelDownloader:
         model_id: str,
         final_dir: Path,
         show_progress: bool = True,
+        stall_minutes: Optional[float] = None,
+        token: Optional[str] = None,
     ) -> tuple[bool, Optional[str]]:
         """Runs snapshot_download in a subprocess, watching final_dir's
-        total size. If it hasn't grown in STALL_MINUTES, the transfer has
-        gone silent (e.g. a CDN connection stuck in CLOSE_WAIT that
-        `requests` never notices, since it has no default read timeout) —
-        kill the subprocess and retry, relying on snapshot_download's own
-        resume support (partial files under .cache/huggingface/download/)
-        to continue rather than start over. Gives up after
-        MAX_STALL_RETRIES stalls in a row.
+        total size. If it hasn't grown in stall_minutes (default
+        STALL_MINUTES), the transfer has gone silent (e.g. a CDN
+        connection stuck in CLOSE_WAIT that `requests` never notices,
+        since it has no default read timeout) — kill the subprocess and
+        retry, relying on snapshot_download's own resume support (partial
+        files under .cache/huggingface/download/) to continue rather than
+        start over. Gives up after MAX_STALL_RETRIES stalls in a row.
         """
         ctx = multiprocessing.get_context("spawn")
-        stall_seconds = self.STALL_MINUTES * 60
+        stall_minutes = stall_minutes if stall_minutes is not None else self.STALL_MINUTES
+        stall_seconds = stall_minutes * 60
 
         for attempt in range(1, self.MAX_STALL_RETRIES + 1):
             result_queue = ctx.Queue()
             proc = ctx.Process(
                 target=_snapshot_download_worker,
-                args=(model_id, str(final_dir), self.MAX_CONCURRENT_DOWNLOADS, result_queue),
+                args=(model_id, str(final_dir), self.MAX_CONCURRENT_DOWNLOADS, token, result_queue),
             )
             proc.start()
 
@@ -189,7 +201,7 @@ class ModelDownloader:
                     stalled = True
                     if show_progress:
                         print(
-                            f"  No progress for {self.STALL_MINUTES} min — "
+                            f"  Stalled: no progress for {stall_minutes:g} min — "
                             f"restarting the transfer (attempt {attempt}/{self.MAX_STALL_RETRIES})..."
                         )
                     proc.terminate()
@@ -215,6 +227,7 @@ class ModelDownloader:
         model_id: str,
         dest_dir: Optional[Path | str] = None,
         show_progress: bool = True,
+        stall_minutes: Optional[float] = None,
     ) -> tuple[bool, Optional[str]]:
         """
         Download a full model repo, with resume support and SHA256
@@ -227,6 +240,9 @@ class ModelDownloader:
                 out under e.g. ~/ai/Models). Defaults to this downloader's
                 cache_dir if not given.
             show_progress: Whether to print progress/status messages.
+            stall_minutes: Minutes without progress before the transfer is
+                considered stalled and restarted. Defaults to STALL_MINUTES
+                (5) if not given.
 
         Returns:
             Tuple of (success, final directory path or None on failure).
@@ -249,11 +265,20 @@ class ModelDownloader:
                 print(f"✓ Model '{model_id}' already downloaded: {status['path']}")
             return True, status["path"]
 
+        token = os.environ.get("HF_TOKEN")
+        if show_progress:
+            if token:
+                print(f"  Using HF_TOKEN from environment ({_masked_token(token)})")
+            else:
+                print("  No HF_TOKEN found in environment — downloading unauthenticated (slower, stricter rate limits).")
+
         self.status_manager.set_model_status(model_id, "downloading")
         if show_progress:
             print(f"Downloading '{model_id}' into {final_dir} ...")
 
-        ok, err = self._download_with_stall_watchdog(model_id, final_dir, show_progress=show_progress)
+        ok, err = self._download_with_stall_watchdog(
+            model_id, final_dir, show_progress=show_progress, stall_minutes=stall_minutes, token=token
+        )
         if not ok:
             self.status_manager.set_model_status(model_id, "error", error=err or "download failed")
             if show_progress:
@@ -280,6 +305,7 @@ def download_model(
     model_id: str,
     dest_dir: Optional[Path | str] = None,
     show_progress: bool = True,
+    stall_minutes: Optional[float] = None,
 ) -> tuple[bool, Optional[str]]:
     """
     Convenience function to download a model.
@@ -289,9 +315,13 @@ def download_model(
         dest_dir: Parent directory to download into (model lands in
             dest_dir/<repo-name>). Defaults to the downloader's cache dir.
         show_progress: Whether to show progress messages.
+        stall_minutes: Minutes without progress before restarting the
+            transfer. Defaults to ModelDownloader.STALL_MINUTES (5).
 
     Returns:
         Tuple of (success: bool, final directory path or None on failure)
     """
     downloader = ModelDownloader()
-    return downloader.download_model(model_id, dest_dir=dest_dir, show_progress=show_progress)
+    return downloader.download_model(
+        model_id, dest_dir=dest_dir, show_progress=show_progress, stall_minutes=stall_minutes
+    )

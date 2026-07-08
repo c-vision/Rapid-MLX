@@ -4354,7 +4354,9 @@ def pull_command(args):
 
         print(f"\n  Pulling {repo_id} into {dest} ...")
         t0 = time.monotonic()
-        success, final_dir = download_model(repo_id, dest_dir=dest)
+        success, final_dir = download_model(
+            repo_id, dest_dir=dest, stall_minutes=getattr(args, "stall_timeout", None)
+        )
         if not success:
             print(f"\n  Error: download of '{repo_id}' failed — see above.")
             sys.exit(1)
@@ -7615,6 +7617,15 @@ Examples:
         help="Download into this directory instead of the HuggingFace cache "
         "(e.g. ~/ai/Models) — the model lands in DIR/<repo-name>, with "
         "resume support and SHA256 verification.",
+    )
+    pull_parser.add_argument(
+        "--stall-timeout",
+        type=float,
+        metavar="MINUTES",
+        default=None,
+        help="With --dest: minutes without progress before the transfer is "
+        "considered stalled and restarted (resumes, doesn't start over). "
+        "Default: 5.",
     )
     rm_parser = subparsers.add_parser(
         "rm", help="Remove a cached model from the HuggingFace cache"
