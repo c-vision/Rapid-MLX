@@ -294,6 +294,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         token: Optional[str] = None,
         retries: Optional[int] = None,
         max_workers: Optional[int] = None,
+        disable_xet: bool = False,
     ) -> tuple[bool, Optional[str]]:
         """Runs the download, retrying stalls, and escalating once if every
         attempt in a row stalls out.
@@ -309,6 +310,11 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         (HF_HUB_DISABLE_XET=1) and run one more fresh set of attempts
         before giving up for good.
 
+        `disable_xet=True` skips straight to the classic path from the
+        first attempt — worth setting once a repo is *known* to stall on
+        Xet (e.g. a previous run already escalated), so the wait to
+        rediscover that isn't repeated every time.
+
         `retries` is retries *beyond* the first attempt (default
         STALL_RETRIES = 1, i.e. 2 attempts total per phase) — a stalled
         transfer this deep is already a strong signal something structural
@@ -321,6 +327,14 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         # interleave into garbled output. Ours is the one meant to survive
         # subprocess restarts, so it's the one that stays.
         os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+        if disable_xet:
+            # Known-bad Xet transport for this repo — skip the first phase
+            # outright instead of waiting to rediscover the same stall.
+            # The check below already treats an already-disabled Xet as
+            # "nothing left to fall back to", so this naturally collapses
+            # to a single phase — the escalation path itself is untouched.
+            os.environ[self.XET_DISABLE_VAR] = "1"
 
         stall_minutes = stall_minutes if stall_minutes is not None else self.STALL_MINUTES
         stall_seconds = stall_minutes * 60
@@ -354,6 +368,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         stall_minutes: Optional[float] = None,
         retries: Optional[int] = None,
         max_workers: Optional[int] = None,
+        disable_xet: bool = False,
     ) -> tuple[bool, Optional[str]]:
         """
         Download a full model repo, with resume support and SHA256
@@ -375,6 +390,11 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
             max_workers: Parallel per-file transfers passed straight to
                 `snapshot_download`. Defaults to MAX_CONCURRENT_DOWNLOADS
                 (8) if not given.
+            disable_xet: Skip the Xet transport entirely and start straight
+                on the classic HTTP/LFS path — worth setting once a repo is
+                known to stall on Xet, to skip the wasted wait to
+                rediscover that. Default: False (still auto-escalates if
+                Xet turns out to be broken, same as always).
 
         Returns:
             Tuple of (success, final directory path or None on failure).
@@ -416,6 +436,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
             token=token,
             retries=retries,
             max_workers=max_workers,
+            disable_xet=disable_xet,
         )
         if not ok:
             self.status_manager.set_model_status(model_id, "error", error=err or "download failed")
@@ -446,6 +467,7 @@ def download_model(
     stall_minutes: Optional[float] = None,
     retries: Optional[int] = None,
     max_workers: Optional[int] = None,
+    disable_xet: bool = False,
 ) -> tuple[bool, Optional[str]]:
     """
     Convenience function to download a model.
@@ -461,6 +483,9 @@ def download_model(
             phase. Defaults to ModelDownloader.STALL_RETRIES (1).
         max_workers: Parallel per-file transfers. Defaults to
             ModelDownloader.MAX_CONCURRENT_DOWNLOADS (8).
+        disable_xet: Skip Xet and start on the classic HTTP/LFS path —
+            worth setting once a repo is known to stall on Xet. Default:
+            False (still auto-escalates if Xet turns out to be broken).
 
     Returns:
         Tuple of (success: bool, final directory path or None on failure)
@@ -473,4 +498,5 @@ def download_model(
         stall_minutes=stall_minutes,
         retries=retries,
         max_workers=max_workers,
+        disable_xet=disable_xet,
     )
