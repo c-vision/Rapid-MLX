@@ -104,7 +104,7 @@ class ModelDownloader:
     CONNECT_TIMEOUT = 10
     STALL_MINUTES = 5
     MAX_STALL_RETRIES = 3
-    STALL_POLL_SECONDS = 15
+    STALL_POLL_SECONDS = 2
     XET_DISABLE_VAR = "HF_HUB_DISABLE_XET"
 
     def __init__(self, cache_dir: Optional[Path | str] = None):
