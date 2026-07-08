@@ -220,8 +220,6 @@ rapid-mlx pull mlx-community/Ornith-1.0-35B-8bit --dest ~/ai/Models --stall-time
 rapid-mlx pull mlx-community/gpt-oss-120b-mxfp4-bf16 --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
 ```
 
-Three custom mixed-precision quantizations of DeepSeek-R1-Distill-Qwen-32B (2.6 / 3.4 / 3.6 bits average) are excluded from this list — they were produced locally from an unquantized base rather than downloaded as a single repo, and no verified HuggingFace source exists for them.
-
 The same downloader is also available directly from Python for scripting: `from vllm_mlx.tools.model_downloader import download_model; download_model("org/repo", dest_dir="~/my-models")` — `rapid-mlx pull --dest` is a thin CLI wrapper around this same function. There's also an earlier, broken draft of the same idea kept around for reference (`model_download_draft.py`) — not used by anything, not exported, not maintained.
 
 **Bugs found and fixed while verifying this end-to-end** (all pre-existing, not introduced by this session's work):
