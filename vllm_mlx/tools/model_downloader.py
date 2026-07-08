@@ -69,6 +69,14 @@ def _dir_size_bytes(path: Path) -> int:
     return total
 
 
+def _format_size(num_bytes: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if num_bytes < 1024:
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024
+    return f"{num_bytes:.1f} TiB"
+
+
 class ModelDownloader:
     """Downloads full HuggingFace model repos with resume support and integrity verification."""
 
@@ -77,6 +85,7 @@ class ModelDownloader:
     STALL_MINUTES = 5
     MAX_STALL_RETRIES = 3
     STALL_POLL_SECONDS = 15
+    HEARTBEAT_SECONDS = 30
 
     def __init__(self, cache_dir: Optional[Path | str] = None):
         """
@@ -174,6 +183,13 @@ class ModelDownloader:
         retry, relying on snapshot_download's own resume support (partial
         files under .cache/huggingface/download/) to continue rather than
         start over. Gives up after MAX_STALL_RETRIES stalls in a row.
+
+        Also prints a heartbeat every HEARTBEAT_SECONDS regardless of
+        whether anything stalled — snapshot_download goes quiet for a
+        while up front verifying already-downloaded partial files before
+        resuming the transfer, and that quiet phase has no progress
+        signal of its own to show. The heartbeat is our own, independent
+        of whatever huggingface_hub's tqdm bars are doing.
         """
         ctx = multiprocessing.get_context("spawn")
         stall_minutes = stall_minutes if stall_minutes is not None else self.STALL_MINUTES
@@ -187,17 +203,20 @@ class ModelDownloader:
             )
             proc.start()
 
+            start_time = time.monotonic()
             last_size = _dir_size_bytes(final_dir)
-            last_progress = time.monotonic()
+            last_progress = start_time
+            last_heartbeat = start_time
             stalled = False
 
             while proc.is_alive():
                 time.sleep(self.STALL_POLL_SECONDS)
                 size = _dir_size_bytes(final_dir)
+                now = time.monotonic()
                 if size > last_size:
                     last_size = size
-                    last_progress = time.monotonic()
-                elif time.monotonic() - last_progress > stall_seconds:
+                    last_progress = now
+                elif now - last_progress > stall_seconds:
                     stalled = True
                     if show_progress:
                         print(
@@ -210,6 +229,10 @@ class ModelDownloader:
                         proc.kill()
                         proc.join()
                     break
+
+                if show_progress and now - last_heartbeat >= self.HEARTBEAT_SECONDS:
+                    print(f"  ... {_format_size(size)} on disk, {now - start_time:.0f}s elapsed")
+                    last_heartbeat = now
 
             if not stalled:
                 proc.join()
