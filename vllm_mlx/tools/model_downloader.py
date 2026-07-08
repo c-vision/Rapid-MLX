@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import multiprocessing
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -56,18 +57,45 @@ def _snapshot_download_worker(
         result_queue.put(("error", str(e)))
 
 
+# huggingface_hub names a resumable partial download
+# "<b64-ish-id>.<sha256>.<8-hex-attempt-id>.incomplete" — and mints a *new*
+# 8-hex attempt id (rather than continuing the old file) whenever a
+# connection reset forces a fresh Range request. On a repo that stalls
+# repeatedly (observed directly: 8 of 14 in-flight shards had duplicate
+# `.incomplete` files after several CDN resets, wasting 15+ GiB), the old
+# ones are simply abandoned on disk, never deleted. Summing every file
+# blindly double/triple-counts the same logical shard's dead attempts,
+# inflating "bytes on disk" past the real repo total.
+_INCOMPLETE_ATTEMPT_SUFFIX = re.compile(r"\.[0-9a-f]{8}\.incomplete$")
+
+
 def _dir_size_bytes(path: Path) -> int:
-    """Total size of all files under path, 0 if it doesn't exist yet."""
+    """Total size of all files under path, 0 if it doesn't exist yet.
+
+    Dedupes abandoned `.incomplete` retry files (see
+    ``_INCOMPLETE_ATTEMPT_SUFFIX``): multiple partials for the same
+    logical shard count once, at the size of the largest (furthest-
+    progressed) attempt, instead of summing every dead one too.
+    """
     if not path.exists():
         return 0
     total = 0
+    incomplete_max: dict[str, int] = {}
     for f in path.rglob("*"):
         try:
-            if f.is_file():
-                total += f.stat().st_size
+            if not f.is_file():
+                continue
+            size = f.stat().st_size
         except OSError:
             continue
-    return total
+        name = f.name
+        if name.endswith(".incomplete") and _INCOMPLETE_ATTEMPT_SUFFIX.search(name):
+            key = str(f.parent / _INCOMPLETE_ATTEMPT_SUFFIX.sub(".incomplete", name))
+            if size > incomplete_max.get(key, 0):
+                incomplete_max[key] = size
+        else:
+            total += size
+    return total + sum(incomplete_max.values())
 
 
 def _format_size(num_bytes: float) -> str:
