@@ -103,7 +103,7 @@ class ModelDownloader:
     MAX_CONCURRENT_DOWNLOADS = 8
     CONNECT_TIMEOUT = 10
     STALL_MINUTES = 5
-    MAX_STALL_RETRIES = 3
+    STALL_RETRIES = 1
     STALL_POLL_SECONDS = 2
     XET_DISABLE_VAR = "HF_HUB_DISABLE_XET"
 
@@ -291,9 +291,10 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         show_progress: bool = True,
         stall_minutes: Optional[float] = None,
         token: Optional[str] = None,
+        retries: Optional[int] = None,
     ) -> tuple[bool, Optional[str]]:
         """Runs the download, retrying stalls, and escalating once if every
-        retry in a row stalls out.
+        attempt in a row stalls out.
 
         Stalling on *every* attempt (as opposed to one transient blip) is
         the signature of HuggingFace's Xet transfer backend being broken
@@ -301,10 +302,17 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         progress (not just our polling) sits at 0 bytes for the entire
         stall window, identically on every retry, while huggingface.co
         itself is reachable fine. No amount of retrying the same transport
-        fixes that. So after MAX_STALL_RETRIES straight stalls, if Xet
+        fixes that. So once every attempt in a phase has stalled, if Xet
         isn't already disabled, switch to the classic HTTP/LFS path
         (HF_HUB_DISABLE_XET=1) and run one more fresh set of attempts
         before giving up for good.
+
+        `retries` is retries *beyond* the first attempt (default
+        STALL_RETRIES = 1, i.e. 2 attempts total per phase) — a stalled
+        transfer this deep is already a strong signal something structural
+        is wrong, not a blip a third or fourth identical retry would fix;
+        the real remedy is the Xet fallback below, not more attempts on
+        the same transport.
         """
         # huggingface_hub's own tqdm bar and our heartbeat below both write
         # to the same terminal line independently — left enabled, they
@@ -314,23 +322,24 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
 
         stall_minutes = stall_minutes if stall_minutes is not None else self.STALL_MINUTES
         stall_seconds = stall_minutes * 60
+        max_attempts = (retries if retries is not None else self.STALL_RETRIES) + 1
 
         ok, err, all_stalled = self._run_stall_attempts(
-            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, self.MAX_STALL_RETRIES
+            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, max_attempts
         )
         if ok or not all_stalled or _env_is_true(self.XET_DISABLE_VAR):
             return ok, err
 
         if show_progress:
             print(
-                f"  Still stalled after {self.MAX_STALL_RETRIES} tries — this looks like HuggingFace's Xet "
+                f"  Still stalled after {max_attempts} tries — this looks like HuggingFace's Xet "
                 f"transfer backend, not a slow connection. Switching to the classic HTTP/LFS transfer "
                 f"({self.XET_DISABLE_VAR}=1) and trying again..."
             )
         os.environ[self.XET_DISABLE_VAR] = "1"
 
         ok, err, _ = self._run_stall_attempts(
-            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, self.MAX_STALL_RETRIES
+            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, max_attempts
         )
         return ok, err
 
@@ -340,6 +349,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         dest_dir: Optional[Path | str] = None,
         show_progress: bool = True,
         stall_minutes: Optional[float] = None,
+        retries: Optional[int] = None,
     ) -> tuple[bool, Optional[str]]:
         """
         Download a full model repo, with resume support and SHA256
@@ -355,6 +365,9 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
             stall_minutes: Minutes without progress before the transfer is
                 considered stalled and restarted. Defaults to STALL_MINUTES
                 (5) if not given.
+            retries: Retries beyond the first attempt before giving up on a
+                phase (2 attempts total by default) — see STALL_RETRIES.
+                Defaults to STALL_RETRIES (1) if not given.
 
         Returns:
             Tuple of (success, final directory path or None on failure).
@@ -389,7 +402,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
             print(f"Downloading '{model_id}' into {final_dir} ...")
 
         ok, err = self._download_with_stall_watchdog(
-            model_id, final_dir, show_progress=show_progress, stall_minutes=stall_minutes, token=token
+            model_id, final_dir, show_progress=show_progress, stall_minutes=stall_minutes, token=token, retries=retries
         )
         if not ok:
             self.status_manager.set_model_status(model_id, "error", error=err or "download failed")
@@ -418,6 +431,7 @@ def download_model(
     dest_dir: Optional[Path | str] = None,
     show_progress: bool = True,
     stall_minutes: Optional[float] = None,
+    retries: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
     """
     Convenience function to download a model.
@@ -429,11 +443,13 @@ def download_model(
         show_progress: Whether to show progress messages.
         stall_minutes: Minutes without progress before restarting the
             transfer. Defaults to ModelDownloader.STALL_MINUTES (5).
+        retries: Retries beyond the first attempt before giving up on a
+            phase. Defaults to ModelDownloader.STALL_RETRIES (1).
 
     Returns:
         Tuple of (success: bool, final directory path or None on failure)
     """
     downloader = ModelDownloader()
     return downloader.download_model(
-        model_id, dest_dir=dest_dir, show_progress=show_progress, stall_minutes=stall_minutes
+        model_id, dest_dir=dest_dir, show_progress=show_progress, stall_minutes=stall_minutes, retries=retries
     )

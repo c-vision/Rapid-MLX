@@ -4355,7 +4355,10 @@ def pull_command(args):
         print(f"\n  Pulling {repo_id} into {dest} ...")
         t0 = time.monotonic()
         success, final_dir = download_model(
-            repo_id, dest_dir=dest, stall_minutes=getattr(args, "stall_timeout", None)
+            repo_id,
+            dest_dir=dest,
+            stall_minutes=getattr(args, "stall_timeout", None),
+            retries=getattr(args, "stall_retries", None),
         )
         if not success:
             print(f"\n  Error: download of '{repo_id}' failed — see above.")
@@ -7626,6 +7629,16 @@ Examples:
         help="With --dest: minutes without progress before the transfer is "
         "considered stalled and restarted (resumes, doesn't start over). "
         "Default: 5.",
+    )
+    pull_parser.add_argument(
+        "--stall-retries",
+        type=int,
+        metavar="N",
+        default=None,
+        help="With --dest: retries beyond the first attempt before giving "
+        "up on a stalled transfer (2 attempts total by default) — a "
+        "stall this deep switches to HF_HUB_DISABLE_XET=1 instead of "
+        "retrying the same transport again. Default: 1.",
     )
     rm_parser = subparsers.add_parser(
         "rm", help="Remove a cached model from the HuggingFace cache"
