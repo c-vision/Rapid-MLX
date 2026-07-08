@@ -196,6 +196,7 @@ class ModelDownloader:
         stall_minutes: float,
         token: Optional[str],
         max_attempts: int,
+        max_workers: int,
     ) -> tuple[bool, Optional[str], bool]:
         """Runs up to max_attempts download attempts, restarting the
         subprocess whenever final_dir's total size hasn't grown in
@@ -226,7 +227,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
             result_queue = ctx.Queue()
             proc = ctx.Process(
                 target=_snapshot_download_worker,
-                args=(model_id, str(final_dir), self.MAX_CONCURRENT_DOWNLOADS, token, result_queue),
+                args=(model_id, str(final_dir), max_workers, token, result_queue),
             )
             proc.start()
 
@@ -292,6 +293,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         stall_minutes: Optional[float] = None,
         token: Optional[str] = None,
         retries: Optional[int] = None,
+        max_workers: Optional[int] = None,
     ) -> tuple[bool, Optional[str]]:
         """Runs the download, retrying stalls, and escalating once if every
         attempt in a row stalls out.
@@ -323,9 +325,10 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         stall_minutes = stall_minutes if stall_minutes is not None else self.STALL_MINUTES
         stall_seconds = stall_minutes * 60
         max_attempts = (retries if retries is not None else self.STALL_RETRIES) + 1
+        max_workers = max_workers if max_workers is not None else self.MAX_CONCURRENT_DOWNLOADS
 
         ok, err, all_stalled = self._run_stall_attempts(
-            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, max_attempts
+            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, max_attempts, max_workers
         )
         if ok or not all_stalled or _env_is_true(self.XET_DISABLE_VAR):
             return ok, err
@@ -339,7 +342,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         os.environ[self.XET_DISABLE_VAR] = "1"
 
         ok, err, _ = self._run_stall_attempts(
-            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, max_attempts
+            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, max_attempts, max_workers
         )
         return ok, err
 
@@ -350,6 +353,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         show_progress: bool = True,
         stall_minutes: Optional[float] = None,
         retries: Optional[int] = None,
+        max_workers: Optional[int] = None,
     ) -> tuple[bool, Optional[str]]:
         """
         Download a full model repo, with resume support and SHA256
@@ -368,6 +372,9 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
             retries: Retries beyond the first attempt before giving up on a
                 phase (2 attempts total by default) — see STALL_RETRIES.
                 Defaults to STALL_RETRIES (1) if not given.
+            max_workers: Parallel per-file transfers passed straight to
+                `snapshot_download`. Defaults to MAX_CONCURRENT_DOWNLOADS
+                (8) if not given.
 
         Returns:
             Tuple of (success, final directory path or None on failure).
@@ -402,7 +409,13 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
             print(f"Downloading '{model_id}' into {final_dir} ...")
 
         ok, err = self._download_with_stall_watchdog(
-            model_id, final_dir, show_progress=show_progress, stall_minutes=stall_minutes, token=token, retries=retries
+            model_id,
+            final_dir,
+            show_progress=show_progress,
+            stall_minutes=stall_minutes,
+            token=token,
+            retries=retries,
+            max_workers=max_workers,
         )
         if not ok:
             self.status_manager.set_model_status(model_id, "error", error=err or "download failed")
@@ -432,6 +445,7 @@ def download_model(
     show_progress: bool = True,
     stall_minutes: Optional[float] = None,
     retries: Optional[int] = None,
+    max_workers: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
     """
     Convenience function to download a model.
@@ -445,11 +459,18 @@ def download_model(
             transfer. Defaults to ModelDownloader.STALL_MINUTES (5).
         retries: Retries beyond the first attempt before giving up on a
             phase. Defaults to ModelDownloader.STALL_RETRIES (1).
+        max_workers: Parallel per-file transfers. Defaults to
+            ModelDownloader.MAX_CONCURRENT_DOWNLOADS (8).
 
     Returns:
         Tuple of (success: bool, final directory path or None on failure)
     """
     downloader = ModelDownloader()
     return downloader.download_model(
-        model_id, dest_dir=dest_dir, show_progress=show_progress, stall_minutes=stall_minutes, retries=retries
+        model_id,
+        dest_dir=dest_dir,
+        show_progress=show_progress,
+        stall_minutes=stall_minutes,
+        retries=retries,
+        max_workers=max_workers,
     )
