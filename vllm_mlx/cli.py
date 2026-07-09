@@ -2123,9 +2123,9 @@ def serve_command(args):
     # Qwen3.6 aliases, ``"off"`` everywhere else) is materialized into
     # ``args.pflash``. The resolved value then flows through the same
     # validation path the user-explicit case takes.
-    from .api.utils import is_mllm_model
     from .pflash import (
         config_from_args,
+        resolve_effective_is_mllm,
         resolve_pflash_mode_default,
         validate_model_support,
     )
@@ -2136,7 +2136,7 @@ def serve_command(args):
         validate_model_support(
             pflash_config,
             model_name=args.model,
-            is_mllm=getattr(args, "mllm", False) or is_mllm_model(args.model),
+            is_mllm=resolve_effective_is_mllm(args, model_name=args.model),
         )
     except ValueError as e:
         print(f"Error: {e}")
@@ -3807,9 +3807,9 @@ def bench_command(args):
 
     from mlx_lm import load
 
-    from .api.utils import is_mllm_model as _bench_is_mllm_model
     from .engine_core import AsyncEngineCore, EngineConfig
     from .pflash import config_from_args as _pflash_config_from_args
+    from .pflash import resolve_effective_is_mllm as _bench_resolve_effective_is_mllm
     from .pflash import resolve_pflash_mode_default as _pflash_resolve_default
     from .pflash import validate_model_support as _bench_pflash_validate
     from .request import SamplingParams
@@ -3847,7 +3847,7 @@ def bench_command(args):
         _bench_pflash_validate(
             bench_pflash_config,
             model_name=args.model,
-            is_mllm=getattr(args, "mllm", False) or _bench_is_mllm_model(args.model),
+            is_mllm=_bench_resolve_effective_is_mllm(args, model_name=args.model),
         )
     except ValueError as e:
         print(f"Error: {e}")

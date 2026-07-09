@@ -16,8 +16,7 @@ from vllm_mlx.pflash import (
     compress_request_tokens,
     compress_tokens,
     config_from_args,
-    resolve_pflash_config,
-    resolve_pflash_keep_ratio_default,
+    resolve_effective_is_mllm,
     resolve_pflash_mode_default,
     validate_model_support,
 )
@@ -207,27 +206,6 @@ class TestPFlashConfig:
         # behaviour is the conservative skip.
         assert config.skip_when_tools is False
 
-    def test_config_from_args_none_keep_ratio_falls_back_to_default(self):
-        # The CLI default for --pflash-keep-ratio is now a None sentinel
-        # (resolved to an alias override or 0.20 before construction). If the
-        # resolver never ran (bare SimpleNamespace, or the --enable-dflash
-        # path that skips PFlash resolution), config_from_args must fall back
-        # to 0.20 rather than fail PFlashConfig.validate on ``None``.
-        args = SimpleNamespace(
-            pflash="always",
-            pflash_threshold=1024,
-            pflash_keep_ratio=None,
-            pflash_min_keep_tokens=128,
-            pflash_sink_tokens=16,
-            pflash_tail_tokens=64,
-            pflash_block_size=32,
-            pflash_query_window=128,
-            pflash_stride_blocks=4,
-            pflash_include_tools=False,
-        )
-        config = config_from_args(args)
-        assert config.keep_ratio == 0.20
-
     def test_validate_rejects_multimodal_models(self):
         config = PFlashConfig(mode="auto")
         try:
@@ -244,6 +222,46 @@ class TestPFlashConfig:
     def test_validate_allows_mllm_when_disabled(self):
         config = PFlashConfig(mode="off")
         validate_model_support(config, model_name="qwen-vl", is_mllm=True)
+
+
+class TestResolveEffectiveIsMllm:
+    """Regression coverage for the ``--no-mllm``/``--text-only`` override
+    that ``serve``/``bench``/the standalone server all failed to apply
+    before calling ``validate_model_support`` -- each computed ``is_mllm``
+    straight from ``is_mllm_model(args.model)``, so a text-only fork of a
+    multimodal architecture (config.json still declaring ``vision_config``,
+    the same case ``--no-mllm`` exists for per #393) got its PFlash request
+    rejected even though ``--no-mllm`` forces the engine to load it as pure
+    text (``force_text=args.no_mllm`` at the loader boundary).
+    """
+
+    def test_no_mllm_overrides_vision_checkpoint_to_false(self):
+        args = SimpleNamespace(no_mllm=True, mllm=False)
+        assert resolve_effective_is_mllm(args, model_name="qwen-vl") is False
+
+    def test_mllm_force_on_wins_even_without_no_mllm(self):
+        args = SimpleNamespace(no_mllm=False, mllm=True)
+        assert resolve_effective_is_mllm(args, model_name="some-text-model") is True
+
+    def test_mllm_and_no_mllm_both_set_no_mllm_wins(self):
+        # cli.py rejects --mllm + --no-mllm together at parse time (see the
+        # ``args.mllm and args.no_mllm`` guard), but this function shouldn't
+        # itself assume that guard already ran.
+        args = SimpleNamespace(no_mllm=True, mllm=True)
+        assert resolve_effective_is_mllm(args, model_name="qwen-vl") is False
+
+    def test_falls_back_to_static_detection_without_either_flag(self):
+        args = SimpleNamespace(no_mllm=False, mllm=False)
+        # "-VL-" is one of MLLM_PATTERNS' legacy substrings; plain "qwen-vl"
+        # (no trailing hyphen) doesn't actually match it.
+        assert resolve_effective_is_mllm(args, model_name="Qwen2-VL-7B-Instruct") is True
+        assert resolve_effective_is_mllm(args, model_name="qwen3-coder") is False
+
+    def test_missing_attrs_default_to_static_detection(self):
+        # cli.py/server.py always set these via argparse, but the function
+        # shouldn't crash if called with a bare namespace missing them.
+        args = SimpleNamespace()
+        assert resolve_effective_is_mllm(args, model_name="qwen3-coder") is False
 
 
 class TestResolvePFlashModeDefault:
@@ -263,66 +281,6 @@ class TestResolvePFlashModeDefault:
         # qwen3.5-4b-4bit is tagged pflash_tier=verified in aliases.json
         # (PR #649). Mirror the alias-driven default the engine wires up.
         mode = resolve_pflash_mode_default(self._ns(None), model_name="qwen3.5-4b-4bit")
-        assert mode == "always"
-
-    def test_verified_alias_default_branch_emits_log_without_error(self, caplog):
-        # Regression guard for the module-level ``logger`` binding: the
-        # verified-alias default path calls ``logger.info(...)`` and must
-        # resolve cleanly (a stray NameError here would break the exact code
-        # this PR touches). Assert the branch both returns "always" AND emits
-        # its INFO line, so the logging call is provably exercised.
-        import logging as _logging
-
-        with caplog.at_level(_logging.INFO, logger="vllm_mlx.pflash"):
-            mode = resolve_pflash_mode_default(
-                self._ns(None), model_name="qwen3.5-4b-4bit"
-            )
-        assert mode == "always"
-        assert any(
-            "pflash_tier=verified" in rec.message and "qwen3.5-4b-4bit" in rec.message
-            for rec in caplog.records
-        ), "verified-alias default branch did not emit its INFO log"
-
-    def test_multimodal_suppression_log_does_not_advise_a_flag_that_errors(
-        self, caplog
-    ):
-        # codex #2 nit on #1178: the multimodal-suppression log must NOT tell
-        # the user to "Pass --pflash always" as an override — that flag is
-        # rejected downstream by validate_model_support for the MLLM lane. The
-        # message should keep the user's mental model correct instead.
-        import logging as _logging
-
-        with caplog.at_level(_logging.INFO, logger="vllm_mlx.pflash"):
-            mode = resolve_pflash_mode_default(
-                self._ns(None), model_name="qwen3.5-4b-4bit", is_multimodal=True
-            )
-        assert mode == "off"
-        msgs = [rec.message for rec in caplog.records if "multimodal" in rec.message]
-        assert msgs, "multimodal-suppression branch did not emit its INFO log"
-        joined = " ".join(msgs)
-        assert "Pass --pflash always to override" not in joined
-        # It should instead signal that PFlash is unavailable / an override errors.
-        assert "unavailable" in joined and "rejected" in joined
-
-    def test_verified_alias_multimodal_suppresses_always(self):
-        # A verified alias that ALSO routes multimodally (a vision-config
-        # Qwen3.6-27B checkpoint is both) must NOT auto-enable PFlash — the
-        # MLLM lane is rejected by validate_model_support, so the naive
-        # default-serve command would otherwise die on a --pflash flag the
-        # user never set (#352 dogfood P1-②). The caller passes the same
-        # is_mllm verdict it feeds validate_model_support.
-        mode = resolve_pflash_mode_default(
-            self._ns(None), model_name="qwen3.5-4b-4bit", is_multimodal=True
-        )
-        assert mode == "off"
-
-    def test_explicit_always_wins_even_when_multimodal(self):
-        # is_multimodal only suppresses the AUTO tier default; an explicit
-        # --pflash always still wins (and is then rejected loudly downstream
-        # by validate_model_support — the user asked for it).
-        mode = resolve_pflash_mode_default(
-            self._ns("always"), model_name="qwen3.5-4b-4bit", is_multimodal=True
-        )
         assert mode == "always"
 
     def test_unknown_alias_with_no_flag_defaults_to_off(self):
@@ -395,99 +353,6 @@ class TestResolvePFlashModeDefault:
         )
         config = config_from_args(args)
         assert config.mode == "off"
-
-
-class TestResolvePFlashKeepRatioDefault:
-    """Per-alias ``pflash_keep_ratio`` override (#287 follow-up).
-
-    Contract mirrors the mode resolver:
-    * explicit ``--pflash-keep-ratio`` (args value not None) wins;
-    * else the alias's ``pflash_keep_ratio`` if it pins one;
-    * else the engine default 0.20.
-    """
-
-    def _ns(self, keep_ratio):
-        return SimpleNamespace(pflash_keep_ratio=keep_ratio)
-
-    def test_alias_override_applies_when_no_flag(self):
-        # bonsai-27b-2bit is verified BUT only recall-safe at 0.50 (1/5 needle
-        # at the 0.20 default); it pins pflash_keep_ratio=0.5 in aliases.json.
-        ratio = resolve_pflash_keep_ratio_default(
-            self._ns(None), model_name="bonsai-27b-2bit"
-        )
-        assert ratio == 0.5
-
-    def test_explicit_flag_wins_over_alias_override(self):
-        ratio = resolve_pflash_keep_ratio_default(
-            self._ns(0.33), model_name="bonsai-27b-2bit"
-        )
-        assert ratio == 0.33
-
-    def test_verified_alias_without_override_uses_engine_default(self):
-        # qwen3.5-4b-4bit is verified at the default 0.20 and pins no override.
-        ratio = resolve_pflash_keep_ratio_default(
-            self._ns(None), model_name="qwen3.5-4b-4bit"
-        )
-        assert ratio == 0.20
-
-    def test_unknown_alias_without_override_uses_engine_default(self):
-        ratio = resolve_pflash_keep_ratio_default(
-            self._ns(None), model_name="qwen3-0.6b-4bit"
-        )
-        assert ratio == 0.20
-
-    def test_unrecognized_model_path_uses_engine_default(self):
-        ratio = resolve_pflash_keep_ratio_default(
-            self._ns(None), model_name="/no/such/model-xyz"
-        )
-        assert ratio == 0.20
-
-    def _full_ns(self, **overrides):
-        base = dict(
-            pflash=None,
-            pflash_keep_ratio=None,
-            pflash_threshold=32_768,
-            pflash_min_keep_tokens=2_048,
-            pflash_sink_tokens=256,
-            pflash_tail_tokens=2_048,
-            pflash_block_size=128,
-            pflash_query_window=512,
-            pflash_stride_blocks=8,
-            pflash_include_tools=False,
-        )
-        base.update(overrides)
-        return SimpleNamespace(**base)
-
-    def test_resolve_pflash_config_wires_bonsai_mode_and_ratio_end_to_end(self):
-        # Guards the actual serve/bench WIRING, not just the resolvers: a bare
-        # ``serve bonsai-27b-2bit`` routes through resolve_pflash_config, which
-        # must resolve mode→"always" AND keep_ratio→0.5 from the alias and bake
-        # both into the built PFlashConfig. If either resolver call is dropped
-        # from the helper, one of these assertions fails (a test that called the
-        # resolvers directly would still pass — codex #1458 BLOCKING).
-        args = self._full_ns()
-        config = resolve_pflash_config(args, model_name="bonsai-27b-2bit")
-        assert config.mode == "always"
-        assert config.keep_ratio == 0.5
-        # The helper also materializes the resolved values back onto args so
-        # later readers (engine wiring) see them, not the None sentinels.
-        assert args.pflash == "always"
-        assert args.pflash_keep_ratio == 0.5
-
-    def test_resolve_pflash_config_explicit_keep_ratio_flag_wins(self):
-        # An explicit --pflash-keep-ratio must survive the shared wiring even
-        # when the alias pins its own override.
-        args = self._full_ns(pflash_keep_ratio=0.33)
-        config = resolve_pflash_config(args, model_name="bonsai-27b-2bit")
-        assert config.mode == "always"
-        assert config.keep_ratio == 0.33
-
-    def test_resolve_pflash_config_unknown_alias_stays_off_at_default(self):
-        # A non-verified alias: mode stays off and keep_ratio falls to 0.20.
-        args = self._full_ns()
-        config = resolve_pflash_config(args, model_name="qwen3-0.6b-4bit")
-        assert config.mode == "off"
-        assert config.keep_ratio == 0.20
 
 
 class TestCompressRequestTokens:

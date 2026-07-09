@@ -350,6 +350,32 @@ def validate_model_support(
         )
 
 
+def resolve_effective_is_mllm(args: Any, *, model_name: str) -> bool:
+    """Whether this model is actually loading in MLLM/vision mode, for the
+    ``validate_model_support`` gate above.
+
+    ``--no-mllm``/``--text-only`` forces a genuine text-only load
+    (``force_text=args.no_mllm`` at the engine boundary in ``cli.py``) --
+    the model runs exactly like any other text-only checkpoint. Without
+    this override, ``serve``/``bench``/the standalone server entrypoint
+    all called ``is_mllm_model(args.model)`` directly here, which only
+    inspects the checkpoint's static config -- so a text-only fork of a
+    multimodal architecture whose config.json still declares
+    ``vision_config`` (the same #393 case ``--no-mllm`` exists for) got
+    its PFlash request rejected for a mode it was never actually going to
+    run in. ``--mllm`` (force-on) still wins over auto-detection either
+    way, matching the boot-guard's precedence a few lines above its own
+    call site in ``serve_command``.
+    """
+    if getattr(args, "no_mllm", False):
+        return False
+    if getattr(args, "mllm", False):
+        return True
+    from .api.utils import is_mllm_model
+
+    return is_mllm_model(model_name)
+
+
 @dataclass(frozen=True)
 class _BlockScore:
     start: int

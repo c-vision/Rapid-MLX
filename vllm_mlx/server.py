@@ -18,8 +18,11 @@ Features:
 - Tool calling (Qwen/Llama formats)
 
 Usage:
-    # Start the server
+    # Simple mode (maximum throughput)
     python -m vllm_mlx.server --model mlx-community/Llama-3.2-3B-Instruct-4bit
+
+    # Batched mode (for multiple concurrent users)
+    python -m vllm_mlx.server --model mlx-community/Llama-3.2-3B-Instruct-4bit --continuous-batching
 
     # With MCP tools
     python -m vllm_mlx.server --model mlx-community/Qwen3-4B-4bit --mcp-config mcp.json
@@ -39,15 +42,10 @@ import asyncio
 import gc
 import logging
 import os
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-if TYPE_CHECKING:
-    from .runtime.audio_worker import AudioWorkerHandoff, ModelWorker
 
 # Single source of truth for the OpenAI-shaped 400 / 422 / 500 envelopes
 # (F-161 / F-162 / F-163 / F-094-class). Defined in ``middleware`` so
@@ -118,8 +116,6 @@ from .api.utils import (
     extract_json_from_response,  # noqa: F401
     extract_multimodal_content,  # noqa: F401
     is_mllm_model,  # noqa: F401
-    resolve_serving_lane,  # noqa: F401
-    resolve_serving_lane_decision,
     sanitize_output,  # noqa: F401
     strip_special_tokens,  # noqa: F401
     strip_thinking_tags,  # noqa: F401
@@ -130,11 +126,6 @@ from .engine import (
     BatchedEngine,
 )
 from .runtime.model_registry import ModelEntry, ModelRegistry
-from .runtime.resident_models import (
-    ResidentModelBusyError,
-    ResidentModelManager,
-    estimate_model_bytes,
-)
 from .service.helpers import (  # noqa: F401 — re-export for backward compat
     _FALLBACK_TEMPERATURE,
     _FALLBACK_TOP_P,
@@ -198,18 +189,9 @@ def configure_logging(log_level: str) -> str:
 # When populated, get_engine() routes by request model name.
 # Backward-compatible: single-model mode still uses _engine global as before.
 _model_registry = ModelRegistry()
-_residency_manager: ResidentModelManager | None = None
-_resident_memory_limit_bytes: int = 0
-_resident_idle_ttl_seconds: float = 0.0
-_resident_gpu_memory_utilization: float = 0.90
 
 # Global engine instance (single-model legacy path, also primary model in multi-model)
 _engine: BaseEngine | None = None
-# Background prefix-cache load scheduled after the readiness flip (#1350). Held
-# at module scope so ``asyncio`` doesn't garbage-collect the task mid-flight and
-# so shutdown can await a still-running load to completion before the shutdown
-# save and engine teardown.
-_prefix_cache_load_task = None  # asyncio.Task | None
 _model_name: str | None = None
 _model_alias: str | None = None  # Short alias used to start the model (if any)
 # Task #292 (Bo R13/R14): operator opt-in for ``/v1/audio/*`` routes on a
@@ -224,11 +206,6 @@ _enable_audio_lane: bool = False
 _model_path: str | None = (
     None  # Actual model path (for cache dir, not affected by --served-model-name)
 )
-# True when ``load_model`` was given an explicit ``--served-model-name``, so
-# downstream surfaces (the readiness banner) can prefer the served API name
-# over the catalog alias. Set regardless of what the name resolves to (issue
-# #2353).
-_served_model_name_set: bool = False
 _default_max_tokens: int = 4096
 _default_max_tokens_is_explicit: bool = False
 _thinking_token_budget: int = 2048  # Extra tokens added for thinking models
@@ -241,30 +218,6 @@ _default_repetition_penalty: float | None = None  # Set via --default-repetition
 _default_presence_penalty: float | None = None  # Set via --default-presence-penalty
 _default_frequency_penalty: float | None = None  # Set via --default-frequency-penalty
 
-
-def _bind_audio_worker_for_engine(engine: object | None) -> bool:
-    """Bind a compatible primary engine or select the isolated fallback."""
-
-    from .runtime.audio_worker import bind_audio_worker
-
-    worker = _audio_worker_for_engine(engine)
-    bind_audio_worker(worker)
-    return worker is not None
-
-
-def _audio_worker_for_engine(engine: object | None) -> "ModelWorker | None":
-    """Return an engine only when it implements the audio worker contract."""
-
-    compatible = engine is not None and all(
-        callable(getattr(engine, method, None))
-        for method in (
-            "execute_on_model_worker",
-            "execute_on_model_worker_sync",
-        )
-    )
-    return cast("ModelWorker", engine) if compatible else None
-
-
 # Sampling overlays populated from the model's AliasProfile +
 # generation_config.json once the path is known (load_model). Both stay
 # as None pre-load; the resolve helpers tolerate missing dicts.
@@ -275,27 +228,10 @@ _generation_config_sampling: dict[str, float | int] | None = None
 # Global MCP manager
 _mcp_manager = None
 _mcp_executor = None
-# Issue #1716: MCP is optional and must never be able to fail server boot.
-# When init/reload fails these carry the reason (and the path to retry from)
-# out to ``/v1/mcp/servers`` so the desktop app can render something the user
-# can act on instead of an empty connector list.
-_mcp_init_error: str | None = None
-_mcp_config_path: str | None = None
-# Per-server entries dropped by the tolerant config load, with their reasons.
-_mcp_rejected: list = []
-# Serializes concurrent ``reload_mcp`` calls: two overlapping reloads both
-# tearing down and rebuilding the global manager would corrupt each other's
-# state. Created lazily (module import must not touch the event loop).
-_mcp_reload_lock: "asyncio.Lock | None" = None
 
 # Global embedding engine (lazy loaded)
 _embedding_engine = None
 _embedding_model_locked: str | None = None  # Set when --embedding-model is used
-# Operator embedding-length config (issue #1381). Set once from the CLI and
-# reused by route-triggered loads so both the pre-load and lazy paths build
-# the engine with the same limits.
-_embedding_max_length: int | str = "auto"
-_embedding_overflow_policy: str = "truncate"
 
 # API key authentication
 _api_key: str | None = None
@@ -352,39 +288,29 @@ _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama,
 _tool_parser_instance = None  # Instantiated parser
 _enable_tool_logits_bias: bool = False  # Jump-forward decoding for tool calls
 
+# Cloud routing (offload large-context requests to cloud LLM)
+_cloud_router = None  # CloudRouter instance when --cloud-model is set
+
 # GC control (Tier 0 optimization)
 _gc_control: bool = True  # Disable GC during generation to avoid latency spikes
 _no_thinking: bool = (
     False  # --no-thinking: force enable_thinking=False in chat template
 )
 
-#: Keep a mid-conversation ``role="system"`` message at its position
-#: instead of hoisting it into the leading system block. Set from
-#: ``serve --relocate-mid-conversation-system``; OFF by default.
-_relocate_mid_conversation_system: bool = False
-
 # Pinned prefix cache (Tier 0 optimization)
 _pin_system_prompt: bool = False  # Auto-pin system prompt prefix cache blocks
 _pinned_system_prompt_hash: str | None = None  # Hash of pinned system prompt
 
 
+from .runtime.cache import (  # noqa: E402
+    get_cache_dir as _get_cache_dir,  # noqa: F401
+)
 from .runtime.cache import (
     load_prefix_cache_from_disk as _load_prefix_cache_from_disk,
 )
 from .runtime.cache import (
     save_prefix_cache_to_disk as _save_prefix_cache_to_disk,
 )
-
-
-def _automatic_prefix_cache_persistence_enabled() -> bool:
-    """Whether lifespan-owned prefix-cache restore/save should run.
-
-    Restore and save are one policy: skipping restore but still replacing the
-    disk snapshot at shutdown would discard entries this process never loaded.
-    Explicit cache import/export endpoints do not use this lifecycle gate.
-    """
-    raw = os.environ.get("RAPID_MLX_PREFIX_CACHE_AUTOLOAD", "1")
-    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 async def _shutdown_save_prefix_cache() -> None:
@@ -407,210 +333,9 @@ async def _shutdown_save_prefix_cache() -> None:
     save; if anyone in the future replaces the ``await asyncio.to_thread
     (...)`` line below with a direct call, the regression fires.
     """
-    if not _automatic_prefix_cache_persistence_enabled():
-        logger.info(
-            "[lifespan] Prefix-cache auto-save disabled with auto-load by "
-            "RAPID_MLX_PREFIX_CACHE_AUTOLOAD"
-        )
-        return
     if _engine is None or not hasattr(_engine, "save_cache_to_disk"):
         return
     await asyncio.to_thread(_save_prefix_cache_to_disk)
-
-
-async def _deferred_load_prefix_cache() -> None:
-    """Lifespan startup step: warm the prefix cache off the readiness path.
-
-    Mirror of :func:`_shutdown_save_prefix_cache` for the load side (#1350).
-    The synchronous ``_load_prefix_cache_from_disk`` streams hundreds of MB
-    off disk under the GIL; running it inline in the lifespan handler — before
-    ``_cfg.ready = True`` — kept ``/health/ready`` and ``/v1/models`` at 503
-    for the entire load. It is a pure warm-start optimization, so the lifespan
-    now flips readiness first and schedules THIS coroutine as a background
-    task. Extracted (rather than inlined as a closure) so a regression test can
-    pin the ``asyncio.to_thread`` wrapper at its production callsite: if anyone
-    later replaces the wrapped call below with a direct one, the loop-starves-
-    during-load regression fires. Failures are non-fatal — a cold cache only
-    costs a few early prefix recomputes, never a wedged server.
-    """
-    if not _automatic_prefix_cache_persistence_enabled():
-        logger.info(
-            "[lifespan] Prefix-cache auto-load disabled by "
-            "RAPID_MLX_PREFIX_CACHE_AUTOLOAD"
-        )
-        return
-    if _engine is None or not hasattr(_engine, "load_cache_from_disk"):
-        return
-    try:
-        await asyncio.to_thread(_load_prefix_cache_from_disk)
-    except Exception as _e:  # noqa: BLE001
-        logger.warning(f"[lifespan] deferred prefix-cache load failed: {_e}")
-
-
-async def _drain_deferred_prefix_cache_load() -> None:
-    """Lifespan shutdown step: let the deferred prefix-cache load FINISH (#1350).
-
-    We AWAIT the background load task rather than cancel it. ``Task.cancel()``
-    only unblocks us from awaiting the ``asyncio.to_thread`` wrapper — the
-    worker thread keeps running ``_load_prefix_cache_from_disk``, which reads
-    the on-disk cache and calls into the engine. Running the shutdown save or
-    ``_engine.stop()`` underneath a still-live loader would race the cache
-    files and the engine's own state. Awaiting is bounded by the load duration
-    (the same cost the old synchronous on-startup load always paid) and is only
-    ever non-instant in the rare case shutdown arrives mid-load; in the common
-    case the task is already done and this returns immediately. The load
-    coroutine swallows its own errors, so the guard here is belt-and-suspenders.
-    """
-    task = _prefix_cache_load_task
-    if task is None:
-        return
-    try:
-        await task
-    except Exception as _e:  # noqa: BLE001
-        logger.debug(f"[lifespan] deferred prefix-cache load cleanup: {_e}")
-
-
-def _do_tool_grammar_warmup(tokenizer, parser_cls) -> bool:
-    """Pre-build the llguidance ``LLTokenizer`` (+ warm the grammar path).
-
-    CPU-ONLY and idempotent, safe to run on a worker thread: it touches only
-    llguidance's Rust surface, never an MLX GPU op, so it does not trip the
-    per-thread MLX stream gotcha (#170) that forbids GPU evals off the step
-    thread. The dominant cost this hoists off the first request is the
-    ``LLTokenizer`` build — a ~1s, vocab-scale operation llguidance's own docs
-    flag "expensive … should be cached". ``get_lltokenizer`` memoizes it on the
-    tokenizer, so building it here means the first real tool-call request hits a
-    warm cache instead of paying ~1s inline. Returns True if the tokenizer warmed.
-    """
-    from .api.tool_grammar import (
-        build_tool_grammar,
-        get_lltokenizer,
-        get_request_matcher,
-    )
-
-    lltok = get_lltokenizer(tokenizer)
-    if lltok is None:
-        return False
-    # Also warm the grammar-build + compiled-matcher path (module imports, the
-    # Lark->grammar compile, one automaton construction) with a trivial 0-arg
-    # tool so the first real request's setup is fully hot. Per-request schemas
-    # differ, so we cannot pre-compile a client's specific grammar — the win is
-    # the shared LLTokenizer above; this just primes the rest of the code path.
-    try:
-        parser = parser_cls(tokenizer=tokenizer)
-        warm_tools = [
-            {
-                "name": "_rapid_mlx_warmup",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                },
-            }
-        ]
-        grammar = build_tool_grammar(warm_tools, "required", parser)
-        if grammar is not None:
-            get_request_matcher(lltok, grammar)
-    except Exception:
-        # Non-fatal: the LLTokenizer (the expensive part) is already warm. Log
-        # the secondary grammar-path priming failure rather than swallowing it
-        # silently, so a real defect here is diagnosable (codex #1155 nit).
-        logger.warning(
-            "Tool-grammar warmup: LLTokenizer built, but grammar-path priming "
-            "failed (non-fatal — first real request re-primes it)",
-            exc_info=True,
-        )
-    return True
-
-
-async def _warmup_tool_grammar(engine) -> None:
-    """Startup warmup for grammar-constrained tool calling (#558).
-
-    Gated so it only fires when the server is actually configured for
-    grammar-capable tool calling: a ``tool_call_parser`` is set, the parser
-    class opts into ``SUPPORTS_GRAMMAR``, and the llguidance stack is importable.
-    Any other case returns immediately (a text-only or non-grammar deploy pays
-    nothing at boot). The heavy build runs via ``asyncio.to_thread`` so the ~1s
-    LLTokenizer construction never blocks the event loop. Fully non-fatal.
-    """
-    cfg = get_config()
-    parser_name = getattr(cfg, "tool_call_parser", None)
-    if not parser_name:
-        return
-    try:
-        from .api.tool_grammar import HAS_LL_TOKENIZER, HAS_LLGUIDANCE
-    except Exception:
-        return
-    if not (HAS_LLGUIDANCE and HAS_LL_TOKENIZER):
-        return
-    tokenizer = getattr(engine, "tokenizer", None)
-    if tokenizer is None:
-        return
-    try:
-        from .tool_parsers import ToolParserManager
-
-        parser_cls = ToolParserManager.get_tool_parser(parser_name)
-    except Exception:
-        return
-    if not getattr(parser_cls, "SUPPORTS_GRAMMAR", False):
-        return
-    # Run the warmup on the loop's default thread pool and AWAIT it (the ~1s
-    # build runs off the event loop, so the loop stays responsive; startup waits
-    # for it the same way it already waits for ``generate_warmup``'s Metal-shader
-    # compile above). We deliberately impose NO timeout / background thread: a
-    # ``wait_for`` cannot cancel ``to_thread`` (the worker keeps running), and a
-    # detached daemon thread is untracked at shutdown (codex #1155). The warmup is
-    # a bounded, single-flighted CPU build that cannot realistically hang, so the
-    # simplest correct shape is a plain awaited ``to_thread`` — no orphaned worker
-    # to manage, and a genuine llguidance defect surfaces as a normal startup
-    # error rather than being masked by a timeout.
-    warmed = await asyncio.to_thread(_do_tool_grammar_warmup, tokenizer, parser_cls)
-    if warmed:
-        logger.info(
-            "Tool-grammar warmup complete (LLTokenizer pre-built for parser %r)",
-            parser_name,
-        )
-
-
-def _detect_hybrid_for_warmup(engine) -> bool:
-    """Whether the loaded model is hybrid for warmup-gating purposes.
-
-    Hybrid (GatedDeltaNet/Mamba + Transformer) models must SKIP the bare
-    ``generate_warmup`` (it contaminates compiled kernel state that
-    interferes with batched inference) and take the full-request warmup
-    path instead. Two independent signals, either sufficing:
-
-    1. The engine's fail-closed ``_is_hybrid_model()`` profile probe
-       (BatchedEngine). This replaced the old ``_hybrid_throttle`` read,
-       which stopped implying is-hybrid when the #115 admission throttle
-       default flipped OFF (codex review on the retirement PR).
-    2. The pre-existing ``make_cache()``/``ArraysCache`` structural
-       detection through the wrapper layers — retained unchanged as the
-       fallback for engine wrappers that do not expose the probe.
-
-    MLLM engines are excluded FIRST, before either signal (their warmup
-    path is separate). Today the combination cannot arise — hybrid VLMs
-    auto-downgrade to the text lane because the MLLM engine cannot build
-    a BatchKVCache over an ArraysCache backbone (#352) — but if the MLLM
-    lane ever gains hybrid support, warmup must fail closed to the bare
-    path rather than silently entering the hybrid one.
-    """
-    if getattr(engine, "_is_mllm", False):
-        return False
-    probe = getattr(engine, "_is_hybrid_model", None)
-    if callable(probe) and bool(probe()):
-        return True
-    model = getattr(engine, "_model", None) or getattr(engine, "_shared_model", None)
-    if model and hasattr(model, "model") and not hasattr(model, "make_cache"):
-        model = model.model
-    if model and hasattr(model, "make_cache"):
-        try:
-            from mlx_lm.models.cache import ArraysCache
-
-            return any(isinstance(c, ArraysCache) for c in model.make_cache())
-        except Exception:
-            pass
-    return False
 
 
 async def lifespan(app: FastAPI):
@@ -659,25 +384,7 @@ async def lifespan(app: FastAPI):
 
     # Startup: Start engine if loaded (needed for BatchedEngine in uvicorn's event loop)
     if _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded:
-        try:
-            await _engine.start()
-        except Exception as _start_exc:
-            # Opt-in telemetry (Phase 2.2 error wiring): serve's real weight
-            # load happens HERE in the async lifespan, not in the CLI's
-            # ``load_model()`` (which only does config read + MLLM/LLM
-            # type-detection). A failure here is THE ``serve`` model-load
-            # failure — the CLI-side wiring (PR #1207) cannot see it. Record
-            # a bucketed error (allowlisted category + traceback fingerprint
-            # only, never the model name / message / path), then re-raise so
-            # startup still aborts exactly as before. ``emit.error`` is
-            # ``is_enabled()``-gated and ``@_safe`` → a no-op when telemetry
-            # is off and can never mask the failure.
-            from vllm_mlx.telemetry import emit as _telemetry_emit
-
-            _telemetry_emit.error(
-                category="model_load_failure", exc=_start_exc, phase="startup"
-            )
-            raise
+        await _engine.start()
 
     # Warmup: generate one token to trigger Metal shader compilation.
     # Runs here (not in CLI) so all engine types are fully started first.
@@ -687,7 +394,34 @@ async def lifespan(app: FastAPI):
         logger.info("Warming up (compiling Metal shaders)...")
         _warmup_start = _time.monotonic()
         try:
-            _is_hybrid = _detect_hybrid_for_warmup(_engine)
+            # Skip warmup for hybrid models (GatedDeltaNet) to avoid
+            # contaminating compiled kernel state that interferes with
+            # batched inference.  Check multiple engine wrappers:
+            # BatchedEngine sets _hybrid_throttle via EngineCore,
+            # Check model for hybrid cache
+            _is_hybrid = getattr(_engine, "_hybrid_throttle", False)
+            if not _is_hybrid and not getattr(_engine, "_is_mllm", False):
+                # Try to find the raw model through wrapper layers
+                _model = getattr(_engine, "_model", None) or getattr(
+                    _engine, "_shared_model", None
+                )
+                # Unwrap model wrapper if needed
+                if (
+                    _model
+                    and hasattr(_model, "model")
+                    and not hasattr(_model, "make_cache")
+                ):
+                    _model = _model.model
+                if _model and hasattr(_model, "make_cache"):
+                    try:
+                        from mlx_lm.models.cache import ArraysCache
+
+                        _test_cache = _model.make_cache()
+                        _is_hybrid = any(
+                            isinstance(c, ArraysCache) for c in _test_cache
+                        )
+                    except Exception:
+                        pass
             if not _is_hybrid:
                 _engine.generate_warmup()
                 # NOTE: do NOT call `mx.eval(mx.zeros(1))` here — that
@@ -719,64 +453,9 @@ async def lifespan(app: FastAPI):
         _warmup_secs = _time.monotonic() - _warmup_start
         logger.info(f"Warmup complete ({_warmup_secs:.1f}s)")
 
-    # Publish the startup engine into the resident-model lifecycle after it is
-    # fully started. Legacy routes still expose this engine through cfg.engine,
-    # so it is the protected primary; additional engines are manager-owned and
-    # eligible for LRU/TTL eviction.
-    global _residency_manager
-    if _residency_manager is None:
-        _residency_manager = configure_model_residency(
-            memory_limit_gb=_resident_memory_limit_bytes / 1024**3,
-            idle_ttl_seconds=_resident_idle_ttl_seconds,
-            gpu_memory_utilization=_resident_gpu_memory_utilization,
-        )
-    if _engine is not None:
-        from .routes.audio import audio_routes_should_register
-
-        if audio_routes_should_register(
-            model_name=_model_name,
-            model_alias=_model_alias,
-            enable_audio_lane=_enable_audio_lane,
-        ):
-            _bind_audio_worker_for_engine(_engine)
-        _primary_entry = next(
-            (
-                entry
-                for entry in _model_registry.list_entries()
-                if entry.engine is _engine
-            ),
-            None,
-        )
-        if _primary_entry is not None and not _residency_manager.contains(
-            _primary_entry.model_name
-        ):
-            _residency_manager.register_primary(
-                _primary_entry,
-                estimated_bytes=estimate_model_bytes(
-                    _model_alias or _primary_entry.model_name
-                ),
-            )
-    await _residency_manager.start()
-
-    # Tool-grammar warmup (#558): the FIRST grammar-constrained tool call
-    # otherwise pays a one-time ~1s llguidance ``LLTokenizer`` build on the
-    # request path (measured on gpt-oss-20b: ~1.7s cold first tool-call vs
-    # ~0.37s warm — distinct schemas AFTER the first are already warm, so the
-    # cost is the shared tokenizer build, not per-schema compile). Pre-build it
-    # at startup, off the event loop, so no user request eats the cold-start.
-    # Self-gates to grammar-capable tool deployments and is non-fatal.
-    if _engine is not None:
-        try:
-            await _warmup_tool_grammar(_engine)
-        except Exception as _e:
-            logger.debug(f"Tool-grammar warmup failed (non-fatal): {_e}")
-
-    # Prefix-cache load is deferred OFF the readiness path (#1359 follow-up
-    # #1350): a large persisted cache used to block here — between engine
-    # start and ``_cfg.ready = True`` — so ``/health/ready`` and ``/v1/models``
-    # stayed 503 for the whole (potentially multi-second) disk load. It is a
-    # pure warm-start optimization, so it is now scheduled as a background
-    # task AFTER the readiness flip below; see ``_prefix_cache_load_task``.
+    # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
+    if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
+        _load_prefix_cache_from_disk()
 
     # Initialize MCP if config provided. VLLM_MLX_MCP_CONFIG is the
     # deprecated pre-rename alias. Prefer the first var that points to an
@@ -840,49 +519,24 @@ async def lifespan(app: FastAPI):
     # starts returning 200. Anything that races a request before this point
     # would otherwise hit a not-yet-warmed engine.
     _cfg = get_config()
-    from .routes.video import start_video_jobs
-
-    start_video_jobs()
     _cfg.ready = True
 
-    # Now that readiness is flipped, warm the prefix cache from disk in the
-    # background (#1350). The memory-aware cache installs each imported entry
-    # as a single atomic bulk-swap under its own lock, so a request that
-    # arrives mid-load either misses (recompute — always correct) or hits the
-    # fully-installed cache, never a partially-populated one. Worst case a few
-    # early requests recompute their prefix; they never see a wedged server.
-    if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
-        global _prefix_cache_load_task
-        _prefix_cache_load_task = asyncio.create_task(_deferred_load_prefix_cache())
-
-    # Render the real "Ready:" / "Connect:" banner now — only here is the
-    # port truly accepting connections AND the engine warmed up. The CLI's
-    # earlier "Starting server …" line is replaced by this. Output is produced
-    # by the connect SSOT (:mod:`vllm_mlx.connect`) so the served banner and
-    # ``rapid-mlx connect`` can never disagree about an endpoint. If neither
-    # the host/port nor inherited-fd source of truth was stashed (e.g.
+    # Print the real "Ready:" banner now — only here is the port truly
+    # accepting connections AND the engine warmed up. The CLI's earlier
+    # "Starting server …" line is replaced by this. If neither the
+    # host/port nor inherited-fd source of truth was stashed (e.g.
     # embedded usage where uvicorn is owned elsewhere), fall back silently.
-    from vllm_mlx.connect import endpoints_from_bind, render_banner
-
-    # The banner's "Model:" line is the copyable API identity the user
-    # pastes into an SDK request. Prefer the explicit ``--served-model-name``
-    # when one was supplied; otherwise keep the catalog alias. Tracking the
-    # option explicitly (not inferring from ``model_name``/``model_path``
-    # differences) keeps the banner correct even when a served name happens
-    # to equal the resolved path (issue #2353).
-    _banner_model = (
-        _cfg.model_name
-        if _served_model_name_set
-        else (_cfg.model_alias or _cfg.model_name)
-    )
-    _ep = endpoints_from_bind(
-        _cfg.bind_host,
-        _cfg.bind_port,
-        model=_banner_model,
-        listen_fd=_cfg.bind_listen_fd,
-    )
-    if _ep.listen_fd is not None or (_cfg.bind_host and _cfg.bind_port):
-        print(render_banner(_ep), end="")
+    if _cfg.bind_host and _cfg.bind_port:
+        print(f"  Ready: http://{_cfg.bind_host}:{_cfg.bind_port}/v1")
+        print(f"  Docs:  http://{_cfg.bind_host}:{_cfg.bind_port}/docs")
+        print()
+    elif _cfg.bind_listen_fd is not None:
+        # Socket-activation branch: the supervisor's ``getsockname`` is the
+        # source of truth for the bind address (we don't probe it). Print
+        # the fd shape so log readers can match it to the supervisor's
+        # ``LISTEN_FDS=1`` handoff record.
+        print(f"  Ready: inherited fd {_cfg.bind_listen_fd}")
+        print()
 
     yield
 
@@ -898,56 +552,22 @@ async def lifespan(app: FastAPI):
     _shutdown_cfg.ready = False
     _shutdown_cfg.draining = True
 
-    # Shutdown teardown: save cache, close MCP, stop engine.
+    # Shutdown: Save cache to disk BEFORE stopping engine.
     #
-    # ``_shutdown_save_prefix_cache`` wraps the synchronous save in
-    # ``asyncio.to_thread`` — see that function's docstring for the
-    # rationale. Extracted so the regression test pins the wrapper at
-    # the production callsite rather than wrapping ``to_thread``
-    # test-side (codex PR #667 round 1 BLOCKING-3).
-    #
-    # Opt-in telemetry (Phase 2.2 error wiring): a crash while tearing
-    # down is exactly the "process disappeared during shutdown" shape the
-    # signal-observability hooks above were installed for. Record a
-    # bucketed ``shutdown_traceback`` error (allowlisted category/phase +
-    # traceback fingerprint only — no message text or path), then re-raise
-    # so the shutdown path behaves identically. ``emit.error`` is
-    # ``is_enabled()``-gated and ``@_safe`` → a no-op when telemetry is off
-    # and never masks the failure.
-    try:
-        from .routes.video import shutdown_video_jobs
+    # Delegates to ``_shutdown_save_prefix_cache`` which wraps the
+    # synchronous save in ``asyncio.to_thread`` — see that function's
+    # docstring for the rationale. Extracted so the regression test
+    # pins the wrapper at the production callsite rather than wrapping
+    # ``to_thread`` test-side (codex PR #667 round 1 BLOCKING-3).
+    await _shutdown_save_prefix_cache()
 
-        await shutdown_video_jobs()
-
-        # Let the deferred prefix-cache load (#1350) finish before we save or
-        # tear down the engine — see the helper's docstring for why we await
-        # rather than cancel.
-        await _drain_deferred_prefix_cache_load()
-
-        await _shutdown_save_prefix_cache()
-
-        # Shutdown: Close MCP connections and stop engine
-        if _mcp_manager is not None:
-            await _mcp_manager.stop()
-            logger.info("MCP manager stopped")
-        from .routes.audio import shutdown_audio_lanes
-
-        await shutdown_audio_lanes()
-        if _residency_manager is not None:
-            await _residency_manager.shutdown()
-        from .runtime.audio_worker import bind_audio_worker
-
-        bind_audio_worker(None)
-        if _engine is not None:
-            await _engine.stop()
-            logger.info("Engine stopped")
-    except Exception as _shutdown_exc:
-        from vllm_mlx.telemetry import emit as _telemetry_emit
-
-        _telemetry_emit.error(
-            category="shutdown_traceback", exc=_shutdown_exc, phase="shutdown"
-        )
-        raise
+    # Shutdown: Close MCP connections and stop engine
+    if _mcp_manager is not None:
+        await _mcp_manager.stop()
+        logger.info("MCP manager stopped")
+    if _engine is not None:
+        await _engine.stop()
+        logger.info("Engine stopped")
 
     # Round 19 codex review (PR #532): Drive the telemetry session_end
     # path here too. ``atexit`` does NOT fire on SIGTERM (systemd /
@@ -981,16 +601,6 @@ app = FastAPI(
 from .routes.audio import install_audio_body_limit_middleware  # noqa: E402
 
 install_audio_body_limit_middleware(app)
-
-# SECURITY: video multipart auth/body cap must run before Starlette spools an
-# UploadFile. It also owns the 21 MiB request allowance for the 20 MiB file cap.
-from .routes.video import install_video_body_limit_middleware  # noqa: E402
-
-install_video_body_limit_middleware(app)
-
-from .routes.images import install_image_body_limit_middleware  # noqa: E402
-
-install_image_body_limit_middleware(app)
 
 # SECURITY: blanket request-body size cap across all /v1/* routes.
 # Defends against the DoS pattern documented in rapid-desktop#273 / #463
@@ -1077,25 +687,6 @@ _DEFAULT_CORS_HEADERS: tuple[str, ...] = (
 _DEFAULT_CORS_MAX_AGE: int = 3600
 
 
-@dataclass(frozen=True)
-class ResolvedCORSPolicy:
-    """The fully resolved CORS policy shared by all HTTP server modes."""
-
-    origins: tuple[str, ...]
-    methods: tuple[str, ...]
-    headers: tuple[str, ...]
-    max_age: int
-    allow_credentials: bool
-
-
-_last_resolved_cors_policy: ResolvedCORSPolicy | None = None
-
-
-def get_resolved_cors_policy() -> ResolvedCORSPolicy | None:
-    """Return the policy configured during this process's CLI startup."""
-    return _last_resolved_cors_policy
-
-
 class _SpecAlignedCORSMiddleware(CORSMiddleware):
     """``CORSMiddleware`` whose preflight rejection is spec-aligned (L-02).
 
@@ -1148,13 +739,6 @@ class _SpecAlignedCORSMiddleware(CORSMiddleware):
         for k, v in response.headers.items():
             lk = k.lower()
             if lk == "access-control-allow-origin":
-                continue
-            # The upstream 400 body is longer than our constant ``"OK"``.
-            # Carrying its Content-Length into PlainTextResponse makes the
-            # wire response claim bytes that never arrive: curl exits 18 and
-            # strict HTTP clients raise IncompleteRead. Let PlainTextResponse
-            # calculate the length of the replacement body instead.
-            if lk == "content-length":
                 continue
             if lk == "vary":
                 continue  # canonicalized below
@@ -1261,44 +845,6 @@ def _parse_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def configure_trusted_hosts(cli_hosts: list[str] | None = None) -> list[str]:
-    """OPT-IN Host-header allowlist (DNS-rebinding / Host-header-spoofing
-    hardening) via Starlette's ``TrustedHostMiddleware``.
-
-    Resolution:
-      1. ``--trusted-hosts`` CLI flag (comma-separated) — takes precedence.
-      2. ``RAPID_MLX_TRUSTED_HOSTS`` env var (comma-separated).
-      3. Unset / empty → middleware is NOT registered. This is the default:
-         restricting the Host header would break ``rapid-mlx share`` (which
-         forwards the public-facing Host header into the local server) and
-         LAN access via machine hostname, so an operator opts in deliberately.
-
-    ``allowed_hosts`` (Starlette) values cross-match the request ``Host``
-    header against glob patterns; ``*`` and ``localhost``/``127.0.0.1`` are
-    typical. A request whose Host matches nothing is rejected with 400.
-    """
-    hosts: list[str] = []
-    if cli_hosts is not None:
-        # argparse's nargs="+" accepts both ``a b`` and values users commonly
-        # write as ``a,b``. Normalize each entry so CLI and env semantics match.
-        hosts = [host for entry in cli_hosts for host in _parse_csv(entry)]
-    else:
-        env_raw = os.environ.get("RAPID_MLX_TRUSTED_HOSTS")
-        if env_raw:
-            hosts = _parse_csv(env_raw)
-    if not hosts:
-        return []
-    from starlette.middleware.trustedhost import TrustedHostMiddleware
-
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts)
-    logger.info(
-        "TrustedHostMiddleware enabled (allowed_hosts=%s): requests with a "
-        "non-matching Host header are rejected.",
-        hosts,
-    )
-    return hosts
-
-
 def configure_cors_from_env(
     cli_origins: list[str] | None = None,
 ) -> list[str]:
@@ -1320,8 +866,6 @@ def configure_cors_from_env(
 
     Returns the resolved origin list (empty list when CORS is disabled).
     """
-    global _last_resolved_cors_policy
-
     # ``came_from_cli`` discriminates the two compat tiers (codex round-3
     # BLOCKING). The legacy ``--cors-origins`` CLI path used to imply
     # ``allow_headers=["*"]`` / ``allow_methods=["*"]``; existing browser
@@ -1487,18 +1031,6 @@ def configure_cors_from_env(
                 creds_env,
             )
 
-    # Keep the policy snapshot byte-for-byte equivalent to the middleware
-    # actually installed below. In particular, a credentialed wildcard is
-    # invalid under Fetch and must never reappear on DFlash via its separate
-    # FastAPI application.
-    if "*" in origins and allow_credentials:
-        logger.warning(
-            "%s requested with a wildcard origin is invalid per the "
-            "Fetch spec; forcing allow_credentials=False",
-            "RAPID_MLX_CORS_ALLOW_CREDENTIALS",
-        )
-        allow_credentials = False
-
     # Fail-closed path: ``RAPID_MLX_CORS_ALLOW_ORIGINS`` was set but
     # parsed to an empty list (operator-controlled typo). Don't register
     # CORSMiddleware — that's the visible signal the WARNING above
@@ -1507,16 +1039,8 @@ def configure_cors_from_env(
     # lambda — we never call ``configure_cors(...)`` on the fail-closed
     # path, so the stub's signature doesn't matter.
     if not origins:
-        _last_resolved_cors_policy = None
         return []
 
-    _last_resolved_cors_policy = ResolvedCORSPolicy(
-        origins=tuple(origins),
-        methods=tuple(methods),
-        headers=tuple(headers),
-        max_age=max_age,
-        allow_credentials=allow_credentials,
-    )
     configure_cors(
         origins,
         methods=methods,
@@ -1594,26 +1118,12 @@ def load_embedding_model(
     *,
     lock: bool = False,
     reuse_existing: bool = True,
-    max_length: int | str | None = None,
-    overflow_policy: str | None = None,
 ) -> None:
-    """Load or reuse the embedding model engine when configured.
-
-    ``max_length`` / ``overflow_policy`` (issue #1381) are remembered in
-    module globals when provided (the CLI passes them once at startup), so
-    route-triggered lazy loads — which call this without them — build the
-    engine with the same operator-configured limits.
-    """
+    """Load or reuse the embedding model engine when configured."""
     global _embedding_engine, _embedding_model_locked
-    global _embedding_max_length, _embedding_overflow_policy
 
     if not model_name:
         return
-
-    if max_length is not None:
-        _embedding_max_length = max_length
-    if overflow_policy is not None:
-        _embedding_overflow_policy = overflow_policy
 
     if lock:
         _embedding_model_locked = model_name
@@ -1627,152 +1137,13 @@ def load_embedding_model(
 
     from .embedding import EmbeddingEngine
 
-    _embedding_engine = EmbeddingEngine(
-        model_name,
-        max_length=_embedding_max_length,
-        overflow_policy=_embedding_overflow_policy,
-    )
+    _embedding_engine = EmbeddingEngine(model_name)
     _embedding_engine.load()
 
     # Sync into config for route modules
     cfg = get_config()
     cfg.embedding_engine = _embedding_engine
     cfg.embedding_model_locked = _embedding_model_locked
-
-
-def _ensure_routing_config(model_name: str) -> None:
-    """Materialize the checkpoint config on disk before the offline routing
-    probes run, and FAIL FAST if it cannot be materialized.
-
-    ``resolve_serving_lane`` reads the checkpoint config from the local cache
-    to decide the MLLM-vs-text lane. On a first-time uncached remote startup
-    that config does not exist yet, so a hybrid VLM would probe "not hybrid"
-    and get routed into the MLLM engine that cannot serve it (#352 dogfood
-    P1-②).
-
-    Contract: on a normal return the routing probes have real config evidence.
-    - Already materialized (cached repo, a prior prefetch, or a local dir that
-      ships a config) -> nothing to do; the probe is reliable. Fully offline
-      and cheap, so warm starts and the unit suite never trigger a download.
-    - Otherwise prefetch via the same canonical mirror/HF fetch the CLI uses,
-      then VERIFY the config actually landed. If it did not, raise an
-      actionable error instead of letting the caller route on a guess — a
-      silent miss here misroutes a hybrid VLM into the crashing MLLM lane.
-
-    A hard disk-space gate (``SystemExit``) from the prefetch is an intentional
-    fail-fast and propagates unchanged. Module-level so tests can substitute
-    the prefetch to simulate "config appears only after download".
-    """
-    from .model_metadata import read_model_metadata
-
-    # Config already readable (warm cache / local checkpoint dir) -> the routing
-    # probe has real evidence; skip the prefetch so warm starts and the unit
-    # suite never download.
-    if read_model_metadata(model_name) is not None:
-        return
-    # A local path the user pointed us at: trust their files. If a config is
-    # genuinely absent the engine's own loader surfaces it with its own
-    # message; we must not try to "download" a filesystem path.
-    if os.path.exists(model_name):
-        return
-
-    _prefetch_exc: Exception | None = None
-    try:
-        from .cli import _ensure_model_downloaded
-
-        _ensure_model_downloaded(model_name)
-    except SystemExit:
-        # ``_ensure_model_downloaded`` may exit(1) on a hard disk-space gate —
-        # that is an intentional fail-fast; let it propagate.
-        raise
-    except Exception as _e:  # noqa: BLE001 — preserved below, not swallowed
-        _prefetch_exc = _e
-        logger.debug("routing-config prefetch raised (will re-verify): %r", _e)
-
-    # VERIFY the prefetch actually put the config on disk. If it did not, the
-    # routing probes would fall back to a guess and could misroute a hybrid VLM
-    # into the MLLM engine that cannot serve it (#352). Fail fast with an
-    # actionable message instead of silently guess-routing — and chain the
-    # original prefetch error so its real cause (auth / network / 404) is not
-    # lost.
-    if read_model_metadata(model_name) is None:
-        raise RuntimeError(
-            f"Could not materialize the checkpoint config for {model_name!r} "
-            "before selecting the serving lane. The MLLM-vs-text routing "
-            "decision needs the model's config.json on disk; without it a "
-            "hybrid VLM can be misrouted into the multimodal engine that "
-            "cannot serve it (GH #352). Check network / HuggingFace access / "
-            "disk space and retry, or pass --no-mllm to force the text-only "
-            "lane (or --mllm to force the multimodal lane)."
-        ) from _prefetch_exc
-    if _prefetch_exc is not None:
-        # Config landed, so we CAN resolve the lane — but the prefetch still
-        # errored (e.g. a partial download: config.json present, weights
-        # incomplete, or a late auth/network fault). Don't discard that cause;
-        # surface it at WARNING so a later weight-load failure is attributable
-        # instead of appearing as an unrelated error downstream.
-        logger.warning(
-            "routing-config prefetch for %r reported an error even though its "
-            "config materialized; the model may be partially downloaded and "
-            "fail to load its weights later. Original error: %r",
-            model_name,
-            _prefetch_exc,
-        )
-
-
-@dataclass(frozen=True)
-class _ServingCheckpoint:
-    """One resolved checkpoint identity and the path the engine must load."""
-
-    model_path: str
-    load_path: str
-    auto_text_fallback: bool
-    lane_reason: str
-
-
-def _resolve_serving_checkpoint(
-    model_name: str,
-    *,
-    force_mllm: bool = False,
-    force_text: bool = False,
-    requested_spec_decode: str = "none",
-) -> _ServingCheckpoint:
-    """Resolve alias, local checkpoint, and serving lane as one contract.
-
-    Both startup and runtime residency must route and load the same checkpoint.
-    In particular, a commit-pinned Hub download may have one complete snapshot
-    but no ``refs/main``; metadata resolution can identify that snapshot, and
-    the engine must receive that local path rather than retrying the repo id.
-    """
-    from .model_aliases import resolve_model, resolve_profile
-
-    model_path = resolve_model(model_name)
-    if not force_mllm and not force_text:
-        _ensure_routing_config(model_path)
-    from .model_metadata import read_model_metadata
-
-    metadata = read_model_metadata(model_path)
-    load_path = (
-        str(metadata.snapshot_dir)
-        if metadata is not None and metadata.snapshot_dir is not None
-        else model_path
-    )
-    profile = resolve_profile(model_path)
-    decision = resolve_serving_lane_decision(
-        load_path,
-        force_mllm=force_mllm,
-        force_text=force_text,
-        vision_min_memory_gb=(
-            profile.vision_min_memory_gb if profile is not None else None
-        ),
-        requested_spec_decode=requested_spec_decode,
-    )
-    return _ServingCheckpoint(
-        model_path=model_path,
-        load_path=load_path,
-        auto_text_fallback=decision.auto_text_fallback,
-        lane_reason=decision.reason,
-    )
 
 
 def load_model(
@@ -1783,9 +1154,13 @@ def load_model(
     force_mllm: bool = False,
     gpu_memory_utilization: float = 0.90,
     prefill_step_size: int | None = None,
-    *,
+    cloud_model: str | None = None,
+    cloud_threshold: int = 20000,
+    cloud_api_base: str | None = None,
+    cloud_api_key: str | None = None,
     served_model_name: str | None = None,
     mtp: bool = False,
+    *,
     max_tokens_is_explicit: bool | None = None,
     force_text: bool = False,
     force_hybrid: bool = False,
@@ -1794,8 +1169,6 @@ def load_model(
     no_spec_decode: bool = False,
     force_openai_harmony_streaming: bool = False,
     no_openai_harmony_streaming: bool = False,
-    enable_disk_stream: bool = False,
-    disk_stream_cache_gb: float = 1.0,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -1836,12 +1209,6 @@ def load_model(
         force_spec_decode / no_spec_decode: Keyword-only. SOP §10
             escape hatches for ``ModelConfig.supports_spec_decode``
             auto-detection. Mutually exclusive.
-        enable_disk_stream / disk_stream_cache_gb: Keyword-only.
-            ``--disk-stream`` (PRD-rapid-mlx-integration.md). Forwarded
-            to ``BatchedEngine``, which loads lazily and installs
-            ``vllm_mlx.disk_stream_patch`` in ``_start_llm`` before the
-            model reaches ``AsyncEngineCore``. Default False keeps every
-            existing caller's behavior unchanged.
     """
     max_tokens_was_supplied = max_tokens is not None
     if max_tokens is None:
@@ -1928,191 +1295,34 @@ def load_model(
 
     global \
         _engine, \
-        _model_alias, \
         _model_name, \
         _model_path, \
-        _served_model_name_set, \
         _default_max_tokens, \
         _default_max_tokens_is_explicit, \
         _tool_parser_instance, \
+        _cloud_router, \
         _alias_recommended_sampling, \
         _generation_config_sampling
 
-    # ``load_model`` is also the engine-owned residency entry point; callers
-    # outside the CLI (including Desktop model replacement) can pass an alias
-    # that has not gone through ``cli.main``. Resolve that alias once, before
-    # config materialization, lane selection, and the loader consume it. This
-    # keeps those three decisions on the same checkpoint source instead of
-    # probing the alias spelling as though it were a Hub repository.
-    from .model_aliases import resolve_model, resolve_profile
-
-    requested_model_name = model_name
-    model_name = resolve_model(model_name)
-
-    # A direct alias in this request is authoritative. CLI startup reaches
-    # here with an already-canonical path, so only in that case may its saved
-    # alias be reused—and only when it still resolves to this same checkpoint.
-    # A prior resident model's alias must never lend its profile or registry
-    # identity to a replacement model.
-    effective_model_alias = (
-        requested_model_name if requested_model_name != model_name else None
-    )
-    if effective_model_alias is None and _model_alias is not None:
-        try:
-            if resolve_model(_model_alias) == model_name:
-                effective_model_alias = _model_alias
-        except Exception:  # stale prior identity; current request still owns load
-            pass
-
     _default_max_tokens = max_tokens
     _default_max_tokens_is_explicit = max_tokens_is_explicit
-    _model_alias = effective_model_alias
     _model_path = model_name
     _model_name = served_model_name or model_name
-    _served_model_name_set = bool(served_model_name)
     _tool_parser_instance = None
 
     # Populate the sampling overlays now that we know which model we're
     # serving. Both are best-effort — an alias without curated sampling
     # or a model missing generation_config.json simply contributes an
     # empty layer to the cascade in service/helpers.py.
+    from .model_aliases import resolve_profile
     from .utils.generation_config import load_generation_config_sampling
 
     _alias_recommended_sampling = None
     # resolve_profile handles both alias-name and HF-path lookups, so a
     # single call suffices regardless of which form load_model was passed.
-    _profile = resolve_profile(effective_model_alias or requested_model_name)
-    _model_config = _profile
-    if _model_config is None:
-        from .model_auto_config import detect_model_config
-
-        _model_config = detect_model_config(model_name)
+    _profile = resolve_profile(_model_alias or model_name)
     if _profile is not None and _profile.recommended_sampling:
         _alias_recommended_sampling = dict(_profile.recommended_sampling)
-
-    # Alias-declared ``is_text_only`` → the registered ``force_text``
-    # routing kwarg. When an alias profile pins ``is_text_only=True``
-    # (e.g. Ternary-Bonsai-27B: a multimodal-config checkpoint whose
-    # vision path our mlx-vlm loader can't drive, but whose text tower is
-    # coherent via mlx-lm's qwen3_5), fold that into the effective
-    # ``force_text`` so the text-only mlx-lm lane is chosen with no CLI
-    # flag. This is NOT a new routing surface: ``is_text_only`` is a
-    # state description (parallel to ``is_hybrid`` / ``is_moe``) and it
-    # feeds the SAME ``force_text`` kwarg already registered in
-    # ``AUTO_ROUTING_FLAG_PAIRS`` (``--mllm`` / ``--no-mllm``, #393).
-    #
-    # Set it UNCONDITIONALLY (do NOT gate on ``not force_mllm``): an
-    # explicit ``--mllm`` on such an alias must then collide with this
-    # ``force_text=True`` at the ``force_mllm and force_text``
-    # mutual-exclusion check below and raise loudly — an operator who
-    # insists on the (broken) MLLM path for a text-only-pinned alias gets
-    # a clear error, NOT a silent flip to the garbling MLLM engine.
-    # Gating on ``not force_mllm`` here would suppress that guard and
-    # silently select the broken path (codex #1116 BLOCKING).
-    if _profile is not None and _profile.is_text_only:
-        if not force_text:
-            logger.info(
-                "Alias profile declares is_text_only=True — routing to the "
-                "text-only mlx-lm lane (MLLM auto-detection overridden per "
-                "alias, #393)"
-            )
-        force_text = True
-        # Fail FAST on the alias-pin ↔ ``--mllm`` conflict — before the
-        # generation-config load / guardrail I/O below. The
-        # general ``force_mllm and force_text`` guard further down still
-        # covers direct ``load_model(force_mllm=True, force_text=True)``
-        # callers; this early raise just avoids doing config I/O for an
-        # invocation we already know is invalid (codex #1116 nit).
-        if force_mllm:
-            raise ValueError(
-                "force_mllm and force_text are mutually exclusive — "
-                "pick at most one to override auto-detection. "
-                "(alias pins is_text_only=True but --mllm was also given)"
-            )
-
-    # Hybrid/linear-attention VLM checkpoints (e.g. Qwen3.5/3.6/3.8 GatedDeltaNet
-    # with a vision tower) auto-route to the MLLM lane on their vision weights.
-    # Post-#1798 the MLLM engine CAN serve an ArraysCache backbone, but only in
-    # a serialized one-request-at-a-time lane (a BatchKVCache cannot be built
-    # over ArraysCache, so concurrent batching stays off — GitHub #352). Left
-    # alone, the naive ``rapid-mlx serve <flagship>`` command would boot the
-    # whole model into that B=1 lane, capping text throughput for every request.
-    # Auto-fall-back to the text-only mlx-lm lane HERE, at the routing layer,
-    # with one clear INFO line, so the common text path keeps full batching and
-    # --mllm opts into the serialized vision lane. The dense text lane serves the
-    # GatedDeltaNet backbone coherently and keeps ``is_hybrid=False`` (avoiding
-    # the metal::malloc throttle wedge the 4B/9B/27B dense variants hit under
-    # the hybrid scheduler path — see model_auto_config r6-A R6-C1).
-    #
-    # The fallback is tracked in ``_auto_text_fallback`` — a state DISTINCT
-    # from the explicit ``force_text`` / ``--no-mllm`` flag — so diagnostics say
-    # "auto-downgraded" and never falsely claim the user passed ``--no-mllm``
-    # (codex #2 on #1178). The materialize-then-probe order is load-bearing:
-    # ``_ensure_routing_config`` must run BEFORE ``resolve_serving_lane`` so a
-    # first-time uncached hybrid VLM has real config evidence and is routed on
-    # fact, not on a missing config (codex BLOCKING on #1178). Only fires in
-    # auto mode: an explicit ``--mllm`` (force_mllm) is respected so the
-    # operator who wants vision gets the serialized MLLM lane (#1798) — for a
-    # hybrid backbone that serves vision at B=1; for an arch mlx-vlm cannot
-    # drive it still errors — rather than a silent override. #352 dogfood
-    # P1-② (0.10.16).
-    #
-    # The generative-media lanes are exempt. An ``image-gen`` / ``video-gen``
-    # alias never reaches ``resolve_serving_lane``'s question at all — it
-    # branches to ImageEngine / VideoEngine below — so the MLLM-vs-text
-    # preflight has nothing to decide for it. Running it anyway is not merely
-    # wasted work: mflux-layout checkpoints keep their weights and configs in
-    # ``transformer/`` / ``text_encoder/`` / ``vae/`` subdirectories and ship
-    # no ``config.json`` at the checkpoint root, so ``_ensure_routing_config``
-    # cannot materialize one and raises. That is how the Images tab's
-    # ``z-image-turbo`` alias could never start: a fully-cached 5.5 GB
-    # checkpoint refused with an error about hybrid-VLM misrouting, a hazard
-    # that does not exist for a diffusion model.
-    _is_generative_media = _profile is not None and _profile.modality in (
-        "image-gen",
-        "video-gen",
-    )
-    _engine_model_path = model_name
-    _auto_text_fallback = False
-    _serving_lane_reason = "not_applicable"
-    if not _is_generative_media:
-        _serving_checkpoint = _resolve_serving_checkpoint(
-            model_name,
-            force_mllm=force_mllm,
-            force_text=force_text,
-            requested_spec_decode=(
-                getattr(scheduler_config, "spec_decode", "none")
-                if scheduler_config is not None
-                else "none"
-            ),
-        )
-        _engine_model_path = _serving_checkpoint.load_path
-        _auto_text_fallback = _serving_checkpoint.auto_text_fallback
-        _serving_lane_reason = _serving_checkpoint.lane_reason
-    if _auto_text_fallback:
-        fallback_detail = {
-            "vision_hybrid_runtime_unsupported": (
-                "the installed vision runtime does not support its hybrid "
-                "language backbone"
-            ),
-            "vision_architecture_unavailable": (
-                "the installed vision runtime does not provide its architecture"
-            ),
-            "vision_memory_insufficient": (
-                "its measured vision footprint exceeds this Mac's physical memory"
-            ),
-        }.get(
-            _serving_lane_reason,
-            "its vision cache contract is not supported",
-        )
-        logger.info(
-            "Model %r auto-downgraded to the text-only lane because %s. "
-            "Pass --mllm to request the vision lane explicitly, or --no-mllm "
-            "to select text-only serving explicitly.",
-            model_name,
-            fallback_detail,
-        )
-
     try:
         gen_cfg = load_generation_config_sampling(model_name)
     except Exception as _e:  # pragma: no cover — defensive belt-and-suspenders
@@ -2130,10 +1340,26 @@ def load_model(
         check_from_profile(
             model_name=model_name,
             profile=_profile,
-            alias=effective_model_alias,
+            alias=_model_alias,
         )
     except Exception as _e:  # pragma: no cover — defensive belt-and-suspenders
         logger.debug(f"mxfp4/moe guardrail probe failed (non-fatal): {_e}")
+
+    # Initialize cloud router if --cloud-model is set
+    if cloud_model:
+        from .cloud_router import CloudRouter
+
+        _cloud_router = CloudRouter(
+            cloud_model=cloud_model,
+            threshold=cloud_threshold,
+            api_base=cloud_api_base,
+            api_key=cloud_api_key,
+        )
+        logger.info(
+            f"Cloud routing enabled: model={cloud_model}, threshold={cloud_threshold} new tokens"
+        )
+    else:
+        _cloud_router = None
 
     if force_mllm and force_text:
         raise ValueError(
@@ -2164,12 +1390,6 @@ def load_model(
             "(MLLM auto-detection overridden, #393)"
         )
 
-    # The engine picks the text lane for BOTH an explicit ``--no-mllm``
-    # (``force_text``) and the automatic hybrid-backbone downgrade
-    # (``_auto_text_fallback``). Kept as separate inputs above so the log lines
-    # attribute the reason correctly; combined here to select the final lane.
-    _effective_force_text = force_text or _auto_text_fallback
-
     # Modality dispatch: ``text-diffusion`` aliases route to the
     # discrete-text-diffusion engine (mlx-vlm DiffusionGemma path).
     # Default ``text`` keeps the AR BatchedEngine flow that every
@@ -2177,29 +1397,7 @@ def load_model(
     # already-resolved alias profile so the same call (alias-name or
     # full HF path) lands on the right lane without re-resolving.
     _profile_modality = _profile.modality if _profile is not None else "text"
-    if _profile_modality == "video-gen":
-        from .runtime.video_lane import VideoEngine
-
-        _video_hf_path = _profile.hf_path if _profile is not None else model_name
-        logger.info(
-            f"Loading model with VideoEngine (modality=video-gen): {_video_hf_path}"
-        )
-        _engine = VideoEngine(model_name=_video_hf_path)
-        logger.info(f"Video model ready for lazy generation: {model_name}")
-    elif _profile_modality == "image-gen":
-        from .runtime.image_lane import ImageEngine, require_image_runtime_or_exit
-
-        _image_hf_path = _profile.hf_path if _profile is not None else model_name
-        # Preflight the optional image stack (Python ≥3.11 + mflux) BEFORE
-        # advertising a ready server, so a missing runtime fails at startup with
-        # an actionable diagnostic instead of a generic HTTP 500 on first request.
-        require_image_runtime_or_exit(_image_hf_path)
-        logger.info(
-            f"Loading model with ImageEngine (modality=image-gen): {_image_hf_path}"
-        )
-        _engine = ImageEngine(model_name=_image_hf_path)
-        logger.info(f"Image model ready for lazy generation: {model_name}")
-    elif _profile_modality == "text-diffusion":
+    if _profile_modality == "text-diffusion":
         from .runtime.diffusion_lane import DiffusionEngine
 
         # ``python -m vllm_mlx.server --model <alias>`` bypasses
@@ -2230,15 +1428,11 @@ def load_model(
     else:
         logger.info(f"Loading model with BatchedEngine: {model_name}")
         _engine = BatchedEngine(
-            model_name=_engine_model_path,
-            chat_template_id=(
-                _profile.chat_template_id if _profile is not None else None
-            ),
+            model_name=model_name,
             scheduler_config=scheduler_config,
             stream_interval=stream_interval,
             force_mllm=force_mllm,
-            force_text=_effective_force_text,
-            serving_lane_reason=_serving_lane_reason,
+            force_text=force_text,
             gpu_memory_utilization=gpu_memory_utilization,
             force_hybrid=force_hybrid,
             no_hybrid=no_hybrid,
@@ -2246,8 +1440,6 @@ def load_model(
             no_spec_decode=no_spec_decode,
             force_openai_harmony_streaming=force_openai_harmony_streaming,
             no_openai_harmony_streaming=no_openai_harmony_streaming,
-            enable_disk_stream=enable_disk_stream,
-            disk_stream_cache_gb=disk_stream_cache_gb,
         )
         logger.info(f"Model loaded: {model_name}")
 
@@ -2258,47 +1450,6 @@ def load_model(
     # prose-conversion fallback ([Calling tool: ...]) — the model then mimics
     # that format on subsequent turns. See #225.
     _sync_config()
-
-    # Opt-in prompt-deterministic response cache: configure the process
-    # singleton's LRU capacity from the resolved SchedulerConfig knob.
-    # 0 (default) keeps the cache inert. ``configure_response_cache``
-    # atomically sets capacity, clears the store, and bumps the epoch — a
-    # stored completion is only valid for the exact model artifact that
-    # produced it, but the key spans only the model id, so this (re)load
-    # invalidation prevents serving completions from a previously-loaded
-    # model after a reload of changed weights under the same id.
-    #
-    # load_model is boot-only: it is invoked once from serve_command before
-    # uvicorn begins accepting requests, and there is no runtime model-swap
-    # route. So the order in which the engine is published versus the cache
-    # invalidated cannot race with a live request — the epoch-versioned
-    # reconfigure is correctness-by-construction today, and defense-in-depth
-    # if a runtime reload endpoint is ever added.
-    #
-    # Best-effort: a cache-config failure must never block model load — but
-    # on failure the PREVIOUS cache must NOT stay live under the NEW model
-    # (that would serve stale cross-model output). The fail-safe rebinds the
-    # singleton to a fresh disabled instance via ``force_disable_response_
-    # cache`` rather than calling a method on the possibly-wedged instance
-    # that just failed — a fresh capacity-0 object is inert by construction.
-    try:
-        from .response_cache import configure_response_cache
-
-        configure_response_cache(
-            int(getattr(scheduler_config, "response_cache_entries", 0) or 0)
-        )
-    except Exception as _rc_e:
-        logger.warning(
-            f"response cache reconfigure failed on model load ({_rc_e}); "
-            "forcing the cache disabled + empty so it cannot serve stale "
-            "cross-model output"
-        )
-        try:
-            from .response_cache import force_disable_response_cache
-
-            force_disable_response_cache()
-        except Exception:  # pragma: no cover — defensive
-            pass
 
     # Set native tool format support on the engine (thread-safe via instance property)
     _engine.preserve_native_tool_format = _detect_native_tool_support()
@@ -2340,8 +1491,8 @@ def load_model(
 
     # Register in multi-model registry
     aliases = set()
-    if effective_model_alias and effective_model_alias != _model_name:
-        aliases.add(effective_model_alias)
+    if _model_alias and _model_alias != _model_name:
+        aliases.add(_model_alias)
     entry = ModelEntry(
         engine=_engine,
         model_name=_model_name,
@@ -2350,7 +1501,6 @@ def load_model(
         tool_call_parser=_tool_call_parser,
         reasoning_parser=_reasoning_parser_name,
         is_mllm=getattr(_engine, "is_mllm", False),
-        experimental=bool(_model_config is not None and _model_config.experimental),
         max_tokens=_default_max_tokens,
     )
     _model_registry.add(entry, is_default=True)
@@ -2377,248 +1527,6 @@ def load_model(
     register_audio_routes_if_enabled()
 
 
-async def _load_dynamic_resident_model(
-    model_name: str,
-    model_path: str | None,
-    performance=None,
-    image_mode: str | None = None,
-) -> ModelEntry:
-    """Construct and start one non-primary engine for the residency manager."""
-
-    from .model_aliases import resolve_model, resolve_profile
-
-    profile = resolve_profile(model_name) or (
-        resolve_profile(model_path) if model_path else None
-    )
-    resolved_path = resolve_model(
-        model_path or (profile.hf_path if profile is not None else model_name)
-    )
-    modality = profile.modality if profile is not None else "text"
-    profile_force_text = bool(profile is not None and profile.is_text_only)
-    load_path = resolved_path
-    effective_force_text = profile_force_text
-    serving_lane_reason = "not_applicable"
-    if modality == "text":
-        serving_checkpoint = _resolve_serving_checkpoint(
-            resolved_path,
-            force_text=profile_force_text,
-            # Residency loads carry no spec-decode request; keep the lane
-            # contract identical to startup (whose default is also "none").
-            requested_spec_decode="none",
-        )
-        resolved_path = serving_checkpoint.model_path
-        load_path = serving_checkpoint.load_path
-        effective_force_text = (
-            profile_force_text or serving_checkpoint.auto_text_fallback
-        )
-        serving_lane_reason = serving_checkpoint.lane_reason
-    model_config = profile
-    if model_config is None:
-        from .model_auto_config import detect_model_config
-
-        model_config = detect_model_config(load_path)
-
-    if modality == "image-gen":
-        from .runtime.image_lane import ImageEngine
-
-        engine = ImageEngine(model_name=resolved_path)
-        # Dynamic loads are explicit operator/app requests. Materialize the
-        # lazy mflux weights before returning so "resident" and budget usage
-        # have their literal meanings on the control-plane response.
-        await asyncio.to_thread(engine.ensure_resident, mode=image_mode)
-    elif modality == "text-diffusion":
-        from .runtime.diffusion_lane import DiffusionEngine
-
-        engine = DiffusionEngine(
-            model_name=resolved_path,
-            max_tokens=_default_max_tokens,
-        )
-        engine._load_blocking()  # noqa: SLF001
-        if hasattr(engine, "_loaded") and not engine._loaded:
-            await engine.start()
-        engine.generate_warmup()
-    elif modality in ("video-gen", "audio"):
-        raise RuntimeError(
-            f"runtime residency loading is not available for modality {modality!r}"
-        )
-    else:
-        from .cli import (
-            _needs_bounded_trim_free_reuse,
-            _resolve_hybrid_cache_entries,
-        )
-        from .runtime.resident_models import resident_scheduler_kwargs
-        from .scheduler import SchedulerConfig
-
-        scheduler_kwargs = resident_scheduler_kwargs(performance)
-        enable_prefix_cache = bool(scheduler_kwargs.get("enable_prefix_cache", True))
-        hybrid_cache_entries = _resolve_hybrid_cache_entries(
-            enable_prefix_cache=enable_prefix_cache,
-            explicit_value=0,
-            user_set_explicit=False,
-            model_name=load_path,
-            model_config=model_config,
-        )
-        scheduler_kwargs["hybrid_cache_entries"] = hybrid_cache_entries
-        scheduler_kwargs["non_trimmable_exact_prefix_reuse"] = (
-            hybrid_cache_entries > 0
-            and _needs_bounded_trim_free_reuse(
-                load_path,
-                model_config=model_config,
-            )
-        )
-
-        engine = BatchedEngine(
-            model_name=load_path,
-            chat_template_id=(
-                profile.chat_template_id if profile is not None else None
-            ),
-            force_text=effective_force_text,
-            serving_lane_reason=serving_lane_reason,
-            gpu_memory_utilization=_resident_gpu_memory_utilization,
-            scheduler_config=SchedulerConfig(**scheduler_kwargs),
-        )
-        await engine.start()
-        try:
-            engine.generate_warmup()
-        except Exception as exc:  # noqa: BLE001 - warmup is an optimization
-            logger.debug("Dynamic model warmup failed (non-fatal): %s", exc)
-
-    return ModelEntry(
-        engine=engine,
-        model_name=model_name,
-        model_path=resolved_path,
-        aliases=set(),
-        tool_call_parser=(profile.tool_call_parser if profile is not None else None),
-        reasoning_parser=(profile.reasoning_parser if profile is not None else None),
-        is_mllm=getattr(engine, "is_mllm", False),
-        experimental=bool(model_config is not None and model_config.experimental),
-        max_tokens=_default_max_tokens,
-    )
-
-
-def configure_model_residency(
-    *,
-    memory_limit_gb: float = 0,
-    idle_ttl_seconds: float = 0,
-    gpu_memory_utilization: float = 0.90,
-) -> ResidentModelManager:
-    """Configure the process-wide resident-model manager before startup."""
-
-    global _residency_manager
-    global _resident_memory_limit_bytes
-    global _resident_idle_ttl_seconds
-    global _resident_gpu_memory_utilization
-
-    _resident_memory_limit_bytes = max(0, int(float(memory_limit_gb) * 1024**3))
-    _resident_idle_ttl_seconds = max(0.0, float(idle_ttl_seconds))
-    _resident_gpu_memory_utilization = float(gpu_memory_utilization)
-    _residency_manager = ResidentModelManager(
-        _model_registry,
-        _load_dynamic_resident_model,
-        memory_limit_bytes=_resident_memory_limit_bytes,
-        idle_ttl_seconds=_resident_idle_ttl_seconds,
-        on_primary_handoff=_handoff_resident_primary_audio_worker,
-        on_primary_changed=_set_resident_primary,
-    )
-    get_config().residency_manager = _residency_manager
-    return _residency_manager
-
-
-class _ResidentPrimaryAudioHandoff:
-    """Adapt the audio dispatcher's lease to residency model entries."""
-
-    def __init__(self, handoff: "AudioWorkerHandoff") -> None:
-        self._handoff = handoff
-
-    def commit(self, entry: ModelEntry | None) -> None:
-        engine = entry.engine if entry is not None else None
-        self._handoff.commit(_audio_worker_for_engine(engine))
-
-    def rollback(self) -> None:
-        self._handoff.rollback()
-
-
-def _handoff_resident_primary_audio_worker(
-    entry: ModelEntry,
-) -> _ResidentPrimaryAudioHandoff:
-    """Reserve audio ownership for a transactional primary replacement."""
-
-    # The entry identifies the primary whose residency transaction owns the
-    # lease. The dispatcher is the worker-ownership SSOT and preserves that
-    # worker until commit or rollback.
-    del entry
-    from .runtime.audio_worker import AudioWorkerBusyError, audio_worker
-
-    try:
-        return _ResidentPrimaryAudioHandoff(audio_worker.begin_handoff())
-    except AudioWorkerBusyError as exc:
-        raise ResidentModelBusyError(
-            "primary model is serving active audio work"
-        ) from exc
-
-
-def _set_resident_primary(entry: ModelEntry | None) -> None:
-    """Publish a replacement assistant as the legacy/default engine."""
-
-    global _engine, _model_name, _model_alias, _model_path, _served_model_name_set
-    global _enable_auto_tool_choice, _tool_call_parser, _tool_parser_instance
-    global _reasoning_parser, _reasoning_parser_name
-
-    if entry is None:
-        _engine = None
-        _model_name = None
-        _model_alias = None
-        _model_path = None
-        _enable_auto_tool_choice = False
-        _tool_call_parser = None
-        _tool_parser_instance = None
-        _reasoning_parser = None
-        _reasoning_parser_name = None
-
-        cfg = get_config()
-        cfg.engine = None
-        cfg.model_name = None
-        cfg.model_alias = None
-        cfg.model_path = None
-        cfg.enable_auto_tool_choice = False
-        cfg.tool_call_parser = None
-        cfg.tool_parser_instance = None
-        cfg.reasoning_parser = None
-        cfg.reasoning_parser_name = None
-        cfg.ready = False
-        return
-
-    _engine = entry.engine
-    _model_name = entry.model_name
-    _model_alias = entry.model_name
-    _model_path = entry.model_path
-    # A replacement assistant has no --served-model-name override; the banner
-    # must fall back to the alias, so clear the explicit-override marker.
-    _served_model_name_set = False
-    _tool_call_parser = entry.tool_call_parser
-    _tool_parser_instance = None
-    _enable_auto_tool_choice = entry.tool_call_parser is not None
-    _reasoning_parser_name = entry.reasoning_parser
-    if entry.reasoning_parser is not None:
-        from .reasoning import get_parser
-
-        _reasoning_parser = get_parser(entry.reasoning_parser)()
-    else:
-        _reasoning_parser = None
-
-    cfg = get_config()
-    cfg.engine = entry.engine
-    cfg.model_name = entry.model_name
-    cfg.model_alias = entry.model_name
-    cfg.model_path = entry.model_path
-    cfg.enable_auto_tool_choice = _enable_auto_tool_choice
-    cfg.tool_call_parser = entry.tool_call_parser
-    cfg.tool_parser_instance = None
-    cfg.reasoning_parser = _reasoning_parser
-    cfg.reasoning_parser_name = entry.reasoning_parser
-    cfg.ready = True
-
-
 def _sync_config() -> None:
     """Copy server globals into the ServerConfig singleton.
 
@@ -2637,6 +1545,7 @@ def _sync_config() -> None:
     cfg.model_name = _model_name
     cfg.model_alias = _model_alias
     cfg.model_path = _model_path
+    cfg.inference_lock = None  # legacy, unused with BatchedEngine
     cfg.default_max_tokens = _default_max_tokens
     cfg.default_max_tokens_is_explicit = _default_max_tokens_is_explicit
     cfg.default_timeout = _default_timeout
@@ -2662,18 +1571,14 @@ def _sync_config() -> None:
     cfg.max_request_bytes = _max_request_bytes
     cfg.sse_keepalive_seconds = _sse_keepalive_seconds
     cfg.body_receive_timeout_seconds = _body_receive_timeout_seconds
+    cfg.cloud_router = _cloud_router
     cfg.gc_control = _gc_control
     cfg.no_thinking = _no_thinking
-    cfg.relocate_mid_conversation_system = _relocate_mid_conversation_system
     cfg.thinking_token_budget = _thinking_token_budget
     cfg.pin_system_prompt = _pin_system_prompt
     cfg.pinned_system_prompt_hash = _pinned_system_prompt_hash
     cfg.mcp_executor = _mcp_executor
-    cfg.mcp_init_error = _mcp_init_error
-    cfg.mcp_rejected = _mcp_rejected
-    cfg.mcp_config_path = _mcp_config_path
     cfg.model_registry = _model_registry
-    cfg.residency_manager = _residency_manager
     cfg.enable_audio_lane = _enable_audio_lane
 
 
@@ -2685,38 +1590,22 @@ from .routes.anthropic import _emit_content_pieces  # noqa: F401, E402
 # =============================================================================
 
 
-async def _start_mcp(config_path: str) -> None:
-    """Build a manager/executor pair from ``config_path`` and publish them.
+async def init_mcp(config_path: str):
+    """Initialize MCP manager from config file."""
+    global _mcp_manager, _mcp_executor
 
-    Raises on failure. Callers decide whether that is fatal —
-    :func:`init_mcp` (boot) does not, :func:`reload_mcp` (explicit user
-    action) reports it back over HTTP.
-    """
-    global _mcp_manager, _mcp_executor, _mcp_rejected
-
-    from vllm_mlx.mcp import (
-        MCPClientManager,
-        ToolExecutor,
-        ToolSandbox,
-        load_mcp_config,
-        set_sandbox,
-    )
-
-    # Issue #1716: tolerant load. A single entry that fails security
-    # validation is dropped and reported through ``/v1/mcp/servers`` rather
-    # than taking every other connector down with it.
-    config = load_mcp_config(config_path, tolerant=True)
-    _mcp_rejected = list(config.rejected)
-    for entry in _mcp_rejected:
-        logger.warning(f"MCP server '{entry.name}' rejected: {entry.error}")
-
-    # Build locally and publish only after a clean start. ``start()`` connects
-    # child processes; if it (or the wiring below) raises with some already up,
-    # stopping the local manager first is what keeps a failed init from
-    # orphaning subprocesses under a discarded, never-published manager.
-    manager = MCPClientManager(config)
     try:
-        await manager.start()
+        from vllm_mlx.mcp import (
+            MCPClientManager,
+            ToolExecutor,
+            ToolSandbox,
+            load_mcp_config,
+            set_sandbox,
+        )
+
+        config = load_mcp_config(config_path)
+        _mcp_manager = MCPClientManager(config)
+        await _mcp_manager.start()
 
         # Wire allowed_high_risk_tools from config into the global sandbox so
         # default-deny on shell/exec/eval tools respects the user's allowlist.
@@ -2726,108 +1615,21 @@ async def _start_mcp(config_path: str) -> None:
             )
         )
 
-        executor = ToolExecutor(manager)
-    except Exception:
-        try:
-            await manager.stop()
-        except Exception as stop_err:  # pragma: no cover - defensive
-            logger.warning(f"Error stopping half-started MCP manager: {stop_err}")
-        raise
+        _mcp_executor = ToolExecutor(_mcp_manager)
 
-    _mcp_manager = manager
-    _mcp_executor = executor
+        logger.info(f"MCP initialized with {len(_mcp_manager.get_all_tools())} tools")
 
-    logger.info(f"MCP initialized with {len(manager.get_all_tools())} tools")
-
-
-async def init_mcp(config_path: str):
-    """Initialize MCP manager from config file — never fatal.
-
-    Issue #1716: this used to re-raise, and it runs inside the lifespan
-    startup, so a missing config file or one unstartable server took the
-    WHOLE server down — no chat, no models, no error the desktop app could
-    render. MCP is an optional capability; failing to bring it up must
-    degrade to "no connectors" rather than "no server". The reason is kept in
-    ``_mcp_init_error`` and surfaced on ``/v1/mcp/servers`` so the app can
-    show something actionable.
-    """
-    global _mcp_manager, _mcp_executor, _mcp_init_error, _mcp_config_path
-
-    _mcp_config_path = config_path
-    _mcp_init_error = None
-
-    try:
-        await _start_mcp(config_path)
-    except ImportError:
-        _mcp_init_error = "MCP SDK not installed. Install with: pip install mcp"
-        logger.error(_mcp_init_error)
-        _mcp_manager = None
-        _mcp_executor = None
-    except Exception as e:
-        _mcp_init_error = f"Failed to initialize MCP: {e}"
-        logger.error(_mcp_init_error)
-        _mcp_manager = None
-        _mcp_executor = None
-
-    # Sync whatever we ended up with (including the None/error case) into the
-    # ServerConfig singleton so MCP routes see it. Keeping this inside
-    # init_mcp() means every code path that initializes MCP also publishes it.
-    _sync_config()
-
-
-async def reload_mcp(config_path: str | None = None) -> str | None:
-    """Tear down the running MCP manager and rebuild it from disk.
-
-    Backs ``POST /v1/mcp/reload`` (issue #1716): the desktop app edits
-    ``mcp.json`` and needs the change to take effect without restarting the
-    model, which would mean a multi-GB reload for a one-line config edit.
-
-    Returns ``None`` on success, or the error string on failure. The old
-    manager is stopped either way — a half-torn-down manager whose child
-    processes are still alive is worse than no manager.
-
-    A ``/v1/mcp/execute`` call that captured the old manager just before a
-    reload can still run against it as it is torn down; that resolves to a
-    clean "server not connected" error result (the client reports
-    ``is_connected == False``), not a crash. Concurrent reloads, which WOULD
-    corrupt the shared globals, are serialized by ``_mcp_reload_lock``.
-    """
-    global _mcp_manager, _mcp_executor, _mcp_init_error, _mcp_config_path
-    global _mcp_reload_lock
-
-    if _mcp_reload_lock is None:
-        _mcp_reload_lock = asyncio.Lock()
-
-    async with _mcp_reload_lock:
-        path = config_path or _mcp_config_path
-        if path is None:
-            _mcp_init_error = (
-                "No MCP config path known — start the server with --mcp-config"
-            )
-            _sync_config()
-            return _mcp_init_error
-
-        _mcp_config_path = path
-
-        if _mcp_manager is not None:
-            try:
-                await _mcp_manager.stop()
-            except Exception as e:  # pragma: no cover - defensive
-                logger.warning(f"Error stopping MCP manager during reload: {e}")
-        _mcp_manager = None
-        _mcp_executor = None
-
-        _mcp_init_error = None
-        try:
-            await _start_mcp(path)
-        except Exception as e:
-            _mcp_init_error = f"Failed to reload MCP: {e}"
-            logger.error(_mcp_init_error)
-            _mcp_manager = None
-            _mcp_executor = None
-
+        # Sync the newly-created manager/executor into the ServerConfig
+        # singleton so MCP routes see them. Keeping this inside init_mcp()
+        # means every code path that initializes MCP also publishes it to cfg.
         _sync_config()
-        return _mcp_init_error
+
+    except ImportError:
+        logger.error("MCP SDK not installed. Install with: pip install mcp")
+        raise
+    except Exception as e:
+        logger.error(f"Failed to initialize MCP: {e}")
+        raise
 
 
 # =============================================================================
@@ -2848,14 +1650,10 @@ from .routes.embeddings import router as _embeddings_router
 from .routes.health import admin_router as _health_admin_router
 from .routes.health import probe_router as _probe_router
 from .routes.health import router as _health_router
-from .routes.images import router as _images_router
-from .routes.mcp_routes import admin_router as _mcp_admin_router
 from .routes.mcp_routes import router as _mcp_router
 from .routes.metrics import router as _metrics_router
 from .routes.models import router as _models_router
-from .routes.residency import router as _residency_router
 from .routes.responses import router as _responses_router
-from .routes.video import router as _video_router
 
 app.include_router(_probe_router)
 app.include_router(_health_router)
@@ -2863,24 +1661,13 @@ app.include_router(_health_router)
 # ``X-Rapid-MLX-Internal: true`` gate ALSO applies when ``--api-key`` is unset.
 app.include_router(_health_admin_router)
 app.include_router(_metrics_router)
-# Keep literal residency paths ahead of ``/v1/models/{model_id:path}`` so the
-# latter cannot consume ``residency`` as an ordinary model id.
-app.include_router(_residency_router)
 app.include_router(_models_router)
 app.include_router(_chat_router)
 app.include_router(_completions_router)
 app.include_router(_anthropic_router)
 app.include_router(_responses_router)
-app.include_router(_video_router)
-# Image lane is registered unconditionally like video: a text-only server
-# answers /v1/images/generations with the 409 "image_model_not_loaded"
-# envelope (the router's own gate), never a stray 404.
-app.include_router(_images_router)
 app.include_router(_embeddings_router)
 app.include_router(_mcp_router)
-# ``/v1/mcp/reload`` — separate router so the Bearer-OR-x-api-key gate applies
-# even when ``--api-key`` is unset (mirrors ``_health_admin_router``).
-app.include_router(_mcp_admin_router)
 # Task #292: ``_audio_router`` is registered LAZILY (after model load) by
 # :func:`register_audio_routes_if_enabled` — text-only servers (Bo R13/R14
 # fuzz wave: Qwen3-7B-4bit, etc.) must answer ``/v1/audio/*`` with a
@@ -2925,17 +1712,16 @@ def register_audio_routes_if_enabled() -> bool:
 
 def main():
     """Run the server."""
-    if os.environ.get("RAPID_PYSAMPLE"):
-        from ._pysample import install as _pysample_install
-
-        _pysample_install()
     parser = argparse.ArgumentParser(
         description="Rapid-MLX OpenAI-compatible server for LLM and MLLM inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Start the server
+    # Start with simple mode (maximum throughput)
     python -m vllm_mlx.server --model mlx-community/Llama-3.2-3B-Instruct-4bit
+
+    # Start with continuous batching (for multiple users)
+    python -m vllm_mlx.server --model mlx-community/Llama-3.2-3B-Instruct-4bit --continuous-batching
 
     # With MCP tools
     python -m vllm_mlx.server --model mlx-community/Qwen3-4B-4bit --mcp-config mcp.json
@@ -2973,7 +1759,7 @@ Examples:
     parser.add_argument(
         "--mllm",
         action="store_true",
-        help="Force loading as MLLM (multimodal language model). Also disables the automatic text-only fallback: a vision-config checkpoint with no usable vision tower normally auto-degrades to text-only serving (#1187), but with --mllm it hard-fails instead.",
+        help="Force loading as MLLM (multimodal language model)",
     )
     parser.add_argument(
         "--no-mllm",
@@ -3042,6 +1828,12 @@ Examples:
         default=False,
         help="Force-off HarmonyStreamingRouter upgrade; use legacy state machine. Mutually exclusive with --force-openai-harmony-streaming.",
     )
+    parser.add_argument(
+        "--continuous-batching",
+        action="store_true",
+        default=True,
+        help="Enable continuous batching (default: on).",
+    )
     # PFlash long-prompt prefill compression (#287). Off by default. The
     # unified ``rapid-mlx serve`` CLI exposes the same surface; we mirror
     # it here so the standalone ``python -m vllm_mlx.server`` path is
@@ -3049,8 +1841,18 @@ Examples:
     from .cli import _add_pflash_args as _add_pflash_args_to_server_parser
 
     _add_pflash_args_to_server_parser(parser)
+    # Deprecated flags — accepted silently to avoid breaking user scripts
     import argparse as _ap
 
+    parser.add_argument(
+        "--simple-engine", action="store_true", default=False, help=_ap.SUPPRESS
+    )
+    parser.add_argument(
+        "--kv-bits", type=int, default=None, choices=[4, 8], help=_ap.SUPPRESS
+    )
+    parser.add_argument("--kv-group-size", type=int, default=64, help=_ap.SUPPRESS)
+    parser.add_argument("--draft-model", type=str, default=None, help=_ap.SUPPRESS)
+    parser.add_argument("--num-draft-tokens", type=int, default=4, help=_ap.SUPPRESS)
     # TurboQuant flags — MUST match ``rapid-mlx serve`` (cli.py) choice
     # set + defaults so this standalone entry is functionally at parity.
     # Pre-#969, this parser was missing the ``"none"`` off-switch added
@@ -3190,25 +1992,29 @@ Examples:
         "Larger values may improve TTFT on Apple Silicon with sufficient memory.",
     )
     parser.add_argument(
-        "--vision-prefill-token-budget",
-        type=int,
+        "--cloud-model",
+        type=str,
         default=None,
-        help=(
-            "Advanced per-vision-request admission budget. Defaults to 8192; "
-            "explicit --prefill-step-size keeps the legacy shared limit."
-        ),
+        help="Cloud model string for litellm (e.g. 'anthropic/claude-sonnet-4-5-20250929'). "
+        "When set, large-context requests are routed to the cloud provider.",
     )
     parser.add_argument(
-        "--vision-min-pixels",
+        "--cloud-threshold",
         type=int,
-        default=0,
-        help="Minimum pixels for dynamic-resolution VLM inputs (0: model default).",
+        default=20000,
+        help="New token threshold to trigger cloud routing (default: 20000)",
     )
     parser.add_argument(
-        "--vision-max-pixels",
-        type=int,
-        default=0,
-        help="Maximum pixels for dynamic-resolution VLM inputs (0: model default).",
+        "--cloud-api-base",
+        type=str,
+        default=None,
+        help="Custom API base URL for cloud model (for OpenAI-compatible providers like Zhipu).",
+    )
+    parser.add_argument(
+        "--cloud-api-key",
+        type=str,
+        default=None,
+        help="API key for cloud model (overrides environment variable).",
     )
     # Task #292: mirror the ``rapid-mlx serve`` ``--enable-audio`` flag
     # on the legacy ``python -m vllm_mlx.server`` entrypoint so the same
@@ -3311,32 +2117,6 @@ Examples:
     if args.mcp_config:
         os.environ["RAPID_MLX_MCP_CONFIG"] = args.mcp_config
 
-    # Resolve checkpoint/profile metadata lazily and at most once for every
-    # standalone-server default below. Cache admission is best-effort; parser,
-    # PFlash, and TurboQuant retain their existing error policy when they are
-    # the first consumer.
-    auto_config = None
-    auto_config_resolved = False
-
-    def resolve_auto_config(*, non_fatal: bool):
-        nonlocal auto_config, auto_config_resolved
-        if auto_config_resolved:  # pragma: no cover - callers guard resolved state
-            return auto_config
-        try:
-            from .model_auto_config import detect_model_config
-        except ImportError:
-            auto_config_resolved = True
-            return None
-        try:
-            auto_config = detect_model_config(args.model)
-        except Exception as exc:
-            if not non_fatal:
-                raise
-            logger.debug("Auto-detection failed (non-fatal): %s", exc)
-            return None
-        auto_config_resolved = True
-        return auto_config
-
     # Auto-detect parser config from model name when not explicitly set.
     # SOP §10: honor --no-tool-call-parser / --no-reasoning-parser opt-
     # outs so this entrypoint matches the unified CLI behavior.
@@ -3351,7 +2131,9 @@ Examples:
             "--reasoning-parser and --no-reasoning-parser are mutually exclusive"
         )
     if not args.tool_call_parser or not args.reasoning_parser:
-        resolve_auto_config(non_fatal=False)
+        from .model_auto_config import detect_model_config
+
+        auto_config = detect_model_config(args.model)
         if auto_config:
             if (
                 not args.tool_call_parser
@@ -3413,78 +2195,22 @@ Examples:
     # was silently dropped — same bug class as #400. The unified rapid-mlx
     # CLI builds a richer SchedulerConfig in cli.py; the standalone path only
     # exposes a small subset of flags, so we plumb just those.
-    from .model_aliases import resolve_profile as _srv_resolve_profile
-    from .pflash import resolve_pflash_config as _server_pflash_resolve_config
+    from .pflash import config_from_args as _server_pflash_config_from_args
+    from .pflash import resolve_effective_is_mllm as _server_resolve_effective_is_mllm
+    from .pflash import resolve_pflash_mode_default as _server_pflash_resolve_default
     from .pflash import validate_model_support as _server_pflash_validate
     from .scheduler import SchedulerConfig
 
     # Per-alias PFlash default (#287): verified Qwen3.5 / Qwen3.6 aliases
     # switch to ``always`` when the user passes no ``--pflash`` flag; all
     # other aliases keep the conservative ``off``. Explicit overrides win.
-    #
-    # Resolve the FINAL serving lane once. PFlash defaulting and
-    # ``validate_model_support`` must both see the effective lane, NOT the raw
-    # multimodal classification: a hybrid VLM that auto-downgrades to the
-    # text-only lane is PFlash-capable there, exactly as an explicit
-    # ``--text-only`` run would be (#352 dogfood P1-②).
-    #
-    # Only materialize the checkpoint config when we actually need to
-    # AUTO-detect the lane (neither ``--mllm`` nor ``--no-mllm`` given). An
-    # explicit lane flag short-circuits ``resolve_serving_lane`` before it reads
-    # any config, so materializing there is unnecessary — and running the
-    # ``_ensure_routing_config`` fail-fast would DENY the very ``--no-mllm``
-    # escape hatch its own error message advertises when the config cannot be
-    # fetched. Mirror ``load_model()``'s flag-first skip (codex BLOCKING #1178).
-    # Same generative-media exemption as ``load_model`` above: an image-gen /
-    # video-gen alias branches to its own engine and never asks the
-    # MLLM-vs-text question, while an mflux-layout checkpoint has no
-    # root-level config.json for the preflight to materialize.
-    _srv_profile = _srv_resolve_profile(args.model)
-    _srv_generative_media = _srv_profile is not None and _srv_profile.modality in (
-        "image-gen",
-        "video-gen",
-    )
-    _srv_force_mllm = getattr(args, "mllm", False)
-    _srv_force_text = getattr(args, "no_mllm", False)
-    if not _srv_force_mllm and not _srv_force_text and not _srv_generative_media:
-        _ensure_routing_config(args.model)
-    _srv_requested_spec_decode = getattr(args, "spec_decode", "none") or "none"
-    if _srv_requested_spec_decode == "none" and getattr(
-        args, "force_spec_decode", False
-    ):
-        _srv_requested_spec_decode = "auto"
-    _srv_is_mllm, _ = resolve_serving_lane(
-        args.model,
-        force_mllm=_srv_force_mllm,
-        force_text=_srv_force_text,
-        requested_spec_decode=_srv_requested_spec_decode,
-    )
-    # Resolve mode AND per-alias keep_ratio through the single shared helper —
-    # the same call ``cli.py`` uses for ``serve``/``bench``. Going through
-    # ``resolve_pflash_config`` (rather than ``resolve_pflash_mode_default`` +
-    # ``config_from_args`` directly) is what applies a per-alias
-    # ``pflash_keep_ratio`` override (#1458): a verified alias pinned at a
-    # non-default ratio (e.g. bonsai-27b-2bit @0.50, whose mid-prompt recall
-    # collapses to 1/5 at the 0.20 engine default) would otherwise auto-enable
-    # PFlash at the lossy 0.20 here while ``rapid-mlx serve`` used 0.50 — the
-    # two serving entrypoints must not drift. It mutates ``args.pflash`` and
-    # ``args.pflash_keep_ratio`` in place so later readers see resolved values.
+    args.pflash = _server_pflash_resolve_default(args, model_name=args.model)
     try:
-        pflash_detection = {}
-        if auto_config_resolved:
-            pflash_detection["_detected_config"] = auto_config
-        elif args.pflash is None or args.pflash_keep_ratio is None:
-            pflash_detection["_detected_config"] = resolve_auto_config(non_fatal=False)
-        server_pflash_config = _server_pflash_resolve_config(
-            args,
-            model_name=args.model,
-            is_multimodal=_srv_is_mllm,
-            **pflash_detection,
-        )
+        server_pflash_config = _server_pflash_config_from_args(args)
         _server_pflash_validate(
             server_pflash_config,
             model_name=args.model,
-            is_mllm=_srv_is_mllm,
+            is_mllm=_server_resolve_effective_is_mllm(args, model_name=args.model),
         )
     except ValueError as e:
         parser.error(str(e))
@@ -3503,67 +2229,12 @@ Examples:
         turboquant_scheduler_kwargs as _server_turboquant_scheduler_kwargs,
     )
 
-    turboquant_detection = {}
-    if auto_config_resolved:
-        turboquant_detection["_detected_config"] = auto_config
-    elif getattr(args, "kv_cache_turboquant", None) is None and not getattr(
-        args, "kv_cache_quantization", False
-    ):
-        turboquant_detection["_detected_config"] = resolve_auto_config(non_fatal=False)
     args.kv_cache_turboquant = _server_turboquant_resolve_default(
-        args, model_name=args.model, **turboquant_detection
-    )
-
-    if args.vision_min_pixels < 0 or args.vision_max_pixels < 0:
-        parser.error("vision pixel bounds must be non-negative")
-    if (
-        args.vision_min_pixels
-        and args.vision_max_pixels
-        and args.vision_min_pixels > args.vision_max_pixels
-    ):
-        parser.error("--vision-min-pixels must not exceed --vision-max-pixels")
-
-    import sys
-
-    prefill_user_set_explicit = "--prefill-step-size" in sys.argv or any(
-        value.startswith("--prefill-step-size=") for value in sys.argv
-    )
-    vision_prefill_token_budget = args.vision_prefill_token_budget
-    if vision_prefill_token_budget is None:
-        vision_prefill_token_budget = (
-            args.prefill_step_size if prefill_user_set_explicit else 8192
-        )
-    if vision_prefill_token_budget <= 0:
-        parser.error("--vision-prefill-token-budget must be positive")
-
-    if not auto_config_resolved:
-        resolve_auto_config(non_fatal=True)
-    from .cli import (
-        _needs_bounded_trim_free_reuse,
-        _resolve_hybrid_cache_entries,
-    )
-
-    hybrid_cache_entries = _resolve_hybrid_cache_entries(
-        enable_prefix_cache=True,
-        explicit_value=0,
-        user_set_explicit=False,
-        model_name=args.model,
-        model_config=auto_config,
+        args, model_name=args.model
     )
 
     scheduler_config = SchedulerConfig(
         prefill_step_size=args.prefill_step_size,
-        vision_prefill_token_budget=vision_prefill_token_budget,
-        vision_min_pixels=args.vision_min_pixels,
-        vision_max_pixels=args.vision_max_pixels,
-        hybrid_cache_entries=hybrid_cache_entries,
-        non_trimmable_exact_prefix_reuse=(
-            hybrid_cache_entries > 0
-            and _needs_bounded_trim_free_reuse(
-                args.model,
-                model_config=auto_config,
-            )
-        ),
         pflash_config=server_pflash_config,
         **_server_turboquant_scheduler_kwargs(args),
     )
@@ -3595,6 +2266,10 @@ Examples:
         max_tokens_is_explicit=_max_tokens_is_explicit,
         force_mllm=args.mllm,
         force_text=args.no_mllm,
+        cloud_model=args.cloud_model,
+        cloud_threshold=args.cloud_threshold,
+        cloud_api_base=args.cloud_api_base,
+        cloud_api_key=args.cloud_api_key,
         force_hybrid=getattr(args, "force_hybrid", False),
         no_hybrid=getattr(args, "no_hybrid", False),
         force_spec_decode=getattr(args, "force_spec_decode", False),
