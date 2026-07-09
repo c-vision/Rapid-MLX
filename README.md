@@ -250,6 +250,14 @@ The same downloader is also available directly from Python for scripting: `from 
 
 This fork is periodically synced with upstream's `main` branch (currently tracking v0.10.2) so it keeps upstream's bug fixes and new model support, on top of the additions above.
 
+### 5. PFlash now respects `--no-mllm`/`--text-only`
+
+`serve`/`bench`/the standalone server entrypoint all computed the `is_mllm` flag for PFlash's multimodal-rejection gate as `args.mllm or is_mllm_model(args.model)` — none of the three checked `args.no_mllm`, even though `--no-mllm`/`--text-only` forces `force_text=True` at the engine boundary, which sets `BatchedEngine._is_mllm = False` unconditionally (`engine/batched.py`) and routes the request through the exact same plain-text scheduler path any text-only checkpoint uses.
+
+So a genuinely vision-capable checkpoint (real `vision_tower` weights in its safetensors — not the `#393` text-only-fork case `is_mllm_model()` already handles) forced into `--text-only` mode still had `--pflash` rejected for a code path it was never going to run. Verified directly against `mlx-community/Qwen3.6-27B-4bit`: 333 real `vision_tower.*` tensors in `model.safetensors.index.json`, confirming this isn't the `#393` case — yet `rapid-mlx serve <path> --text-only --no-mllm --pflash auto` failed immediately with `--pflash is not supported for multimodal models`.
+
+Fixed by extracting the computation into `pflash.resolve_effective_is_mllm()`, used by all three call sites instead of the duplicated inline expression, with unit tests covering the `--no-mllm` override, `--mllm` force-on precedence, and the conflicting-flags case (`tests/test_pflash.py::TestResolveEffectiveIsMllm`).
+
 ## Installation
 
 This fork isn't published to PyPI or Homebrew — install it from source:
