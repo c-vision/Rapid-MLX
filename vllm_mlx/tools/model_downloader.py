@@ -2,13 +2,18 @@
 """
 Model downloader — fetches a full HuggingFace model repo (e.g. an MLX model,
 which is a directory of config/tokenizer/weight-shard files, not a single
-file) into a local directory, with resume support, parallel per-file
-transfers, and SHA256 verification of LFS-tracked files.
+file) into a local directory, with resume support and SHA256 verification
+of LFS-tracked files.
 
-Actual file transfer is delegated to huggingface_hub.snapshot_download
-(already a core dependency) rather than reimplementing HTTP range-request
-resume/retry logic — that's exactly what it's for, and it already handles
-LFS redirects, partial-download resume, and per-file parallelism correctly.
+Default transfer mechanism is plain `curl` (see `_curl_download_worker`),
+one file at a time. huggingface_hub.snapshot_download is still available
+(`use_curl=False` / `--no-curl`) but is no longer the default — observed
+directly, repeatedly, on a real repo: huggingface_hub's own client can
+sit at 0 bytes for 5+ minutes at a time (Xet or classic HTTP, with or
+without a token) on a repo/session that a single `curl --range` request
+transfers real data on on the very same network, same moment. HuggingFace
+appears to throttle the higher-request-volume automated client pattern
+independently of the content or network itself.
 """
 
 from __future__ import annotations
@@ -52,6 +57,73 @@ def _snapshot_download_worker(
     """
     try:
         snapshot_download(repo_id=model_id, local_dir=final_dir, max_workers=max_workers, token=token)
+        result_queue.put(("ok", None))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+
+
+def _curl_download_worker(
+    model_id: str, final_dir: str, token: Optional[str], result_queue
+) -> None:
+    """Downloads every file in the repo with plain `curl` instead of
+    huggingface_hub — a fallback for when huggingface_hub's own client
+    can't make progress on a repo/session that a single curl request
+    demonstrably can.
+
+    Observed directly on a real stuck transfer: huggingface_hub sat at
+    0 bytes for 5+ minutes repeatedly (Xet and classic HTTP, with and
+    without a token, on both the merged and pre-merge code — none of
+    those were the actual variable), while a single `curl --range`
+    request to the exact same file transferred real data in the same
+    window. huggingface_hub issues many more requests per download
+    (metadata, redirects, per-file/per-worker parallelism) than one
+    curl call — consistent with HuggingFace throttling that higher-
+    volume automated client pattern specifically, not the content or
+    network itself.
+
+    Sequential, one file at a time — deliberately not parallelized,
+    since the whole point is to keep the request pattern as close as
+    possible to the single low-volume request that worked. Writes
+    straight to the final filename with curl's own `-C -` resume (no
+    separate `.incomplete` staging), so an interrupted file resumes
+    cleanly from its own last byte on retry — no duplicate-attempt
+    debris like huggingface_hub's local_dir resume can leave behind.
+    """
+    import subprocess
+
+    try:
+        final_dir_path = Path(final_dir)
+        final_dir_path.mkdir(parents=True, exist_ok=True)
+
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        resp = requests.get(
+            f"https://huggingface.co/api/models/{model_id}",
+            params={"blobs": "true"},
+            headers=headers,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        siblings = resp.json().get("siblings", [])
+        if not siblings:
+            result_queue.put(("error", "could not fetch repo file manifest"))
+            return
+
+        for sibling in siblings:
+            filename = sibling.get("rfilename")
+            if not filename:
+                continue
+            dest = final_dir_path / filename
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            url = f"https://huggingface.co/{model_id}/resolve/main/{filename}"
+            cmd = ["curl", "-fL", "-C", "-", "--retry", "50", "--retry-delay", "3", "--retry-max-time", "0"]
+            if token:
+                cmd += ["-H", f"Authorization: Bearer {token}"]
+            cmd += ["-o", str(dest), url]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                result_queue.put(("error", f"curl failed on {filename} (exit {proc.returncode}): {proc.stderr.strip()[-500:]}"))
+                return
+
         result_queue.put(("ok", None))
     except Exception as e:
         result_queue.put(("error", str(e)))
@@ -227,6 +299,7 @@ class ModelDownloader:
         max_attempts: int,
         max_workers: int,
         total_bytes: Optional[int],
+        use_curl: bool = True,
     ) -> tuple[bool, Optional[str], bool]:
         """Runs up to max_attempts download attempts, restarting the
         subprocess whenever final_dir's total size hasn't grown in
@@ -255,10 +328,16 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
 
         for attempt in range(1, max_attempts + 1):
             result_queue = ctx.Queue()
-            proc = ctx.Process(
-                target=_snapshot_download_worker,
-                args=(model_id, str(final_dir), max_workers, token, result_queue),
-            )
+            if use_curl:
+                proc = ctx.Process(
+                    target=_curl_download_worker,
+                    args=(model_id, str(final_dir), token, result_queue),
+                )
+            else:
+                proc = ctx.Process(
+                    target=_snapshot_download_worker,
+                    args=(model_id, str(final_dir), max_workers, token, result_queue),
+                )
             proc.start()
 
             start_time = time.monotonic()
@@ -325,8 +404,8 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
                     return False, "download process exited without reporting a result", False
                 status, err = result_queue.get()
                 return (True, None, False) if status == "ok" else (False, err, False)
-            # Stalled: loop retries, snapshot_download resumes the partial
-            # files already on disk instead of starting over.
+            # Stalled: loop retries, the worker (snapshot_download or curl)
+            # resumes the partial files already on disk instead of starting over.
 
         return False, f"gave up after {max_attempts} stalled retries", True
 
@@ -341,6 +420,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         max_workers: Optional[int] = None,
         disable_xet: bool = False,
         total_bytes: Optional[int] = None,
+        use_curl: bool = True,
     ) -> tuple[bool, Optional[str]]:
         """Runs the download, retrying stalls, and escalating once if every
         attempt in a row stalls out.
@@ -367,6 +447,11 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         is wrong, not a blip a third or fourth identical retry would fix;
         the real remedy is the Xet fallback below, not more attempts on
         the same transport.
+
+        `use_curl=True` bypasses huggingface_hub (and the Xet
+        escalation dance above, which doesn't apply to it) entirely —
+        see `_curl_download_worker`. Only one phase of `max_attempts`
+        runs in this mode.
         """
         # huggingface_hub's own tqdm bar and our heartbeat below both write
         # to the same terminal line independently — left enabled, they
@@ -388,9 +473,10 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         max_workers = max_workers if max_workers is not None else self.MAX_CONCURRENT_DOWNLOADS
 
         ok, err, all_stalled = self._run_stall_attempts(
-            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, max_attempts, max_workers, total_bytes
+            model_id, final_dir, show_progress, stall_seconds, stall_minutes, token, max_attempts, max_workers,
+            total_bytes, use_curl,
         )
-        if ok or not all_stalled or _env_is_true(self.XET_DISABLE_VAR):
+        if use_curl or ok or not all_stalled or _env_is_true(self.XET_DISABLE_VAR):
             return ok, err
 
         if show_progress:
@@ -416,6 +502,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
         max_workers: Optional[int] = None,
         disable_xet: bool = False,
         no_token: bool = False,
+        use_curl: bool = True,
     ) -> tuple[bool, Optional[str]]:
         """
         Download a full model repo, with resume support and SHA256
@@ -436,12 +523,14 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
                 Defaults to STALL_RETRIES (1) if not given.
             max_workers: Parallel per-file transfers passed straight to
                 `snapshot_download`. Defaults to MAX_CONCURRENT_DOWNLOADS
-                (8) if not given.
+                (8) if not given. Only used when `use_curl=False` — curl
+                mode is always sequential, see `use_curl`.
             disable_xet: Skip the Xet transport entirely and start straight
                 on the classic HTTP/LFS path — worth setting once a repo is
                 known to stall on Xet, to skip the wasted wait to
                 rediscover that. Default: False (still auto-escalates if
-                Xet turns out to be broken, same as always).
+                Xet turns out to be broken, same as always). Only used
+                when `use_curl=False` (curl never uses Xet).
             no_token: Ignore HF_TOKEN even if it's set and download
                 unauthenticated. Worth trying if authenticated transfers are
                 stalling for a repo/token combination that's seen heavy
@@ -449,6 +538,16 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
                 tracked separately, so one can be throttled while the other
                 isn't. Default: False (use HF_TOKEN when present, same as
                 always).
+            use_curl: Download every file with plain `curl --range`, one
+                file at a time, instead of huggingface_hub. **Default:
+                True** — huggingface_hub's own client can sit at 0 bytes
+                for 5+ minutes on a repo/session that a single curl
+                request transfers real data on, observed repeatedly;
+                HuggingFace appears to throttle the higher-request-volume
+                automated client pattern independently of the content or
+                network itself. Set to False (`--no-curl`) to use
+                huggingface_hub instead — keeps Xet support and parallel
+                per-file workers, at the cost of that throttling risk.
 
         Returns:
             Tuple of (success, final directory path or None on failure).
@@ -501,6 +600,7 @@ Prints a heartbeat on every poll (every STALL_POLL_SECONDS) regardless
             max_workers=max_workers,
             disable_xet=disable_xet,
             total_bytes=total_bytes,
+            use_curl=use_curl,
         )
         if not ok:
             self.status_manager.set_model_status(model_id, "error", error=err or "download failed")
@@ -533,6 +633,7 @@ def download_model(
     max_workers: Optional[int] = None,
     disable_xet: bool = False,
     no_token: bool = False,
+    use_curl: bool = True,
 ) -> tuple[bool, Optional[str]]:
     """
     Convenience function to download a model.
@@ -547,12 +648,19 @@ def download_model(
         retries: Retries beyond the first attempt before giving up on a
             phase. Defaults to ModelDownloader.STALL_RETRIES (1).
         max_workers: Parallel per-file transfers. Defaults to
-            ModelDownloader.MAX_CONCURRENT_DOWNLOADS (8).
+            ModelDownloader.MAX_CONCURRENT_DOWNLOADS (8). Only used when
+            use_curl=False.
         disable_xet: Skip Xet and start on the classic HTTP/LFS path —
             worth setting once a repo is known to stall on Xet. Default:
             False (still auto-escalates if Xet turns out to be broken).
+            Only used when use_curl=False.
         no_token: Ignore HF_TOKEN even if set, download unauthenticated.
             Default: False.
+        use_curl: Download with plain curl instead of huggingface_hub, one
+            file at a time. Default: True — huggingface_hub's own client
+            has been observed sitting at 0 bytes for 5+ minutes on a
+            repo/session a single curl request transfers real data on.
+            Set False (--no-curl) to use huggingface_hub instead.
 
     Returns:
         Tuple of (success: bool, final directory path or None on failure)
@@ -567,4 +675,5 @@ def download_model(
         max_workers=max_workers,
         disable_xet=disable_xet,
         no_token=no_token,
+        use_curl=use_curl,
     )

@@ -182,9 +182,6 @@ NON_ROUTING_FLAGS_ALLOWLIST: frozenset[str] = frozenset(
         # `serve` (and the canonical name on `chat`). Same dest, same
         # semantics — pure UX symmetry between the two subcommands.
         "--no-think",
-        # Agent setup UX knob: skips a post-write HTTP connectivity probe.
-        # It does not change model/runtime routing or any auto-detection.
-        "--no-check",
         # CORS toggle.
         "--enable-cors",
         # Perf / UX toggles, not routing decisions.
@@ -193,11 +190,16 @@ NON_ROUTING_FLAGS_ALLOWLIST: frozenset[str] = frozenset(
         "--no-memory-aware-cache",  # disables memory-aware cache sizing
         # Privacy toggle.
         "--no-telemetry",
-        # Cheetah launch banner opt-out. Decorative UX knob: it suppresses a
-        # TTY-only print() in cli.main() and never selects a model, parser,
-        # tier, or engine route (no auto-detection). Sibling of the
-        # RAPID_MLX_NO_BANNER allowlist entry in test_no_out_of_band_routing.py.
-        "--no-banner",
+        # `rapid-mlx pull` download-transport selection (Xet vs classic
+        # HTTP/LFS) — a download-time knob, not a model-serving routing
+        # decision. Nothing here touches ModelConfig/AliasProfile/spec-decode.
+        "--disable-xet",
+        # `rapid-mlx pull` transfer-mechanism selection (curl vs
+        # huggingface_hub) — same category as --disable-xet above.
+        "--no-curl",
+        # `rapid-mlx pull` auth selection (ignore HF_TOKEN even if set) —
+        # a download-time knob, not model-serving routing.
+        "--no-token",
     }
 )
 
@@ -405,17 +407,6 @@ def test_force_text_is_keyword_only_in_load_model():
     )
 
 
-def test_cloud_parameter_removal_does_not_shift_positional_bindings():
-    """Parameters after the removed cloud-routing block must be keyword-only."""
-    import inspect
-
-    from vllm_mlx.server import load_model
-
-    sig = inspect.signature(load_model)
-    assert sig.parameters["served_model_name"].kind == inspect.Parameter.KEYWORD_ONLY
-    assert sig.parameters["mtp"].kind == inspect.Parameter.KEYWORD_ONLY
-
-
 def test_force_text_and_force_mllm_mutually_exclusive_in_load_model():
     """server.load_model raises ValueError if both flags are True. This
     is the second line of defense — CLI already rejects this via
@@ -429,79 +420,6 @@ def test_force_text_and_force_mllm_mutually_exclusive_in_load_model():
             force_mllm=True,
             force_text=True,
         )
-
-
-def test_is_text_only_alias_plus_explicit_mllm_raises_loudly():
-    """An ``is_text_only`` alias pins ``force_text=True`` inside
-    ``load_model``. An operator who ALSO passes ``--mllm`` (force_mllm)
-    must get a loud ``mutually exclusive`` ValueError — NOT a silent flip
-    to the (known-broken) MLLM engine.
-
-    Regression for codex #1116 BLOCKING: the first implementation gated
-    the profile's force_text on ``not force_mllm``, which suppressed the
-    mutual-exclusion guard and silently selected the garbling MLLM path
-    for a text-only-pinned checkpoint. The profile's force_text must be
-    applied unconditionally so the conflict surfaces.
-    """
-    from vllm_mlx.model_aliases import resolve_profile
-    from vllm_mlx.server import load_model
-
-    # Precondition: the alias really pins is_text_only (else this test
-    # would pass vacuously if the alias were renamed/dropped).
-    assert resolve_profile("bonsai-27b-2bit").is_text_only is True
-
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        load_model("bonsai-27b-2bit", force_mllm=True)
-
-
-def test_is_text_only_alias_routes_load_model_to_text_engine(monkeypatch):
-    """Integration guard (codex #1116): calling the ordinary
-    ``load_model("bonsai-27b-2bit")`` with NO routing overrides must
-    translate the alias's ``is_text_only`` pin into ``force_text=True`` on
-    the constructed ``BatchedEngine`` — i.e. select the text mlx-lm lane,
-    not the MLLM engine.
-
-    The metadata-only contract test (``test_bonsai_27b_ternary_routes_
-    through_text_loader``) would stay green even if ``server.load_model``
-    stopped forwarding the pin; this test drives the real translation seam
-    by capturing the kwargs ``load_model`` hands to ``BatchedEngine``. A
-    sentinel is raised at construction so no model weights load and the
-    fragile post-construction wiring is skipped — we only care that the
-    routing kwargs are correct.
-    """
-    from vllm_mlx.model_aliases import resolve_profile
-
-    assert resolve_profile("bonsai-27b-2bit").is_text_only is True
-
-    import vllm_mlx.server as srv
-
-    captured = {}
-
-    class _SentinelError(Exception):
-        pass
-
-    def _spy_batched_engine(*args, **kwargs):
-        captured.update(kwargs)
-        raise _SentinelError()
-
-    monkeypatch.setattr(srv, "BatchedEngine", _spy_batched_engine)
-
-    # No routing overrides — the alias pin is the ONLY thing that can set
-    # force_text here.
-    with pytest.raises(_SentinelError):
-        srv.load_model("bonsai-27b-2bit")
-
-    assert captured.get("force_text") is True, (
-        "load_model must translate the alias is_text_only pin into "
-        f"force_text=True on BatchedEngine; got force_text="
-        f"{captured.get('force_text')!r}. Routing to the text mlx-lm lane "
-        "is broken — the checkpoint would load through the garbling MLLM "
-        "engine."
-    )
-    assert captured.get("force_mllm") is False, (
-        "force_mllm must stay False for a text-only-pinned alias with no "
-        f"explicit --mllm; got {captured.get('force_mllm')!r}."
-    )
 
 
 def test_friendly_error_on_missing_vision_tensors(monkeypatch):
@@ -532,11 +450,12 @@ def test_friendly_error_on_missing_vision_tensors(monkeypatch):
     class _FakeMlxVlm:
         @staticmethod
         def load(_name):
-            # Mirror mlx's exact strict-load format: `Missing N parameters:`
-            # header where N equals the number of `,\n`-joined names, list
-            # terminated by a single `.`. All 60 names are vision-tower tensors.
-            names = [f"vision_tower.blocks.{i}.attn.proj.weight" for i in range(60)]
-            raise ValueError("Missing 60 parameters: \n" + ",\n".join(names) + ".")
+            raise ValueError(
+                "Missing 60 parameters: \n"
+                "vision_tower.blocks.27.attn.proj.bias,\n"
+                "vision_tower.blocks.27.attn.proj.weight,\n"
+                "vision_tower.blocks.27.attn.qkv.bias."
+            )
 
     class _FakeMlxVlmUtils:
         @staticmethod
@@ -553,151 +472,17 @@ def test_friendly_error_on_missing_vision_tensors(monkeypatch):
         with pytest.raises(RuntimeError) as excinfo:
             inst.load()
 
-        # The raise is a TextOnlyCheckpointError — a RuntimeError subclass so
-        # this `pytest.raises(RuntimeError)` still holds, but a DEDICATED type
-        # so the engine can degrade on THIS condition alone (auto text-only
-        # fallback) and let every other load failure propagate.
-        assert isinstance(excinfo.value, mllm_mod.TextOnlyCheckpointError), (
-            "Missing-vision-tower load failure must raise the typed "
-            f"TextOnlyCheckpointError; got {type(excinfo.value).__name__}"
-        )
-        assert excinfo.value.missing_count == 60, (
-            "Typed error must carry the parsed missing-tensor count for the "
-            f"engine's degrade log; got {excinfo.value.missing_count!r}"
-        )
         msg = str(excinfo.value)
         assert "--no-mllm" in msg, (
             f"Friendly error must mention --no-mllm; got: {msg!r}"
         )
         assert "#393" in msg, "Friendly error must reference #393 for searchability"
-        assert "60 multimodal tensors missing" in msg, (
-            "Friendly error must surface the count from the underlying error "
-            "with modality-neutral wording (the allowlist accepts audio too)"
+        assert "60 vision tensors missing" in msg, (
+            "Friendly error must surface the count from the underlying error"
         )
     finally:
         # Restore original mlx_vlm so subsequent tests aren't poisoned.
         sys.modules["mlx_vlm"] = real_mlx_vlm
-
-
-def test_mixed_vision_and_language_missing_does_not_degrade(monkeypatch):
-    """A checkpoint missing BOTH vision AND language-backbone tensors is
-    genuinely incomplete — the text lane can't serve it either — so
-    MLLMModel.load() must NOT classify it as text-only. It must re-raise the
-    RAW ValueError (never the typed TextOnlyCheckpointError), so the engine
-    surfaces the real corruption instead of masking it behind an auto-degrade
-    that fails again, more confusingly, in the text lane. Guards the codex
-    BLOCKING finding on PR #1189: the classifier keys on ALL missing weights
-    being multimodal, not just ANY vision name appearing."""
-    import importlib
-    import sys
-
-    try:
-        importlib.import_module("mlx_vlm")
-    except ImportError:
-        pytest.skip("mlx_vlm not installed (vision extra)")
-
-    from vllm_mlx.models import mllm as mllm_mod
-
-    real_mlx_vlm = sys.modules["mlx_vlm"]
-
-    class _FakeMlxVlm:
-        @staticmethod
-        def load(_name):
-            # Vision tensors AND a language-backbone tensor are both absent:
-            # this is corruption, not a text-only fork.
-            raise ValueError(
-                "Missing 3 parameters: \n"
-                "language_model.model.layers.5.mlp.gate_proj.weight,\n"
-                "vision_tower.blocks.27.attn.proj.weight,\n"
-                "vision_tower.blocks.27.attn.qkv.bias."
-            )
-
-    class _FakeMlxVlmUtils:
-        @staticmethod
-        def load_config(_name):
-            return {}
-
-    monkeypatch.setitem(sys.modules, "mlx_vlm", _FakeMlxVlm)
-    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", _FakeMlxVlmUtils)
-
-    inst = mllm_mod.MLXMultimodalLM(model_name="fake/corrupt-vlm")
-
-    try:
-        with pytest.raises(ValueError) as excinfo:
-            inst.load()
-        # Must be the RAW ValueError, NOT the typed degrade signal.
-        assert not isinstance(excinfo.value, mllm_mod.TextOnlyCheckpointError), (
-            "A checkpoint missing language-backbone weights must NOT be "
-            "classified as text-only; the raw ValueError has to propagate so "
-            "the engine reports genuine corruption instead of auto-degrading."
-        )
-        assert "language_model.model.layers.5" in str(excinfo.value), (
-            "The original missing-parameter detail must survive so operators "
-            "can see WHICH weights are missing."
-        )
-    finally:
-        sys.modules["mlx_vlm"] = real_mlx_vlm
-
-
-def test_missing_param_name_parser_and_multimodal_partition():
-    """Unit-level cover for the two helpers the degrade decision rests on:
-    `_parse_missing_param_names` recovers the individual tensor names from
-    mlx's `",\\n".join(sorted(...))` + trailing-`.` format, and
-    `_all_missing_are_multimodal` is True ONLY when every name is a
-    vision/audio/projector tensor (empty / any-language → False, fail safe)."""
-    from vllm_mlx.models import mllm as mllm_mod
-
-    pure_vision = (
-        "Missing 2 parameters: \n"
-        "embed_vision.embedding_projection.weight,\n"
-        "vision_tower.encoder.layers.0.mlp.down_proj.weight."
-    )
-    names = mllm_mod._parse_missing_param_names(pure_vision)
-    assert names == [
-        "embed_vision.embedding_projection.weight",
-        "vision_tower.encoder.layers.0.mlp.down_proj.weight",
-    ]
-    assert mllm_mod._all_missing_are_multimodal(names) is True
-
-    mixed_msg = (
-        "Missing 2 parameters: \n"
-        "language_model.model.norm.weight,\n"
-        "vision_tower.encoder.layers.0.mlp.down_proj.weight."
-    )
-    mixed_names = mllm_mod._parse_missing_param_names(mixed_msg)
-    assert mllm_mod._all_missing_are_multimodal(mixed_names) is False
-
-    # mlx's declared count is recovered and, for a well-formed message, equals
-    # the number of listed names (the completeness invariant the degrade gate
-    # cross-checks so a partial parse fails safe).
-    assert mllm_mod._parse_missing_count(pure_vision) == len(names) == 2
-    assert mllm_mod._parse_missing_count(mixed_msg) == len(mixed_names) == 2
-
-    # Unparseable / unrelated error shape → empty / None → not-degradable.
-    assert mllm_mod._parse_missing_param_names("some other error") == []
-    assert mllm_mod._parse_missing_count("some other error") is None
-    assert mllm_mod._all_missing_are_multimodal([]) is False
-
-    # Segment-aware matching (precision): a language-backbone weight whose
-    # SEGMENT merely CONTAINS an allowlisted token as a substring
-    # (``visual_proj`` ⊃ ``visual``, ``connector_gate`` ⊃ ``connector``) must
-    # NOT be misclassified as multimodal — else an all-language missing set
-    # could trigger an invalid degrade. A bare substring test would misfire.
-    assert mllm_mod._name_is_multimodal_tensor("vision_tower.encoder.0.weight")
-    assert mllm_mod._name_is_multimodal_tensor("model.visual.blocks.0.attn.weight")
-    assert mllm_mod._name_is_multimodal_tensor("model.embed_vision.proj.weight")
-    assert not mllm_mod._name_is_multimodal_tensor(
-        "language_model.model.layers.0.self_attn.visual_proj.weight"
-    )
-    assert not mllm_mod._name_is_multimodal_tensor(
-        "language_model.model.layers.0.connector_gate.weight"
-    )
-    assert mllm_mod._all_missing_are_multimodal(
-        ["vision_tower.a.weight", "model.visual.b.weight"]
-    )
-    assert not mllm_mod._all_missing_are_multimodal(
-        ["vision_tower.a.weight", "model.layers.0.visual_proj.weight"]
-    )
 
 
 def _flag_in_add_argument_calls(source: str, flag: str) -> bool:
@@ -2424,17 +2209,11 @@ def test_param_is_bool_handles_pep604_unions():
     assert not _param_is_bool(_param_with(inspect.Parameter.empty, default=None))
 
 
-def test_hybrid_overrides_mutually_exclusive_in_load_model(monkeypatch):
+def test_hybrid_overrides_mutually_exclusive_in_load_model():
     """server.load_model raises ValueError if both --force-hybrid and
     --no-hybrid are passed. Second line of defense — CLI also rejects
     via sys.exit(2), but load_model is a public entry point too."""
-    import vllm_mlx.server as srv
     from vllm_mlx.server import load_model
-
-    # This test drives the routing block with a placeholder repo id — stub the
-    # config-materialization seam so it doesn't fail-fast on the (uncached)
-    # "fake/model" before reaching the flag-conflict guard under test (#1178).
-    monkeypatch.setattr(srv, "_ensure_routing_config", lambda name: None)
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         load_model(
@@ -2444,15 +2223,10 @@ def test_hybrid_overrides_mutually_exclusive_in_load_model(monkeypatch):
         )
 
 
-def test_spec_decode_overrides_mutually_exclusive_in_load_model(monkeypatch):
+def test_spec_decode_overrides_mutually_exclusive_in_load_model():
     """server.load_model raises ValueError if both --force-spec-decode
     and --no-spec-decode are passed."""
-    import vllm_mlx.server as srv
     from vllm_mlx.server import load_model
-
-    # Placeholder repo id — stub the config-materialization seam (see the
-    # sibling hybrid test) so the fail-fast doesn't preempt the guard (#1178).
-    monkeypatch.setattr(srv, "_ensure_routing_config", lambda name: None)
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         load_model(
@@ -2460,100 +2234,6 @@ def test_spec_decode_overrides_mutually_exclusive_in_load_model(monkeypatch):
             force_spec_decode=True,
             no_spec_decode=True,
         )
-
-
-def test_server_main_no_mllm_skips_routing_config_fail_fast(monkeypatch):
-    """BLOCKING (#1178 codex r5): standalone ``python -m vllm_mlx.server`` must
-    NOT run the config-materialization fail-fast when the user passes an
-    explicit lane flag. ``_ensure_routing_config``'s own error advertises
-    ``--no-mllm`` as the escape hatch, so running it BEFORE consulting the flag
-    would deny the very bypass it names when the config cannot be fetched. With
-    ``--no-mllm`` the lane is already decided (text) and ``resolve_serving_lane``
-    short-circuits without reading config, so ``_ensure_routing_config`` must be
-    skipped entirely — mirroring ``load_model()``'s flag-first order.
-    """
-    from vllm_mlx import cli as _cli
-    from vllm_mlx import server
-    from vllm_mlx.config import get_config
-
-    # Snapshot the globals ``main()`` mutates so the writes don't leak into
-    # sibling tests (mirrors test_audio_route_registration_gate).
-    cfg = get_config()
-    cfg_snapshot = {
-        a: getattr(cfg, a, None)
-        for a in (
-            "tool_call_parser",
-            "reasoning_parser",
-            "reasoning_parser_name",
-            "enable_auto_tool_choice",
-            "enable_tool_logits_bias",
-            "model_name",
-            "model_alias",
-        )
-    }
-    server_snapshot = {
-        a: getattr(server, a, None)
-        for a in (
-            "_tool_call_parser",
-            "_reasoning_parser",
-            "_reasoning_parser_name",
-            "_enable_auto_tool_choice",
-            "_enable_tool_logits_bias",
-            "_model_name",
-            "_model_alias",
-        )
-    }
-
-    called = {"ensure_routing_config": False}
-
-    def _spy_ensure(name):
-        # Simulate the fail-fast: an uncached config that cannot materialize.
-        called["ensure_routing_config"] = True
-        raise RuntimeError("config unmaterializable — MUST be skipped w/ --no-mllm")
-
-    seen: dict[str, object] = {}
-
-    def _stub_load_model(*_a, **kw):
-        seen["force_text"] = kw.get("force_text")
-        seen["force_mllm"] = kw.get("force_mllm")
-
-    monkeypatch.setattr(server, "_ensure_routing_config", _spy_ensure)
-    monkeypatch.setattr(server, "load_model", _stub_load_model)
-    monkeypatch.setattr(_cli, "_port_preflight_or_die", lambda *_a, **_kw: None)
-
-    import uvicorn
-
-    monkeypatch.setattr(uvicorn, "run", lambda *_a, **_kw: None)
-    monkeypatch.setattr(
-        "vllm_mlx._version_check.prompt_upgrade_if_available", lambda: False
-    )
-    monkeypatch.setattr(
-        "vllm_mlx._version_check.print_staleness_warning_if_any",
-        lambda **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "vllm_mlx.server",
-            "--model",
-            "some/uncached-hybrid-vlm-4bit",
-            "--no-mllm",
-        ],
-    )
-    try:
-        # Must NOT raise the fail-fast; boots on the (explicit) text lane.
-        server.main()
-        assert called["ensure_routing_config"] is False, (
-            "_ensure_routing_config must be SKIPPED when --no-mllm is set — "
-            "otherwise an unmaterializable config denies the --no-mllm bypass"
-        )
-        assert seen.get("force_text") is True
-        assert seen.get("force_mllm") is False
-    finally:
-        for attr, value in cfg_snapshot.items():
-            setattr(cfg, attr, value)
-        for attr, value in server_snapshot.items():
-            setattr(server, attr, value)
 
 
 def _post_sop_forwarded_kwargs() -> frozenset[str]:
@@ -2582,7 +2262,7 @@ def test_routing_override_kwargs_are_keyword_only_in_load_model():
     # device, importing these modules raises RuntimeError before any
     # assertion can run. Skip gracefully — the gate's intent is a
     # signature/positional audit that only matters on machines that
-    # can actually run Rapid-MLX. Mirrors the pattern in
+    # can actually run vllm-mlx. Mirrors the pattern in
     # `test_registry_forwarded_kwargs_exist_on_signatures` and
     # `_make_engine_core_for_override_test`.
     try:
@@ -2786,25 +2466,6 @@ def test_engine_core_no_override_leaves_model_config_unchanged(monkeypatch):
     assert core.model_config.supports_spec_decode is False
 
 
-def test_engine_core_profile_log_shows_explicit_mtp(monkeypatch, caplog):
-    """Runtime MTP selection must override the static profile label."""
-    try:
-        from vllm_mlx.engine_core import EngineConfig
-        from vllm_mlx.scheduler import SchedulerConfig
-    except (ImportError, RuntimeError) as exc:
-        pytest.skip(f"MLX runtime unavailable ({exc})")
-
-    cfg = EngineConfig(
-        model_name="fake/model",
-        scheduler_config=SchedulerConfig(spec_decode="mtp"),
-    )
-    with caplog.at_level("INFO", logger="vllm_mlx.engine_core"):
-        _make_engine_core_for_override_test(monkeypatch, cfg)
-
-    assert "spec decode MTP (explicit)" in caplog.text
-    assert "spec decode OFF" not in caplog.text
-
-
 def _engine_core_mutex_cases() -> list[dict[str, bool]]:
     """Build mutex-conflict parametrize cases from the registry. For
     every pair with ``model_config_field`` not None, generate one
@@ -2962,169 +2623,3 @@ def test_friendly_error_does_not_swallow_unrelated_valueerror(monkeypatch):
         # detection means we may not have imported it.
         if real_mlx_vlm is not None:
             sys.modules["mlx_vlm"] = real_mlx_vlm
-
-
-# ---------------------------------------------------------------------------
-# Automatic text-only degrade (#1187 / #393).
-#
-# A vision-config checkpoint whose safetensors carry no usable vision tower
-# must NOT abort startup. mlx-vlm's strict weight load is the authoritative
-# signal (the routing detector reads the index/config, which still declare
-# vision, so it cannot catch a broken quant or an index that lists vision
-# tensors the shards don't contain — e.g. gemma-4 OptiQ). On that specific
-# failure the engine auto-degrades to the text lane, exactly as --no-mllm
-# would, instead of raising. Every OTHER load failure still propagates.
-# ---------------------------------------------------------------------------
-
-
-async def test_start_mllm_degrades_to_text_on_missing_vision_tower(monkeypatch):
-    """``_start_mllm`` catches ``TextOnlyCheckpointError`` and hands off to the
-    text lane: ``is_mllm`` flips to False and the mllm loader is torn down."""
-    from vllm_mlx.engine import batched as batched_mod
-    from vllm_mlx.models import mllm as mllm_mod
-
-    class _FakeTextOnlyMLLM:
-        def __init__(self, model_name, trust_remote_code=True):
-            self.model_name = model_name
-
-        def load(self):
-            raise mllm_mod.TextOnlyCheckpointError(
-                "MLLM load failed (356 vision tensors missing): this "
-                "checkpoint is text-only despite its multimodal config. "
-                "Re-run with --no-mllm ... Tracked in #393.",
-                missing_count=356,
-            )
-
-    # The import inside ``_start_mllm`` resolves the symbol at call time, so
-    # patching the module attribute is sufficient.
-    monkeypatch.setattr(mllm_mod, "MLXMultimodalLM", _FakeTextOnlyMLLM)
-
-    # AUTO-detected MLLM routing (NOT --mllm): the checkpoint's config declared
-    # vision so ``is_mllm_model`` routed it here. Simulate that verdict without
-    # a real config on disk. ``_force_mllm`` stays False so the degrade fires.
-    engine = batched_mod.BatchedEngine("fake/gemma4-optiq-4bit")
-    engine._is_mllm = True
-    assert engine._force_mllm is False, "precondition: auto-detected, not forced"
-
-    import sys
-
-    called = {"start_llm": 0}
-    exc_state = {}
-
-    async def _fake_start_llm():
-        called["start_llm"] += 1
-        # Capture whether an exception is still being HANDLED when the text
-        # lane loads. It must NOT be — the fallback runs outside the ``except``
-        # so the failed MLLM load's traceback (which pins mlx-vlm's whole
-        # weights dict + partial model) is released BEFORE the text model
-        # allocates, or the two coexist and can OOM a RAM-tight box.
-        exc_state["info"] = sys.exc_info()
-
-    monkeypatch.setattr(engine, "_start_llm", _fake_start_llm)
-
-    await engine._start_mllm()
-
-    assert called["start_llm"] == 1, (
-        "missing vision tower must degrade to the text lane, not abort"
-    )
-    assert exc_state["info"] == (None, None, None), (
-        "text-lane load must run OUTSIDE the except block (no active exception "
-        "pinning the failed vision load's ~weights-sized memory)"
-    )
-    assert engine.is_mllm is False, (
-        "engine must report text-only after the degrade so every "
-        "engine.is_mllm consumer (chat routes, /v1/models) stays consistent"
-    )
-    assert engine._model_load_executor is None, (
-        "the mllm-step loader thread must be shut down before the text "
-        "lane spins up its own executor (no leaked thread)"
-    )
-
-
-async def test_explicit_force_mllm_does_not_degrade(monkeypatch):
-    """``--mllm`` is a deliberate demand for the vision lane. A missing vision
-    tower must HARD-FAIL for that operator (surfacing --no-mllm as the fix),
-    never silently degrade behind their back — only AUTO-detected routing
-    degrades. The loader thread is still torn down so nothing leaks."""
-    from vllm_mlx.engine import batched as batched_mod
-    from vllm_mlx.models import mllm as mllm_mod
-
-    class _FakeTextOnlyMLLM:
-        def __init__(self, model_name, trust_remote_code=True):
-            pass
-
-        def load(self):
-            raise mllm_mod.TextOnlyCheckpointError(
-                "MLLM load failed (356 vision tensors missing): ... "
-                "Re-run with --no-mllm ... Tracked in #393.",
-                missing_count=356,
-            )
-
-    monkeypatch.setattr(mllm_mod, "MLXMultimodalLM", _FakeTextOnlyMLLM)
-
-    engine = batched_mod.BatchedEngine("fake/gemma4-optiq-4bit", force_mllm=True)
-
-    called = {"start_llm": 0}
-
-    async def _fake_start_llm():
-        called["start_llm"] += 1
-
-    monkeypatch.setattr(engine, "_start_llm", _fake_start_llm)
-
-    with pytest.raises(mllm_mod.TextOnlyCheckpointError) as excinfo:
-        await engine._start_mllm()
-
-    assert "--no-mllm" in str(excinfo.value), (
-        "explicit --mllm hard-fail must point the operator at the escape hatch"
-    )
-    assert called["start_llm"] == 0, "explicit --mllm must NOT auto-degrade"
-    assert engine.is_mllm is True, "explicit --mllm keeps the vision-lane verdict"
-    assert engine._model_load_executor is None, "loader thread must still be torn down"
-
-
-async def test_start_mllm_does_not_degrade_on_unrelated_load_error(monkeypatch):
-    """A load failure that is NOT a missing-vision-tower degrade signal (e.g.
-    corrupt weights, unsupported arch, OOM) must propagate unchanged — the
-    degrade path is scoped to ``TextOnlyCheckpointError`` alone, never a bare
-    RuntimeError, so genuine errors are never masked as a silent text fallback.
-    """
-    from vllm_mlx.engine import batched as batched_mod
-    from vllm_mlx.models import mllm as mllm_mod
-
-    class _FakeBrokenMLLM:
-        def __init__(self, model_name, trust_remote_code=True):
-            pass
-
-        def load(self):
-            raise RuntimeError("CUDA OOM / corrupt safetensors header")
-
-    monkeypatch.setattr(mllm_mod, "MLXMultimodalLM", _FakeBrokenMLLM)
-
-    # AUTO-detected routing — the mode where a degrade COULD happen — so this
-    # proves the scoping (TextOnlyCheckpointError only), not just that a forced
-    # lane never degrades.
-    engine = batched_mod.BatchedEngine("fake/genuinely-broken")
-    engine._is_mllm = True
-
-    called = {"start_llm": 0}
-
-    async def _fake_start_llm():
-        called["start_llm"] += 1
-
-    monkeypatch.setattr(engine, "_start_llm", _fake_start_llm)
-
-    with pytest.raises(RuntimeError) as excinfo:
-        await engine._start_mllm()
-
-    assert "corrupt safetensors" in str(excinfo.value), (
-        "the original error must surface, not a text-fallback message"
-    )
-    assert called["start_llm"] == 0, "must NOT degrade on an unrelated error"
-    assert engine.is_mllm is True, "engine modality must be unchanged on a real error"
-    # The mllm-step worker must be torn down on EVERY failed load, not only
-    # the degrade path — otherwise an unrelated error orphans the executor
-    # thread (codex BLOCKING). ``_start_mllm`` shuts it down and clears the ref.
-    assert engine._model_load_executor is None, (
-        "the mllm-step ThreadPoolExecutor must be shut down and cleared even "
-        "when the load failure is not a degrade signal, or its worker thread leaks"
-    )

@@ -4362,6 +4362,7 @@ def pull_command(args):
             max_workers=getattr(args, "workers", None),
             disable_xet=getattr(args, "disable_xet", False),
             no_token=getattr(args, "no_token", False),
+            use_curl=not getattr(args, "no_curl", False),
         )
         if not success:
             print(f"\n  Error: download of '{repo_id}' failed — see above.")
@@ -7644,19 +7645,32 @@ Examples:
         "retrying the same transport again. Default: 1.",
     )
     pull_parser.add_argument(
+        "--no-curl",
+        action="store_true",
+        help="With --dest: use huggingface_hub for the transfer instead of "
+        "the default plain-curl downloader. huggingface_hub's own client "
+        "has been observed sitting at 0 bytes for 5+ minutes on a repo/"
+        "session that a single curl request transfers real data on — "
+        "HuggingFace appears to throttle the higher-request-volume "
+        "automated client pattern independently of the content or "
+        "network itself. --workers and --disable-xet only apply with "
+        "--no-curl (curl mode is always sequential and never uses Xet). "
+        "Default: off (use curl).",
+    )
+    pull_parser.add_argument(
         "--workers",
         type=int,
         metavar="N",
         default=None,
-        help="With --dest: parallel per-file transfers passed straight to "
-        "snapshot_download. Default: 8.",
+        help="With --dest --no-curl: parallel per-file transfers passed "
+        "straight to snapshot_download. Default: 8.",
     )
     pull_parser.add_argument(
         "--disable-xet",
         action="store_true",
-        help="With --dest: skip HuggingFace's Xet transport and start "
-        "straight on the classic HTTP/LFS path — worth setting once a "
-        "repo is known to stall on Xet, to skip the wasted wait to "
+        help="With --dest --no-curl: skip HuggingFace's Xet transport and "
+        "start straight on the classic HTTP/LFS path — worth setting once "
+        "a repo is known to stall on Xet, to skip the wasted wait to "
         "rediscover that. Default: off (still auto-escalates if Xet "
         "turns out to be broken).",
     )

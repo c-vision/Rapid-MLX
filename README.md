@@ -46,9 +46,23 @@ Full reference: [`vllm_mlx/alias_resolver.py`](vllm_mlx/alias_resolver.py), test
 
 ### 3. Model download tooling
 
-A parallel-download manager (`vllm_mlx/tools/model_downloader.py` + `model_download_status.py`) that fetches a full HuggingFace model repo (config, tokenizer, weight shards — not just one file) into a target directory, with resume support and SHA256 verification of LFS-tracked files. File transfer itself is delegated to `huggingface_hub.snapshot_download` (already a core dependency) rather than reimplementing HTTP range-request resume logic — `snapshot_download` already does that correctly, including per-file parallelism (default 8 workers, configurable — `--workers N` on `rapid-mlx pull --dest`, or `max_workers=` on `download_model()`).
+A download manager (`vllm_mlx/tools/model_downloader.py` + `model_download_status.py`) that fetches a full HuggingFace model repo (config, tokenizer, weight shards — not just one file) into a target directory, with resume support and SHA256 verification of LFS-tracked files. Transfer defaults to plain `curl` (see *Xet transfer failures* further down for why); `huggingface_hub.snapshot_download` is still available as an opt-in fallback (`--no-curl`).
 
 Wired into the CLI as `rapid-mlx pull <repo> --dest <dir>` — with `--dest`, `pull` uses this downloader (resume + SHA256 verification, lands in `<dir>/<repo-name>`) instead of the default HuggingFace-cache path.
+
+**`rapid-mlx pull <repo> --dest <dir>` — all parameters:**
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--dest DIR` | *(required for this downloader)* | Parent directory to download into — model lands in `DIR/<repo-name>`. Without `--dest`, `pull` uses the default HuggingFace-cache path instead (none of the flags below apply). |
+| `--stall-timeout MINUTES` | `5` | Minutes without progress before a transfer is considered stalled and restarted (resumes, doesn't start over). |
+| `--stall-retries N` | `1` | Retries beyond the first attempt before giving up on a phase (2 attempts total by default). With `--no-curl`, a stall this deep also triggers the automatic Xet→HTTP fallback (see below) before giving up. |
+| `--no-curl` | off (curl is used) | Use `huggingface_hub` for the transfer instead of the default plain-curl downloader. See *Xet transfer failures* below for why curl is the default. `--workers` and `--disable-xet` only apply with `--no-curl`. |
+| `--workers N` | `8` | *(only with `--no-curl`)* Parallel per-file transfers passed straight to `snapshot_download`. Curl mode is always sequential, one file at a time. |
+| `--disable-xet` | off | *(only with `--no-curl`)* Skip HuggingFace's Xet transport and start straight on the classic HTTP/LFS path. Curl never uses Xet at all, so this has no effect without `--no-curl`. |
+| `--no-token` | off (use `HF_TOKEN` if set) | Ignore `HF_TOKEN` even if it's present and download unauthenticated. See *Authentication* below. |
+
+Everything below explains the *why* behind these defaults in more detail.
 
 **Full example — download into a folder of your choice, then register it under an alias of your choice:**
 
@@ -81,17 +95,19 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"smol","messages":[{"role":"user","content":"Say hi in one short sentence."}]}'
 ```
 
-Interrupted downloads resume correctly: `huggingface_hub` tracks partial files under `<dest_dir>/<repo-name>/.cache/huggingface/download/*.incomplete`, and re-running the same `rapid-mlx pull ... --dest ...` call skips whatever's already complete and only re-fetches what's missing — verified twice: once on a small test model, and again on a real 18 GB model (`mlx-community/gemma-4-31b-it-4bit`) interrupted mid-transfer by hand and re-run, which picked up exactly where it left off (already-complete files untouched, only the still-partial shards resumed) rather than starting over.
+Interrupted downloads resume correctly regardless of transfer mode: curl (default) resumes each file with its own `-C -` flag, writing straight to the final filename — an interrupted file just picks up from its own last byte on retry, no separate staging area. `huggingface_hub` (`--no-curl`) tracks partial files under `<dest_dir>/<repo-name>/.cache/huggingface/download/*.incomplete` instead, and re-running the same `rapid-mlx pull ... --dest ...` call skips whatever's already complete and only re-fetches what's missing — verified twice: once on a small test model, and again on a real 18 GB model (`mlx-community/gemma-4-31b-it-4bit`) interrupted mid-transfer by hand and re-run, which picked up exactly where it left off (already-complete files untouched, only the still-partial shards resumed) rather than starting over.
 
-**Stalled-transfer watchdog.** `requests` (what `snapshot_download` uses under the hood) has no default read timeout — if a CDN connection goes quiet without a clean close (observed in the wild: stuck in `CLOSE_WAIT`, no error raised), the download just hangs forever with nothing to notice. `download_model()` now runs the transfer in a subprocess and watches the destination directory's total size: no growth for 5 minutes by default and it kills that subprocess, prints `Stalled: no progress for N min — restarting the transfer (attempt X/Y)`, and retries once by default (`STALL_RETRIES`, 2 attempts total per phase — a stall this deep is a strong enough signal that a third identical retry isn't worth the wait; see the Xet fallback below for the real remedy), relying on the same resume support so a restart continues from the stalled point instead of starting over. Both the timeout and the retry count are configurable — `rapid-mlx pull <repo> --dest <dir> --stall-timeout <minutes> --stall-retries <n>` (or `stall_minutes=`/`retries=` on `download_model()` directly). `rapid-mlx pull --dest` re-prompting on every resume was also fixed: the CLI's large-download confirmation gate only checked the default HuggingFace cache, so it never recognized a `--dest` folder that already had a download in progress — it now checks that folder directly and skips the prompt if anything's already there.
+**Why curl is the default.** Chasing down a real stuck transfer (`mlx-community/Mixtral-8x22B-4bit`, 73.9 GiB) led through several dead ends before finding the actual cause — each ruled out with a direct, controlled test rather than assumed: not the Xet backend (disabling it didn't help), not a stale `HF_TOKEN` (unauthenticated stalled too, and vice versa), not `multiprocessing.Queue` or spawn-vs-fork (isolated and ruled out), not a code regression from syncing upstream (pre-merge code reproduced the identical stall in a side-by-side worktree comparison). What finally isolated it: a single plain `curl --range` request to the exact same file, at the exact same moment `huggingface_hub` was sitting at 0 bytes, transferred real data immediately. `huggingface_hub` issues many more HTTP requests per download than curl does (metadata lookups, redirect resolution, per-file/per-worker parallelism) — consistent with HuggingFace throttling that higher-request-volume automated client pattern specifically, independent of the content or network itself. Since curl demonstrably keeps working in exactly the conditions where `huggingface_hub` didn't, it's now the default transfer mechanism (`_curl_download_worker`) — one file at a time, deliberately not parallelized, to stay close to the low-volume request pattern that was actually observed to work. `--no-curl` switches back to `huggingface_hub` (keeps Xet support and parallel per-file workers) if you'd rather have that trade-off.
 
-**Xet transfer failures — now handled automatically.** The watchdog above handles a connection going silent mid-transfer — it doesn't help when the transfer never delivers any bytes at all, which is a distinct failure mode of HuggingFace's Xet storage backend (many `mlx-community` repos use it instead of plain LFS). Symptom: the progress bar sits at `0%` / `0.00/<size>` for the entire stall window, identically on every retry, even though `huggingface.co` itself is reachable and responding fine — because Xet transfers go through a separate CAS/S3-style endpoint that can be blocked or broken independently of the main site. Retrying against the same transport doesn't help since the failure isn't transient.
+**Stalled-transfer watchdog.** *(Applies to both transfer modes — curl and `--no-curl`.)* `requests` (what `snapshot_download` uses under the hood) has no default read timeout — if a CDN connection goes quiet without a clean close (observed in the wild: stuck in `CLOSE_WAIT`, no error raised), the download just hangs forever with nothing to notice. `download_model()` now runs the transfer in a subprocess and watches the destination directory's total size: no growth for 5 minutes by default and it kills that subprocess, prints `Stalled: no progress for N min — restarting the transfer (attempt X/Y)`, and retries once by default (`STALL_RETRIES`, 2 attempts total per phase — a stall this deep is a strong enough signal that a third identical retry isn't worth the wait; see the Xet fallback below for the real remedy), relying on the same resume support so a restart continues from the stalled point instead of starting over. Both the timeout and the retry count are configurable — `rapid-mlx pull <repo> --dest <dir> --stall-timeout <minutes> --stall-retries <n>` (or `stall_minutes=`/`retries=` on `download_model()` directly). `rapid-mlx pull --dest` re-prompting on every resume was also fixed: the CLI's large-download confirmation gate only checked the default HuggingFace cache, so it never recognized a `--dest` folder that already had a download in progress — it now checks that folder directly and skips the prompt if anything's already there.
+
+**Xet transfer failures — now handled automatically.** *(Applies to `--no-curl` mode only — curl never touches the Xet backend, so this whole failure mode and its auto-fallback simply don't apply when using the default transfer.)* The watchdog above handles a connection going silent mid-transfer — it doesn't help when the transfer never delivers any bytes at all, which is a distinct failure mode of HuggingFace's Xet storage backend (many `mlx-community` repos use it instead of plain LFS). Symptom: the progress bar sits at `0%` / `0.00/<size>` for the entire stall window, identically on every retry, even though `huggingface.co` itself is reachable and responding fine — because Xet transfers go through a separate CAS/S3-style endpoint that can be blocked or broken independently of the main site. Retrying against the same transport doesn't help since the failure isn't transient.
 
 If every attempt in a phase stalls in a row (as opposed to a real error like a bad token, which is never retried this way), that's taken as a strong signal the Xet endpoint itself is the problem — the downloader prints a heads-up and automatically switches to the classic HTTP/LFS path (`HF_HUB_DISABLE_XET=1`) for one more fresh set of attempts (same `--stall-retries` budget) before giving up. No manual intervention needed anymore.
 
 If a repo is *already known* to stall on Xet (e.g. a previous run already had to escalate), waiting through that first phase again just to rediscover the same thing is wasted time — pass `--disable-xet` (or `disable_xet=True` on `download_model()`) to start straight on the classic path instead. Default is off, so the normal auto-escalating behavior above is unchanged unless you opt in.
 
-Verified directly: `mlx-community/Mixtral-8x22B-4bit` (73.9 GiB) stalled at 0 bytes 3/3 times with Xet enabled (3x 5-minute timeouts, watchdog behaving correctly by giving up rather than hanging forever), then transferred at real throughput immediately once Xet was disabled.
+Verified directly: `mlx-community/Mixtral-8x22B-4bit` (73.9 GiB) stalled at 0 bytes 3/3 times with Xet enabled (3x 5-minute timeouts, watchdog behaving correctly by giving up rather than hanging forever), then transferred at real throughput immediately once Xet was disabled. That same repo went on to stall completely under `huggingface_hub` even with Xet off — see *Why curl is the default* above — and completed the full 73.9 GiB with zero stalls once switched to curl, which is why curl is the default and this whole section is scoped to `--no-curl`.
 
 **Authentication.** If `HF_TOKEN` is set in the environment, it's picked up explicitly and passed straight to `snapshot_download` — not just left to whatever implicit fallback `huggingface_hub` might do — and confirmed on the console (`Using HF_TOKEN from environment (...last 4 chars)`, never the full token) so there's no guessing whether it's actually being used. Without one, downloads print a heads-up that they're unauthenticated (HuggingFace's own stricter, slower rate limits apply) rather than silently taking longer with no explanation.
 
@@ -107,119 +123,119 @@ Verified end-to-end, literally running the three steps above: fresh download to 
 
 ```bash
 # DeepSeek-R1-Distill-Qwen-32B — 8-bit
-rapid-mlx pull mlx-community/DeepSeek-R1-Distill-Qwen-32B-MLX-8Bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/DeepSeek-R1-Distill-Qwen-32B-MLX-8Bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 ```bash
 # DeepSeek-R1-Distill-Qwen-32B — 4-bit
-rapid-mlx pull mlx-community/DeepSeek-R1-Distill-Qwen-32B-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/DeepSeek-R1-Distill-Qwen-32B-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 ```bash
 # DeepSeek V4 Flash 158B-A13B — 4-bit
-rapid-mlx pull mlx-community/deepseek-ai-DeepSeek-V4-Flash-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/deepseek-ai-DeepSeek-V4-Flash-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 #### Qwen 3.5
 
 ```bash
 # Qwen3.5-27B — 4-bit
-rapid-mlx pull mlx-community/Qwen3.5-27B-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/Qwen3.5-27B-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 ```bash
 # Qwen3.5-27B Claude-4.6-Opus Distilled — 4-bit
-rapid-mlx pull mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/Qwen3.5-27B-Claude-4.6-Opus-Distilled-MLX-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 #### Qwen 3.6
 
 ```bash
 # Qwen3.5-122B-A10B — mxfp4 (MoE)
-rapid-mlx pull mlx-community/Qwen3.5-122B-A10B-mxfp4 --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/Qwen3.5-122B-A10B-mxfp4 --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 ```bash
 # Qwen3.6-35B-A3B — OptiQ 4-bit
-rapid-mlx pull mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/Qwen3.6-35B-A3B-OptiQ-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 ```bash
 # Qwen3.6-40B Claude-like — 8-bit
-rapid-mlx pull mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/Qwen3.6-40B-Claude-4.6-Opus-Deckard-Heretic-Uncensored-Thinking-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 #### Gemma 4
 
 ```bash
 # Gemma-4-31B-it — 4-bit
-rapid-mlx pull mlx-community/gemma-4-31b-it-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/gemma-4-31b-it-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 ```bash
 # Gemma-4-12B-coder — 4-bit
-rapid-mlx pull mlx-community/gemma-4-12b-coder-fable5-composer2.5-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/gemma-4-12b-coder-fable5-composer2.5-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 ```bash
 # Gemma-4-12B-coder — 8-bit
-rapid-mlx pull mlx-community/gemma-4-12b-coder-fable5-composer2.5-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/gemma-4-12b-coder-fable5-composer2.5-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 #### Devstral
 
 ```bash
-rapid-mlx pull mlx-community/Devstral-Samll-2507-bf16 --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/Devstral-Samll-2507-bf16 --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 #### Mistral
 
 ```bash
 # Mixtral-8x22B — 4-bit (known to stall on Xet — see above)
-rapid-mlx pull mlx-community/Mixtral-8x22B-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8 --disable-xet
+rapid-mlx pull mlx-community/Mixtral-8x22B-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 ```bash
-rapid-mlx pull mlx-community/Mistral-Large-Instruct-2407-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/Mistral-Large-Instruct-2407-4bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 #### Unlimited-OCR (MLX)
 
 ```bash
 # Block-float MX FP8 (recommended for quality/performance)
-rapid-mlx pull sahilchachra/unlimited-ocr-mxfp8-mlx --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull sahilchachra/unlimited-ocr-mxfp8-mlx --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 #### Additional models
 
 ```bash
 # Nemotron-3-Super-120B — 6-bit (~98GB)
-rapid-mlx pull mlx-community/Nemotron-3-Super-120B-A12B-MLX-6bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/Nemotron-3-Super-120B-A12B-MLX-6bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 ```bash
 # Qwen3-Coder-Next — 8-bit
-rapid-mlx pull mlx-community/Qwen3-Coder-Next-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/Qwen3-Coder-Next-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 ```bash
 # Qwopus3.6-35B-A3B-Coder — 8-bit
-rapid-mlx pull mlx-community/Qwopus3.6-35B-A3B-Coder-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/Qwopus3.6-35B-A3B-Coder-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 ```bash
 # GLM-5.2 — 4-bit
-rapid-mlx pull mlx-community/GLM-5.2-mxfp4 --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/GLM-5.2-mxfp4 --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 ```bash
 # Ornith-1.0-35B — 8-bit
-rapid-mlx pull mlx-community/Ornith-1.0-35B-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/Ornith-1.0-35B-8bit --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 ```bash
 # GPT-OSS-120B
-rapid-mlx pull mlx-community/gpt-oss-120b-mxfp4-bf16 --dest ~/ai/Models --stall-timeout 5 --stall-retries 1 --workers 8
+rapid-mlx pull mlx-community/gpt-oss-120b-mxfp4-bf16 --dest ~/ai/Models --stall-timeout 5 --stall-retries 1
 ```
 
 The same downloader is also available directly from Python for scripting: `from vllm_mlx.tools.model_downloader import download_model; download_model("org/repo", dest_dir="~/my-models")` — `rapid-mlx pull --dest` is a thin CLI wrapper around this same function. There's also an earlier, broken draft of the same idea kept around for reference (`model_download_draft.py`) — not used by anything, not exported, not maintained.
