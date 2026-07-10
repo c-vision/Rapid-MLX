@@ -289,6 +289,37 @@ Rapid-MLX is built on [MLX](https://github.com/ml-explore/mlx), which only runs 
 - **Memory-bound**: model size you can run is limited by your Mac's unified memory (see the sizing table in the upstream README for what fits at each memory tier)
 - This fork inherits the exact same platform constraints as upstream — nothing here changes the hardware story
 
+## Known limitations (observed directly, 2026-07-10)
+
+Three separate issues surfaced in a single evening of real agentic-coding use (OpenCode, long multi-turn sessions with many tool calls). Documented here with the actual numbers/logs rather than "it feels slow" — two are genuine rapid-mlx gaps; the third is real but not specific to this engine, and is included so nobody budgets hardware/context size against the wrong expectation.
+
+### 1. No admission control for concurrent requests to the same conversation
+
+rapid-mlx batches whatever arrives — it has no mechanism to notice that two in-flight requests are the same growing conversation (the client sent turn N+1 before turn N's response finished) and serialize them. Caught directly via `/metrics`:
+
+```
+rapid_mlx_requests_running 3
+```
+
+— three overlapping generations for the *same* OpenCode conversation (message counts climbing 165→167→169→171→173→175→176→176→177 across consecutive `[REQUEST]` log lines, each arriving before the previous one's response had been sent). All three compete for the same GPU, degrading throughput for every one of them instead of one finishing before the next starts. On a single-model, single-GPU, single-user backend, concurrent batching has no upside — it only adds contention. (Worked around, for now, one layer up: the [unified-gateway](https://github.com/c-vision/UnifiedLLMGateway) fork serializes all backend-forwarded requests through a mutex before they ever reach rapid-mlx.)
+
+### 2. Metal command-buffer errors abort the whole process, not just the request
+
+Three crashes in three days, identical signature every time — `mlx::core::gpu::check_error` throwing from Metal's async completion-handler dispatch queue, which can't propagate back through Python, so the process dies via `std::terminate()`/`abort()` instead of failing just the one request. rapid-mlx's own `engine_core.py` already documents this as tracked-but-unfixable from this side (issue #353, referencing `mlx-lm#1015`/`ml-explore/mlx`) — the actual fix has to land in MLX itself. mlx **0.32.0** (PR #3523, "catch error in CommandBuffer and poison the events") looks like the real fix; not yet verified against a reproduction of the original crash at time of writing.
+
+### 3. Prefill throughput drops sharply as context grows — largely architectural, not rapid-mlx-specific
+
+Isolated, reproducible measurement (single request, nothing else running, `rapid_mlx_requests_running: 0` confirmed beforehand):
+
+| Prompt size | Time | Throughput |
+|---|---|---|
+| 21,623 tokens | 30.3s | ~713 tok/s |
+| 97,223 tokens | >300s, did not finish | <324 tok/s |
+
+Standard (non-linear-attention) transformer prefill is inherently O(N²) in context length — quadratic compute growth for linear token growth is expected on *any* engine using vanilla attention, not something specific to MLX or this fork. The 21k→97k ratio (~4.5x tokens) predicts almost exactly this kind of falloff under pure O(N²) scaling, so this isn't necessarily a rapid-mlx defect. What genuinely *does* vary between engines is the constant factor — how well-optimized the attention kernels are for a given hardware target (Flash-Attention-style memory access patterns, e.g.) — and that's the open question: whether a more mature, longer-optimized engine (llama.cpp, battle-tested for exactly this workload for years) gets a meaningfully better constant factor on the same hardware. Cross-engine comparison in progress; this section will be updated with the result.
+
+**Practical takeaway regardless of root cause**: don't let a single agentic conversation grow past roughly 20-30k tokens if you need interactive response times — compress/summarize/restart instead of accumulating tool-call history indefinitely. No configuration on rapid-mlx's side (`--prefill-step-size`, `--cache-memory-mb`, TurboQuant) changes this fundamentally; it only shifts where the wall is.
+
 ## Original project
 
 This is a fork, not a competing project — most of the engine, the full feature set, and all the heavy lifting come from the original:
