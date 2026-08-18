@@ -1089,6 +1089,28 @@ def _gather_kv_cache_dtype_inputs(model_name: str) -> tuple[dict | None, dict | 
     except Exception:
         hf_cfg = None
 
+    # Fallback for local, non-aliased checkpoints: try_to_load_from_cache
+    # only resolves a published HF repo_id against the hub's cache blob
+    # store -- a bare filesystem path (a hand-placed local conversion with
+    # no matching alias profile, e.g. a custom OptiQ/quantization output)
+    # never matches there and silently collapses to hf_cfg=None above,
+    # even though the model's own config.json is sitting right on disk.
+    # Every downstream check keyed on this config (MTP eligibility
+    # included) then fails as "config not found" rather than on its own
+    # merits. Only engages when the cache lookup came up empty, so it
+    # never overrides a real cache hit.
+    if hf_cfg is None:
+        try:
+            import json as _json
+            import os as _os
+
+            local_config = _os.path.join(model_name, "config.json")
+            if _os.path.isdir(model_name) and _os.path.exists(local_config):
+                with open(local_config) as fh:
+                    hf_cfg = _json.load(fh)
+        except Exception:
+            hf_cfg = None
+
     return hf_cfg, alias_meta
 
 

@@ -258,6 +258,12 @@ So a genuinely vision-capable checkpoint (real `vision_tower` weights in its saf
 
 Fixed by extracting the computation into `pflash.resolve_effective_is_mllm()`, used by all three call sites instead of the duplicated inline expression, with unit tests covering the `--no-mllm` override, `--mllm` force-on precedence, and the conflicting-flags case (`tests/test_pflash.py::TestResolveEffectiveIsMllm`).
 
+### 6. Local-checkpoint config fallback for KV-cache dtype detection
+
+`_gather_kv_cache_dtype_inputs` (`vllm_mlx/cli.py`) resolves a model's config through `try_to_load_from_cache`, which only finds a published HuggingFace repo id in the hub's blob store. A bare filesystem path — a hand-placed local conversion (e.g. a custom OptiQ/quantization output) with no matching alias profile — never matches there, so every downstream check keyed on that config (MTP eligibility included) silently failed as "config not found" even though the model's own `config.json` was sitting right on disk.
+
+The fallback only engages when the cache lookup came up empty (never overriding a real hit): if `model_name` is a directory containing `config.json`, it's loaded directly and used for the same KV-cache dtype / MTP decisions. This makes local, unaliased checkpoints behave identically to published ones without needing a `models.yaml` alias entry.
+
 ## Installation
 
 This fork isn't published to PyPI or Homebrew — install it from source:
