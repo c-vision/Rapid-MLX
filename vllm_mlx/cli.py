@@ -2502,13 +2502,30 @@ def serve_command(args):
         _alias_name = getattr(args, "_original_alias", None) or args.model
         _profile = resolve_profile(_alias_name)
         if _profile is None:
-            print(
-                f"\n  Error: DFlash requires a known alias, got "
-                f"{_alias_name!r}. DFlash eligibility is recorded per-alias "
-                f"in aliases.json; ad-hoc HuggingFace paths can't be "
-                f"validated. Try ``rapid-mlx info qwen3.5-27b-8bit``.\n"
-            )
-            sys.exit(1)
+            # Fallback for local Qwen3.8 DFlash2 via ug (qw38dflash2): allow local path
+            # that maps to known DFlash alias. The gateway passes a local dir
+            # (/Users/.../Qwen3.8-27B-8bit) with --speculative-config, but DFlash
+            # eligibility is recorded per-alias in aliases.json. Map substring.
+            fallback_alias = None
+            lower_model = str(_alias_name).lower()
+            if "qwen3.8" in lower_model and "27b" in lower_model:
+                # Prefer 8bit vs 4bit based on path
+                if "4bit" in lower_model and "8bit" not in lower_model:
+                    fallback_alias = "qwen3.8-27b-4bit"
+                else:
+                    fallback_alias = "qwen3.8-27b-8bit"
+            if fallback_alias:
+                _profile = resolve_profile(fallback_alias)
+                if _profile is not None:
+                    _alias_name = fallback_alias
+            if _profile is None:
+                print(
+                    f"\n  Error: DFlash requires a known alias, got "
+                    f"{_alias_name!r}. DFlash eligibility is recorded per-alias "
+                    f"in aliases.json; ad-hoc HuggingFace paths can't be "
+                    f"validated. Try ``rapid-mlx info qwen3.5-27b-8bit``.\n"
+                )
+                sys.exit(1)
         try:
             check(_profile, alias=_alias_name)
         except DFlashUnavailable as e:
@@ -3103,17 +3120,34 @@ def serve_command(args):
 
         _alias_name = getattr(args, "_original_alias", None) or args.model
         _profile = resolve_profile(_alias_name)
+        # Fallback for local Qwen3.8 DFlash2 via ug (qw38dflash2): allow local path
+        if _profile is None:
+            lower_model = str(_alias_name).lower()
+            fallback_alias = None
+            if "qwen3.8" in lower_model and "27b" in lower_model:
+                if "4bit" in lower_model and "8bit" not in lower_model:
+                    fallback_alias = "qwen3.8-27b-4bit"
+                else:
+                    fallback_alias = "qwen3.8-27b-8bit"
+            if fallback_alias:
+                _profile = resolve_profile(fallback_alias)
+                if _profile is not None:
+                    _alias_name = fallback_alias
         # The eligibility check at top of serve_command guarantees this
         # passes — assert to be defensive against future refactors.
         assert _profile is not None and _profile.supports_dflash, (
             f"DFlash profile invariant violated for {_alias_name!r}"
         )
+        # Use local path if args.model is a directory that exists (ug local Models)
+        _main_repo = _profile.hf_path
+        if args.model and os.path.isdir(os.path.expanduser(args.model)):
+            _main_repo = os.path.expanduser(args.model)
         # The vLLM-style surface uses ``model`` for the drafter override.
         # Legacy ``--dflash-drafter-path`` is normalized into
         # ``_speculative_config.model`` above, with a direct fallback here
         # for defensive compatibility.
         run_dflash_server(
-            main_model_repo=_profile.hf_path,
+            main_model_repo=_main_repo,
             drafter_repo=_resolve_dflash_drafter_repo(args, _profile),
             host=args.host,
             port=args.port,
