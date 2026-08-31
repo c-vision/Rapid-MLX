@@ -264,6 +264,26 @@ Fixed by extracting the computation into `pflash.resolve_effective_is_mllm()`, u
 
 The fallback only engages when the cache lookup came up empty (never overriding a real hit): if `model_name` is a directory containing `config.json`, it's loaded directly and used for the same KV-cache dtype / MTP decisions. This makes local, unaliased checkpoints behave identically to published ones without needing a `models.yaml` alias entry.
 
+### 7. DFlash2 speculative decoding (Qwen3.8-27B-DFlash2)
+
+**DFlash2** (block-diffusion speculative decoding, Qwen3.8-27B) is now implemented **natively in this repo** — it no longer depends on upstream mlx-vlm's incomplete `qwen3_dflash` drafter, which rejected the DFlash2 checkpoint's weights (`attention_conv`/`mlp_conv` two-tap convs and the `candidate_selector` codebooks) with `not in model`.
+
+The drafter is **vendored** under `vllm_mlx/speculative/dflash/drafters/`:
+
+- `config.py` — `DFlashConfig` with the DFlash2 fields (`block_size`, `conv_kernel_size`, `conv_group_size`, `selector_rank`, `selector_top_k`, `is_causal`), parsed from `dflash_config`.
+- `qwen3_dflash.py` — the model: `GroupedDynamicCausalConv` (two-tap dynamic causal conv), `CandidateSelector` (predecessor/successor codebooks + `hidden_projection`, top-16 candidates + greedy walk, `S_t(a,b)=U_t(b)+⟨A(a)⊙H(h_t),B(b)⟩`), and `DFlashDraftModel` which auto-detects DFlash2 from the config and builds the conv + selector-lattice path.
+- `__init__.py` — `load_drafter(model_path)` (single-file and sharded safetensors) + `is_dflash2_repo()`.
+
+`vllm_mlx/speculative/dflash/runtime.py` picks the vendored loader for DFlash2 checkpoints (falling back to mlx-vlm's drafter for DFlash1, unchanged). The round loop stays mlx-vlm's (`_dflash_rounds`), which is agnostic to drafter internals.
+
+**Enable it** by pointing an alias at the target with `supports_dflash=true` and `dflash_draft_model=<path-to-DFlash2-draft>`:
+
+```
+rapid-mlx serve <target-27B> --speculative-config '{"method":"dflash","model":"/path/to/Qwen3.8-27B-DFlash2"}'
+```
+
+Verified end-to-end: drafter loads all 81 tensors (strict), the block forward produces a coherent block via the selector lattice, and the server serves real completions through the draft→verify→walk round loop.
+
 ## Installation
 
 This fork isn't published to PyPI or Homebrew — install it from source:

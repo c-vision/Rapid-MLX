@@ -1440,7 +1440,7 @@
     "tool_call_parser": "qwen3_coder_xml"
   },
   "qwen3.8-27b-4bit": {
-    "dflash_draft_model": "/Users/gaetano/ai/Models/Qwen3.8-27B-DFlash2-mxfp4",
+    "dflash_draft_model": "/Users/gaetano/ai/Models/Qwen3.8-27B-DFlash2",
     "hf_path": "mlx-community/Qwen3.8-27B-4bit",
     "is_hybrid": false,
     "is_hybrid_explicit": true,
@@ -1453,7 +1453,7 @@
     "turboquant_tier": "k8v4_verified"
   },
   "qwen3.8-27b-8bit": {
-    "dflash_draft_model": "/Users/gaetano/ai/Models/Qwen3.8-27B-DFlash2-mxfp4",
+    "dflash_draft_model": "/Users/gaetano/ai/Models/Qwen3.8-27B-DFlash2",
     "hf_path": "mlx-community/Qwen3.8-27B-8bit",
     "is_hybrid": false,
     "is_hybrid_explicit": true,

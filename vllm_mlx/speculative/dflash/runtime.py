@@ -66,7 +66,12 @@ class DFlashRuntime:
 
 
 def load_runtime(drafter_repo: str, kind: str = "dflash") -> DFlashRuntime:
-    """Lazy-import mlx-vlm's drafter loader and return a ``DFlashRuntime``.
+    """Lazy-import a drafter loader and return a ``DFlashRuntime``.
+
+    DFlash2 checkpoints (Qwen3.8-27B-DFlash2) are loaded by the vendored
+    drafter in ``.drafters`` (which implements the two-tap dynamic convs +
+    selector-lattice head upstream mlx-vlm lacks). DFlash1 checkpoints keep
+    using mlx-vlm's own drafter loader, unchanged.
 
     The mlx-vlm import is deferred to call time so installing rapid-mlx
     without the ``[dflash]`` extras leaves the CLI / unit tests working;
@@ -78,6 +83,15 @@ def load_runtime(drafter_repo: str, kind: str = "dflash") -> DFlashRuntime:
             "DFlash runtime not available — mlx-vlm 0.5.0+ is required. "
             "Install with: pip install 'rapid-mlx[dflash]'"
         )
+    from .drafters import is_dflash2_repo, load_drafter as vendored_load
+
+    if is_dflash2_repo(drafter_repo):
+        logger.info("Loading DFlash2 drafter (vendored): %s (kind=%s)", drafter_repo, kind)
+        drafter, resolved_kind = vendored_load(drafter_repo, kind=kind)
+        return DFlashRuntime(
+            drafter=drafter, kind=resolved_kind, drafter_repo=drafter_repo
+        )
+
     # Import here, not at module top, so the optional dep stays optional.
     from mlx_vlm.speculative.drafters import load_drafter
 
