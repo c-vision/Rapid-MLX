@@ -2882,12 +2882,11 @@ def serve_command(args):
         use_memory_aware_cache=not args.no_memory_aware_cache,
         cache_memory_mb=args.cache_memory_mb,
         cache_memory_percent=args.cache_memory_percent,
+        hybrid_cache_entries=getattr(args, "hybrid_cache_entries", 0),
         # Paged cache options
         use_paged_cache=args.use_paged_cache,
         paged_cache_block_size=args.paged_cache_block_size,
         max_cache_blocks=args.max_cache_blocks,
-        # Chunked prefill
-        chunked_prefill_tokens=args.chunked_prefill_tokens,
         # Prefill step size (chunk size). Must be plumbed here — BatchedEngine
         # reads it off scheduler_config only; the legacy load_model kwarg was
         # accepted but never used. See #400 and the CLI ↔ Config fidelity
@@ -2958,8 +2957,6 @@ def serve_command(args):
     )
 
     print("Mode: Continuous batching (for multiple concurrent users)")
-    if args.chunked_prefill_tokens > 0:
-        print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
     if args.enable_mtp:
         print(f"MTP: enabled, draft_tokens={args.mtp_num_draft_tokens}")
     # Native Qwen3.5/3.6 MTP via vendored mlx-lm PR #990. The
@@ -3946,6 +3943,7 @@ def bench_command(args):
             use_memory_aware_cache=not args.no_memory_aware_cache,
             cache_memory_mb=args.cache_memory_mb,
             cache_memory_percent=args.cache_memory_percent,
+            hybrid_cache_entries=getattr(args, "hybrid_cache_entries", 0),
             # Paged cache options
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
@@ -6634,6 +6632,15 @@ Examples:
         help="Fraction of available RAM for cache if auto-detecting (default: 0.20)",
     )
     serve_parser.add_argument(
+        "--hybrid-cache-entries",
+        type=int,
+        default=0,
+        help="Bounded trim-free prefix reuse for hybrid (Mamba/GatedDeltaNet) models. "
+        "0 (default) keeps the conservative drop-at-store policy (#1025/#1058); N>0 "
+        "retains at most N recurrent-state entries for within-conversation prefix "
+        "reuse, LRU-evicted (#1103). Non-hybrid models are unaffected.",
+    )
+    serve_parser.add_argument(
         "--no-memory-aware-cache",
         action="store_true",
         help="Disable memory-aware cache, use legacy entry-count based cache",
@@ -7516,6 +7523,15 @@ Examples:
         type=float,
         default=0.20,
         help="Fraction of available RAM for cache if auto-detecting (default: 0.20)",
+    )
+    bench_parser.add_argument(
+        "--hybrid-cache-entries",
+        type=int,
+        default=0,
+        help="Bounded trim-free prefix reuse for hybrid (Mamba/GatedDeltaNet) models. "
+        "0 (default) keeps the conservative drop-at-store policy (#1025/#1058); N>0 "
+        "retains at most N recurrent-state entries for within-conversation prefix "
+        "reuse, LRU-evicted (#1103). Non-hybrid models are unaffected.",
     )
     bench_parser.add_argument(
         "--no-memory-aware-cache",
